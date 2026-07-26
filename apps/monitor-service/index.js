@@ -31,7 +31,7 @@ const { loadPlatform } = require('@tennis-bot/platform')
 const FileStorage = require('@tennis-bot/storage/file/FileStorage')
 const ConfigManager = require('@tennis-bot/config')
 const core = require('@tennis-bot/core')
-const { formatSlotText } = require('@tennis-bot/notifier')
+const { formatSlotText, escapeMarkdown } = require('@tennis-bot/notifier')
 const { createTrace, parseSlotStartDateTimeSafe, parseSlotDayKey, formatDateDisplayFromIso } = require('@tennis-bot/utils')
 
 const DATA_DIR = process.env.MONITOR_DATA_DIR || path.resolve(__dirname, '../../data')
@@ -169,11 +169,25 @@ function getPlatformConfig(place) {
 }
 
 /**
+ * 获取生效的扫描间隔（秒）
+ * 优先级：任意平台显式设置的 INTERVAL > global.INTERVAL > 45
+ */
+function getEffectiveInterval() {
+  for (const name of config.getPlatformNames()) {
+    const pc = config.getPlatform(name)
+    if (pc && 'INTERVAL' in pc) return pc.INTERVAL
+  }
+  return config.global.INTERVAL || 45
+}
+
+/**
  * 向所有已配置的平台发送"暂无可预约"提示
  * 跳过没有 Bot Token 的平台
  */
 async function sendNoSlotsMessage() {
   for (const name of config.getPlatformNames()) {
+    const pc = config.getPlatform(name)
+    if (pc.enabled === false) continue
     const b = getBotForPlatform(name)
     const chatId = getPlatformChatId(name)
     if (!b || !chatId) continue
@@ -196,10 +210,10 @@ function groupSlotsByPlatform(slots) {
 }
 
 async function sendTelegram(data, version, title = '🆕 可预约（点击直接预约）') {
-  const maxPush = config.global.MAX_PUSH || 100
   const grouped = groupSlotsByPlatform(data)
 
   for (const [platform, slots] of grouped) {
+    const maxPush = config.getEffective('MAX_PUSH', platform) || 100
     const botInstance = getBotForPlatform(platform)
     const chatId = getPlatformChatId(platform)
     if (!botInstance || !chatId) {
@@ -229,7 +243,7 @@ async function sendRemovedTelegram(data) {
       console.log(`[通知] ${platform} 未配置 Bot Token 或 Chat ID，跳过`)
       continue
     }
-    const maxPush = config.global.MAX_PUSH || 100
+    const maxPush = config.getEffective('MAX_PUSH', platform) || 100
     const msg = slots.slice(0, maxPush)
       .map(d => `⚠️ 已被预约\n${formatSlotText(d, getPlatformConfig(d.place))}`)
       .join('\n\n')
@@ -276,9 +290,10 @@ async function monitor(options = {}) {
   let slotMap = new Map()
 
   for (const platformName of config.getPlatformNames()) {
+    const platformConfig = config.getPlatform(platformName)
+    if (platformConfig.enabled === false) continue
     const adapter = loadPlatform(platformName)
     if (!adapter) continue
-    const platformConfig = config.getPlatform(platformName)
     if (!platformConfig.TARGET_PLACE?.length) continue
 
     try {
@@ -371,6 +386,11 @@ async function monitor(options = {}) {
 
       for (const [platformName, platformAdded] of Object.entries(platformGroups)) {
         const platformConfig = config.getPlatform(platformName)
+        // 平台级 AUTO_BOOK 可关闭（即使全局开启）
+        if ('AUTO_BOOK' in platformConfig && !platformConfig.AUTO_BOOK) {
+          console.log(`[${trace}] AUTO_BOOK ${platformName} 已关闭`)
+          continue
+        }
         const autoCandidates = core.filterSlotsAuto(platformAdded, platformConfig)
         if (autoCandidates.length === 0) {
           console.log(`[${trace}] AUTO_BOOK ${platformName} 无匹配项`)
@@ -440,7 +460,7 @@ async function monitor(options = {}) {
               abChat,
               `❌ *自动预约失败*\n━━━━━━━━━━━━━━\n` +
             targets.map(d => formatSlotText(d, getPlatformConfig(d.place), { style: 'detail' })).join('\n\n') +
-            `\n\n🧨 ${e.message}`,
+            `\n\n🧨 ${escapeMarkdown(e.message)}`,
             { parse_mode: 'Markdown' }
           )
           }
@@ -492,7 +512,7 @@ const server = http.createServer(async (req, res) => {
         autoBooking,
         slotCount: currentData.length,
         version: currentVersion,
-        interval: config.global.INTERVAL || 45,
+        interval: getEffectiveInterval(),
         config: {
           global: config.global,
           platforms: config.getAllPlatforms()
@@ -518,7 +538,7 @@ const server = http.createServer(async (req, res) => {
     // POST /api/resume
     if (req.method === 'POST' && pathname === '/api/resume') {
       if (!timer) {
-        const interval = (config.global.INTERVAL || 45) * 1000
+        const interval = getEffectiveInterval() * 1000
         timer = setInterval(() => monitor(), interval)
       }
       return json(res, { success: true, message: '已恢复' })
@@ -529,6 +549,7 @@ const server = http.createServer(async (req, res) => {
       const places = []
       for (const pname of config.getPlatformNames()) {
         const pc = config.getPlatform(pname)
+        if (pc.enabled === false) continue
         for (const [name, v] of Object.entries(pc.PLACE_MAP || {})) {
           places.push({
             platform: pname,
@@ -567,12 +588,16 @@ const server = http.createServer(async (req, res) => {
 
     // POST /api/config/set
     if (req.method === 'POST' && pathname === '/api/config/set') {
-      const { key, value } = await parseBody(req)
+      const { key, value, platform } = await parseBody(req)
       if (!key) return json(res, { success: false, message: '缺少 key' }, 400)
-      if (!(key in config.global)) {
-        return json(res, { success: false, message: `不存在配置项 ${key}` }, 400)
+      if (platform) {
+        config.setPlatform(platform, key, value)
+      } else {
+        if (!(key in config.global)) {
+          return json(res, { success: false, message: `不存在配置项 ${key}` }, 400)
+        }
+        config.set(key, value)
       }
-      config.set(key, value)
       config.save()
       return json(res, { success: true })
     }
@@ -645,7 +670,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && pathname === '/api/schedule-status') {
       return json(res, {
         running: !!timer,
-        interval: config.global.INTERVAL || 45,
+        interval: getEffectiveInterval(),
         isFirstRun,
         autoBooking,
         lastScanVersion: currentVersion
@@ -674,7 +699,7 @@ async function start() {
   await monitor()
 
   // 定时扫描
-  const interval = (config.global.INTERVAL || 45) * 1000
+  const interval = getEffectiveInterval() * 1000
   timer = setInterval(() => monitor(), interval)
 
   // 清理旧日志

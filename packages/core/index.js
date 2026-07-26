@@ -104,7 +104,18 @@ function getAutoRules(platformConfig) {
 }
 
 function filterSlotsAuto(data, platformConfig) {
-  return filterSlotsByRules(data, getAutoRules(platformConfig))
+  const rules = getAutoRules(platformConfig)
+  const placeFilter = rules.PLACE_FILTER || []
+  if (placeFilter.length > 0 && platformConfig.PLACE_MAP) {
+    const expanded = [...placeFilter]
+    for (const [placeName, meta] of Object.entries(platformConfig.PLACE_MAP)) {
+      if (placeFilter.some(kw => kw === meta.short) && !expanded.includes(placeName)) {
+        expanded.push(placeName)
+      }
+    }
+    rules.PLACE_FILTER = expanded
+  }
+  return filterSlotsByRules(data, rules)
 }
 
 // ========================

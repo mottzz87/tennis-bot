@@ -1,4 +1,5 @@
 {
+  "enabled": false,
   "TARGET_PLACE": [],
   "PLACE_MAP": {},
   "BOOK_DURATION": 60,

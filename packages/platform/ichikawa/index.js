@@ -124,7 +124,7 @@ class IchikawaAdapter {
       const page = await browser.newPage()
 
       // 导航
-      await navigateToSports(page)
+      await navigateToSports(page, this._baseUrl)
 
       // 选择场地
       await selectPlaces(page, [slotData.place], platformConfig.STEP_DELAY || 500)

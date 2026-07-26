@@ -74,6 +74,22 @@ class ConfigManager {
   }
 
   /**
+   * 获取合并后的配置（global + platform），platform 优先级高于 global
+   */
+  getMergedConfig(platformName) {
+    return { ...this.global, ...this.getPlatformConfig(platformName) }
+  }
+
+  /**
+   * 获取某个 key 的有效值：platform 有值则用 platform，否则用 global
+   */
+  getEffective(key, platformName) {
+    const pc = this.getPlatformConfig(platformName)
+    if (pc && key in pc) return pc[key]
+    return this.global[key]
+  }
+
+  /**
    * 从对象加载配置（替代从文件加载）
    * 用于跨服务部署时从 Monitor API 获取配置
    */

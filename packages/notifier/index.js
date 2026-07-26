@@ -51,7 +51,15 @@ function formatReminderButtonLabel(d, platformConfig) {
   return truncateTelegramButtonText(s)
 }
 
+/**
+ * 转义 Telegram Markdown 特殊字符
+ */
+function escapeMarkdown(text) {
+  return String(text).replace(/[_*`\[]/g, '\\$&')
+}
+
 module.exports = {
   formatSlotText,
-  formatReminderButtonLabel
+  formatReminderButtonLabel,
+  escapeMarkdown
 }

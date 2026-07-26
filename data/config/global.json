@@ -1,6 +1,6 @@
 {
   "INTERVAL": 45,
-  "AUTO_BOOK": false,
+  "AUTO_BOOK": true,
   "NOTIFY_ADDED": true,
   "NOTIFY_REMOVED": true,
   "MAX_PUSH": 100,

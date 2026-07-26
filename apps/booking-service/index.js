@@ -111,11 +111,15 @@ async function handleBook(body) {
     return { success: false, message: `平台 ${platformName} 未找到` }
   }
 
+  const platformConfig = config.getPlatform(platformName)
+  if (platformConfig.enabled === false) {
+    return { success: false, message: `平台 ${platformName} 未启用` }
+  }
+
   busy = true
   currentTask = { platform: platformName, slot }
 
   try {
-    const platformConfig = config.getPlatform(platformName)
     const result = await adapter.book(slot, platformConfig)
 
     if (result.success) {

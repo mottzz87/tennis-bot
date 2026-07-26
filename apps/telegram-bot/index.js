@@ -11,7 +11,7 @@
 require('dotenv').config()
 const http = require('http')
 const TelegramBot = require('node-telegram-bot-api')
-const { formatSlotText, formatReminderButtonLabel } = require('@tennis-bot/notifier')
+const { formatSlotText, formatReminderButtonLabel, escapeMarkdown } = require('@tennis-bot/notifier')
 const { parseSlotStartDateTimeSafe, parseSlotDayKey } = require('@tennis-bot/utils')
 
 const MONITOR_HOST = process.env.MONITOR_HOST || 'http://localhost:3000'
@@ -87,6 +87,20 @@ function monitorApi(method, path, body) {
 
 function bookingApi(method, path, body) {
   return httpRequest(BOOKING_HOST, method, path, body)
+}
+
+// 平台配置缓存
+let _platformsCache = null
+async function getPlatformConfig(platformName) {
+  if (!_platformsCache) {
+    try {
+      const res = await monitorApi('GET', '/api/status')
+      _platformsCache = res.data?.config?.platforms || {}
+    } catch {
+      return {}
+    }
+  }
+  return _platformsCache[platformName] || {}
 }
 
 // ========================
@@ -267,6 +281,8 @@ bot.setMyCommands([
   { command: 'listplace', description: '📍 场地开关' },
   { command: 'schedule', description: '📅 预约日程' },
   { command: 'panel', description: '🎛️ 控制面板' },
+  { command: 'config', description: '⚙️ 查看配置' },
+  { command: 'log', description: '📋 查看日志' },
   { command: 'help', description: '❓ 帮助' }
 ])
 
@@ -447,7 +463,7 @@ bot.onText(/\/set (\w+) (.+)/, async (msg, match) => {
     else if (!isNaN(value)) value = Number(value)
     else if (value.startsWith('[')) value = JSON.parse(value)
 
-    await monitorApi('POST', '/api/config/set', { key, value })
+    await monitorApi('POST', '/api/config/set', { key, value, platform: 'ichikawa' })
     await bot.sendMessage(msg.chat.id, `✅ 配置已更新\n━━━━━━━━━━━━━━\n${key} = ${JSON.stringify(value)}`)
   } catch (e) {
     await bot.sendMessage(msg.chat.id, `❌ 修改失败：${e.message || e}`)
@@ -772,11 +788,12 @@ bot.on('callback_query', async (query) => {
       const raw = slotRes.data.slot
       await bot.answerCallbackQuery(query.id, { text: '🚀 开始预约...' })
 
+      const pc = await getPlatformConfig(raw.platform)
       const bookRes = await bookingApi('POST', '/api/book', { platform: raw.platform, slot: raw })
       if (bookRes.data?.success) {
         await bot.sendMessage(
           chatId,
-          `🎉 *预约成功！*\n━━━━━━━━━━━━━━\n${formatSlotText(raw, {}, { showBike: true, style: 'detail' })}`,
+          `🎉 *预约成功！*\n━━━━━━━━━━━━━━\n${formatSlotText(raw, pc, { showBike: true, style: 'detail' })}`,
           { parse_mode: 'Markdown' }
         )
         // Trigger re-scan
@@ -784,14 +801,14 @@ bot.on('callback_query', async (query) => {
       } else {
         await bot.sendMessage(
           chatId,
-          `❌ *预约失败*\n━━━━━━━━━━━━━━\n${formatSlotText(raw, {}, { style: 'detail' })}\n\n🧨 ${bookRes.data?.message || '未知错误'}`,
+          `❌ *预约失败*\n━━━━━━━━━━━━━━\n${formatSlotText(raw, pc, { style: 'detail' })}\n\n🧨 ${escapeMarkdown(bookRes.data?.message || '未知错误')}`,
           { parse_mode: 'Markdown' }
         )
       }
     } catch (e) {
       await bot.sendMessage(
         chatId,
-        `❌ *预约失败*\n━━━━━━━━━━━━━━\n${e.message}`,
+        `❌ *预约失败*\n━━━━━━━━━━━━━━\n${escapeMarkdown(e.message)}`,
         { parse_mode: 'Markdown' }
       )
     }
