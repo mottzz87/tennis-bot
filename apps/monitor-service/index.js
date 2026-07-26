@@ -202,6 +202,10 @@ async function sendTelegram(data, version, title = '🆕 可预约（点击直�
   for (const [platform, slots] of grouped) {
     const botInstance = getBotForPlatform(platform)
     const chatId = getPlatformChatId(platform)
+    if (!botInstance || !chatId) {
+      console.log(`[通知] ${platform} 未配置 Bot Token 或 Chat ID，跳过`)
+      continue
+    }
     const buttons = slots.slice(0, maxPush).map(d => ({
       text: formatSlotText(d, getPlatformConfig(d.place)),
       callback_data: `book_${d.ucode}`
@@ -221,6 +225,10 @@ async function sendRemovedTelegram(data) {
   for (const [platform, slots] of grouped) {
     const botInstance = getBotForPlatform(platform)
     const chatId = getPlatformChatId(platform)
+    if (!botInstance || !chatId) {
+      console.log(`[通知] ${platform} 未配置 Bot Token 或 Chat ID，跳过`)
+      continue
+    }
     const maxPush = config.global.MAX_PUSH || 100
     const msg = slots.slice(0, maxPush)
       .map(d => `⚠️ 已被预约\n${formatSlotText(d, getPlatformConfig(d.place))}`)
@@ -408,12 +416,16 @@ async function monitor(options = {}) {
 
           const abBot = getBotForPlatform(platformName)
           const abChat = getPlatformChatId(platformName)
-          await abBot.sendMessage(
-            abChat,
-            `🎉 *自动预约成功！*\n━━━━━━━━━━━━━━\n` +
-            targets.map(d => formatSlotText(d, getPlatformConfig(d.place), { showBike: true, style: 'detail' })).join('\n\n'),
-            { parse_mode: 'Markdown' }
-          )
+          if (!abBot || !abChat) {
+            console.log(`[AUTO_BOOK] ${platformName} 未配置 Bot Token，跳过通知`)
+          } else {
+            await abBot.sendMessage(
+              abChat,
+              `🎉 *自动预约成功！*\n━━━━━━━━━━━━━━\n` +
+              targets.map(d => formatSlotText(d, getPlatformConfig(d.place), { showBike: true, style: 'detail' })).join('\n\n'),
+              { parse_mode: 'Markdown' }
+            )
+          }
 
           setTimeout(() => monitor({ forcePush: true }), 1000)
         } catch (e) {
@@ -423,13 +435,15 @@ async function monitor(options = {}) {
           saveAutoBooked()
           const abBot = getBotForPlatform(platformName)
           const abChat = getPlatformChatId(platformName)
-          await abBot.sendMessage(
-            abChat,
-            `❌ *自动预约失败*\n━━━━━━━━━━━━━━\n` +
+          if (abBot && abChat) {
+            await abBot.sendMessage(
+              abChat,
+              `❌ *自动预约失败*\n━━━━━━━━━━━━━━\n` +
             targets.map(d => formatSlotText(d, getPlatformConfig(d.place), { style: 'detail' })).join('\n\n') +
             `\n\n🧨 ${e.message}`,
             { parse_mode: 'Markdown' }
           )
+          }
         } finally {
           autoBooking = false
         }
