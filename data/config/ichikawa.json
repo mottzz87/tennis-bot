@@ -1,9 +1,7 @@
 {
   "TARGET_PLACE": [
     "福栄スポーツ広場テニスコート",
-    "菅野終末処理場テニスコート",
-    "国府台テニスコート",
-    "塩浜市民体育館テニスコート"
+    "菅野終末処理場テニスコート"
   ],
   "TIME_FILTER": [],
   "WEEKDAY_FILTER": [],
@@ -13,10 +11,12 @@
   ],
   "AUTO_TIME_FILTER": [],
   "AUTO_WEEKDAY_FILTER": [
-    "木"
+    "土",
+    "日" 
   ],
   "AUTO_PLACE_FILTER": [
-    "行徳・塩焼中央公園テニスコート"
+    "福栄スポーツ広場テニスコート",
+    "菅野終末処理場テニスコート"
   ],
   "AUTO_COURT_NUM_FILTER": [],
   "PLACE_MAP": {
