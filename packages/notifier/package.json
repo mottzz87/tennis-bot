@@ -1,0 +1,9 @@
+{
+  "name": "@tennis-bot/notifier",
+  "version": "1.0.0",
+  "main": "index.js",
+  "dependencies": {
+    "@tennis-bot/models": "*",
+    "@tennis-bot/utils": "*"
+  }
+}

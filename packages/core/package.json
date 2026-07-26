@@ -1,0 +1,10 @@
+{
+  "name": "@tennis-bot/core",
+  "version": "1.0.0",
+  "main": "index.js",
+  "dependencies": {
+    "@tennis-bot/models": "*",
+    "@tennis-bot/utils": "*",
+    "@tennis-bot/storage": "*"
+  }
+}

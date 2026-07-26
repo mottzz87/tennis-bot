@@ -1,0 +1,21 @@
+{
+  "name": "tennis-bot",
+  "version": "2.0.0",
+  "private": true,
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "dev:monitor": "node apps/monitor-service/index.js",
+    "dev:booking": "node apps/booking-service/index.js",
+    "dev:bot": "node apps/telegram-bot/index.js",
+    "start": "node apps/monitor-service/index.js",
+    "dev": "node apps/booking-service/index.js & node apps/monitor-service/index.js & node apps/telegram-bot/index.js & wait"
+  },
+  "dependencies": {
+    "dotenv": "^17.3.1",
+    "node-telegram-bot-api": "^0.67.0",
+    "playwright": "^1.58.2"
+  }
+}

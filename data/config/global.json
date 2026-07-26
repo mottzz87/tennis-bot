@@ -1,0 +1,11 @@
+{
+  "INTERVAL": 45,
+  "AUTO_BOOK": false,
+  "NOTIFY_ADDED": true,
+  "NOTIFY_REMOVED": true,
+  "MAX_PUSH": 100,
+  "PUSH_ON_INIT": true,
+  "BOOKED_REMINDER_INTERVAL_HOURS": 3,
+  "RETRY_COUNT": 2,
+  "STEP_DELAY": 500
+}

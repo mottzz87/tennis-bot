@@ -1,0 +1,372 @@
+/**
+ * Core — 平台无关业务逻辑
+ *
+ * 禁止出现任何平台判断 (if platform === 'ichikawa')
+ * 所有平台差异仅在 packages/platform 中处理
+ */
+const {
+  parseSlotDayKey,
+  parseSlotStartDateTimeSafe,
+  normalizeTimeRange,
+  formatDateDisplayFromIso,
+  normalizeCourtAlias,
+  formatCourt,
+  toMinutes,
+  normalizeText,
+  WEEKDAY_JP
+} = require('@tennis-bot/utils')
+
+// ========================
+// Slot 过滤
+// ========================
+
+function matchTime(dTime, filter) {
+  const start = String(dTime).split(/[～~\-]/)[0]
+  const startMin = toMinutes(start)
+  if (filter.length === 1) return startMin >= toMinutes(filter[0])
+  if (filter.length === 2) {
+    const [min, max] = filter.map(toMinutes)
+    return startMin >= min && startMin <= max
+  }
+  return true
+}
+
+function filterSlotsByRules(data, rules) {
+  const TIME_FILTER = rules.TIME_FILTER || []
+  const WEEKDAY_FILTER = rules.WEEKDAY_FILTER || []
+  const COURT_NUM_FILTER = rules.COURT_NUM_FILTER || []
+  const PLACE_FILTER = rules.PLACE_FILTER || []
+
+  return data.filter(d => {
+    if (TIME_FILTER.length > 0) {
+      if (!matchTime(d.time || d.start, TIME_FILTER)) return false
+    }
+
+    if (WEEKDAY_FILTER.length > 0) {
+      let weekday = null
+      const display = String(d.dateDisplay || '')
+      const m1 = display.match(/[（(]([月火水木金土日])[）)]/)
+      if (m1) {
+        weekday = m1[1]
+      } else if (/^\d{4}-\d{2}-\d{2}$/.test(String(d.date || '').trim())) {
+        const [y, mo, day] = String(d.date).split('-').map(Number)
+        weekday = WEEKDAY_JP[new Date(y, mo - 1, day).getDay()]
+      } else {
+        const m2 = String(d.date || '').match(/[（(]([月火水木金土日])[）)]/)
+        if (m2) weekday = m2[1]
+      }
+      if (!weekday || !WEEKDAY_FILTER.includes(weekday)) return false
+    }
+
+    if (COURT_NUM_FILTER.length > 0) {
+      const court = normalizeCourtAlias(formatCourt(d.court))
+      if (!COURT_NUM_FILTER.some(c => court.includes(normalizeCourtAlias(c)))) return false
+    }
+
+    if (PLACE_FILTER.length > 0) {
+      const placeStr = String(d.place || '')
+      const placeN = normalizeText(placeStr)
+      const hit = PLACE_FILTER.some(kw => {
+        const k = String(kw || '').trim()
+        if (!k) return false
+        return placeStr.includes(k) || placeN.includes(normalizeText(k))
+      })
+      if (!hit) return false
+    }
+
+    return true
+  })
+}
+
+function filterSlotsByConfig(data, config) {
+  return filterSlotsByRules(data, {
+    TIME_FILTER: config.TIME_FILTER,
+    WEEKDAY_FILTER: config.WEEKDAY_FILTER,
+    COURT_NUM_FILTER: config.COURT_NUM_FILTER
+  })
+}
+
+function getAutoRules(platformConfig) {
+  return {
+    TIME_FILTER: Array.isArray(platformConfig.AUTO_TIME_FILTER)
+      ? platformConfig.AUTO_TIME_FILTER
+      : platformConfig.TIME_FILTER,
+    WEEKDAY_FILTER: Array.isArray(platformConfig.AUTO_WEEKDAY_FILTER)
+      ? platformConfig.AUTO_WEEKDAY_FILTER
+      : platformConfig.WEEKDAY_FILTER,
+    COURT_NUM_FILTER: Array.isArray(platformConfig.AUTO_COURT_NUM_FILTER)
+      ? platformConfig.AUTO_COURT_NUM_FILTER
+      : [],
+    PLACE_FILTER: Array.isArray(platformConfig.AUTO_PLACE_FILTER)
+      ? platformConfig.AUTO_PLACE_FILTER
+      : []
+  }
+}
+
+function filterSlotsAuto(data, platformConfig) {
+  return filterSlotsByRules(data, getAutoRules(platformConfig))
+}
+
+// ========================
+// Ucode 构建
+// ========================
+
+function buildUcode(d, platformConfig) {
+  const placeMeta = platformConfig.PLACE_MAP?.[d.place] || {}
+  const placeCode = placeMeta.courtCode || 'unknown'
+  const courtCode = normalizeCourtAlias(d.court)
+  const dayKey = parseSlotDayKey(d) || d.date || 'unknown-date'
+  const timeRange = normalizeTimeRange(d.time || `${d.start}-${d.end}`)
+  return `${placeCode}_${courtCode}_${dayKey}_${timeRange}`
+}
+
+// ========================
+// Diff 计算
+// ========================
+
+function diffSlots(currentData, lastSet) {
+  const currentUids = new Set(currentData.map(d => d.uid))
+  const added = currentData.filter(d => !lastSet.has(d.uid))
+  const removedUids = [...lastSet].filter(k => !currentUids.has(k))
+  return { added, removedUids, currentUids }
+}
+
+// ========================
+// 自动抢目标选择
+// ========================
+
+function autoPickTargets(candidates, autoBookedUIDs, autoBookedDayKeys) {
+  const now = Date.now()
+
+  const valid = candidates.filter(d => {
+    const startDate = parseSlotStartDateTimeSafe(d)
+    if (!startDate) return false
+    const diffMin = (startDate.getTime() - now) / 60000
+    if (diffMin < 20) return false
+
+    const dayKey = parseSlotDayKey(d)
+    if (dayKey && autoBookedDayKeys.has(dayKey)) return false
+    if (autoBookedUIDs.has(d.uid)) return false
+
+    return true
+  })
+
+  if (valid.length === 0) return []
+
+  // 按天分组，每天选最晚一个
+  const grouped = new Map()
+  for (const d of valid) {
+    const dayKey = parseSlotDayKey(d)
+    if (!dayKey) continue
+    if (!grouped.has(dayKey)) grouped.set(dayKey, [])
+    grouped.get(dayKey).push(d)
+  }
+
+  const targets = []
+  for (const [dayKey, list] of grouped.entries()) {
+    list.sort((a, b) => {
+      const ta = parseSlotStartDateTimeSafe(a)?.getTime() ?? -Infinity
+      const tb = parseSlotStartDateTimeSafe(b)?.getTime() ?? -Infinity
+      return tb - ta
+    })
+    targets.push(list[0])
+  }
+
+  return targets
+}
+
+// ========================
+// 已预约管理
+// ========================
+
+function cleanExpiredBooked(bookedSlots) {
+  const now = Date.now()
+  return bookedSlots.filter(s => {
+    const start = parseSlotStartDateTimeSafe(s)
+    return start && start.getTime() > now
+  })
+}
+
+function getFutureBookedSlots(bookedSlots) {
+  const now = Date.now()
+  return bookedSlots.filter(s => {
+    const start = parseSlotStartDateTimeSafe(s)
+    return start && start.getTime() > now
+  })
+}
+
+function eligibleForBookedSummary(s, intervalMs) {
+  if (s.reminderEnabled === false) return false
+  if (s.bookedAt == null) return true
+  return Date.now() >= s.bookedAt + intervalMs
+}
+
+// ========================
+// Stats 记录
+// ========================
+
+const fs = require('fs')
+const path = require('path')
+
+const STATS_DIR = 'stats'
+
+function recordStats(type, list) {
+  if (!list || list.length === 0) return
+
+  const now = Date.now()
+  const hour = new Date().getHours()
+  const file = path.join(STATS_DIR, `${type}.log`)
+  fs.mkdirSync(STATS_DIR, { recursive: true })
+
+  const lines = list.map(d => JSON.stringify({
+    time: now,
+    hour,
+    place: d.place,
+    court: d.court,
+    date: d.date,
+    slot: d.time,
+    id: d.uid
+  })).join('\n') + '\n'
+
+  fs.appendFileSync(file, lines)
+}
+
+function readLogLines(filePath) {
+  if (!fs.existsSync(filePath)) return []
+  const raw = fs.readFileSync(filePath, 'utf-8')
+  return raw.split('\n').map(l => l.trim()).filter(Boolean).map(l => {
+    try { return JSON.parse(l) } catch { return null }
+  }).filter(Boolean)
+}
+
+function startOfLocalDayMs() {
+  const d = new Date()
+  d.setHours(0, 0, 0, 0)
+  return d.getTime()
+}
+
+const PERIODS = [
+  { label: '今天', cutoff: startOfLocalDayMs },
+  { label: '近7天', days: 7 },
+  { label: '近30天', days: 30 },
+  { label: '近半年', days: 182 },
+  { label: '近一年', days: 365 }
+]
+
+function periodCutoff(period) {
+  if (typeof period.cutoff === 'function') return period.cutoff()
+  const d = period.days
+  if (!d) return 0
+  return Date.now() - d * 24 * 60 * 60 * 1000
+}
+
+function filterSince(list, cutoffMs) {
+  return list.filter(i => typeof i.time === 'number' && i.time >= cutoffMs)
+}
+
+function groupByHour(list) {
+  const map = {}
+  list.forEach(i => { if (i.hour !== undefined && i.hour !== null) map[i.hour] = (map[i.hour] || 0) + 1 })
+  return map
+}
+
+function groupByPlace(list) {
+  const map = {}
+  list.forEach(i => { const p = i.place || '（未知）'; map[p] = (map[p] || 0) + 1 })
+  return map
+}
+
+function shortenPlaceName(name, placeMap) {
+  return placeMap?.[name]?.short || name
+}
+
+function topNWithShort(map, n, placeMap, sep = ' · ') {
+  return Object.entries(map)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, n)
+    .map(([k, v]) => `${shortenPlaceName(k, placeMap)}×${v}`)
+    .join(sep)
+}
+
+function calcSpeedBuckets(addedList, removedList) {
+  const addedMap = new Map()
+  addedList.forEach(a => { if (a.id && (!addedMap.has(a.id) || a.time < addedMap.get(a.id))) addedMap.set(a.id, a.time) })
+
+  const buckets = { '≤2m': 0, '≤5m': 0, '≤10m': 0, '≤30m': 0, '>30m': 0 }
+  let paired = 0
+
+  removedList.forEach(r => {
+    if (!r.id || !addedMap.has(r.id)) return
+    const diff = (r.time - addedMap.get(r.id)) / 1000
+    if (diff < 0) return
+    paired++
+    if (diff <= 120) buckets['≤2m']++
+    else if (diff <= 300) buckets['≤5m']++
+    else if (diff <= 600) buckets['≤10m']++
+    else if (diff <= 1800) buckets['≤30m']++
+    else buckets['>30m']++
+  })
+
+  return { paired, buckets }
+}
+
+function buildStatsReport(placeMap) {
+  const allAdded = readLogLines(path.join(STATS_DIR, 'added.log'))
+  const allRemoved = readLogLines(path.join(STATS_DIR, 'removed.log'))
+  const header = '📊 抢场统计\n━━━━━━━━━━━━━━━━━━\n'
+  const blocks = PERIODS.map(p => summarizePeriod(p.label, periodCutoff(p), allAdded, allRemoved, placeMap))
+  return header + blocks.join('\n')
+}
+
+function summarizePeriod(label, cutoffMs, allAdded, allRemoved, placeMap) {
+  const added = filterSince(allAdded, cutoffMs)
+  const removed = filterSince(allRemoved, cutoffMs)
+  const ah = groupByHour(added)
+  const rh = groupByHour(removed)
+
+  const peakA = Object.entries(ah).sort((a, b) => b[1] - a[1])[0]
+  const peakR = Object.entries(rh).sort((a, b) => b[1] - a[1])[0]
+  const peakStr = peakA || peakR
+    ? `出${peakA ? peakA[0] + '时' : '—'}／消${peakR ? peakR[0] + '时' : '—'}`
+    : '—'
+  const topPlaces = topNWithShort(groupByPlace(removed), 4, placeMap, '  ')
+  const placeStr = topPlaces || '—'
+
+  const lines = [`● ${label}  📈${added.length}  📉${removed.length}  ⚡${peakStr}  🏟${placeStr}`]
+  const { paired, buckets } = calcSpeedBuckets(added, removed)
+  if (paired > 0) {
+    const detail = Object.entries(buckets).filter(([, v]) => v > 0).map(([k, v]) => `${k}:${v}`).join('  ')
+    lines.push(`  ⏱配对 ${paired} 次  ${detail}`)
+  }
+  return lines.join('\n')
+}
+
+function splitForTelegram(text, maxLen = 3800) {
+  if (text.length <= maxLen) return [text]
+  const parts = []
+  let rest = text
+  while (rest.length) {
+    if (rest.length <= maxLen) { parts.push(rest); break }
+    let cut = rest.lastIndexOf('\n\n', maxLen)
+    if (cut < maxLen / 2) cut = maxLen
+    parts.push(rest.slice(0, cut).trimEnd())
+    rest = rest.slice(cut).trimStart()
+  }
+  return parts
+}
+
+module.exports = {
+  filterSlotsByRules,
+  filterSlotsByConfig,
+  getAutoRules,
+  filterSlotsAuto,
+  buildUcode,
+  diffSlots,
+  autoPickTargets,
+  cleanExpiredBooked,
+  getFutureBookedSlots,
+  eligibleForBookedSummary,
+  recordStats,
+  buildStatsReport,
+  splitForTelegram
+}

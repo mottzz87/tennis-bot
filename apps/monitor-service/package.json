@@ -1,0 +1,15 @@
+{
+  "name": "@tennis-bot/monitor-service",
+  "version": "1.0.0",
+  "main": "index.js",
+  "dependencies": {
+    "@tennis-bot/models": "*",
+    "@tennis-bot/platform": "*",
+    "@tennis-bot/storage": "*",
+    "@tennis-bot/config": "*",
+    "@tennis-bot/core": "*",
+    "@tennis-bot/notifier": "*",
+    "@tennis-bot/utils": "*",
+    "dotenv": "^17.3.1"
+  }
+}
