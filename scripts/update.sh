@@ -3,6 +3,10 @@
 # Tennis Bot - Update Script
 # ============================================
 
+
+echo "SCRIPT: $(realpath "$0")"
+echo "PWD: $(pwd)"
+
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
