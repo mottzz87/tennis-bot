@@ -16,9 +16,9 @@ echo '📦 git reset...'
 git reset --hard origin/main
 echo '✔ git reset 完成'
 
-echo '📦 pnpm install...'
+echo '📦 npm install...'
 npm ci
-echo '✔ pnpm install 完成'
+echo '✔ npm install 完成'
 
 case "${SERVER_ROLE}" in
 monitor)

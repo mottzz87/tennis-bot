@@ -633,7 +633,7 @@ bot.onText(/\/help/, async (msg) => {
     `【常用】\n` +
     `/panel  控制面板（下方按钮）\n` +
     `/run  立即扫描并推送\n` +
-    `/update  自动更新（git pull + pnpm install + pm2 restart）\n` +
+    `/update  自动更新（git pull + npm ci + pm2 restart）\n` +
     `/status  状态（含面板）\n` +
     `/listplace  场地开关\n` +
     `/booked  预约记录（可加条数，如 /booked 20）\n` +
