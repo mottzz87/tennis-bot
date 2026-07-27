@@ -571,6 +571,7 @@ bot.onText(/\/disableplace (.+)/, async (msg, match) => {
 
 bot.onText(/\/update/, async (msg) => {
   if (!isAdmin(msg)) return
+
   const chatId = msg.chat.id
   const scriptPath = path.resolve(__dirname, '../../scripts/update.sh')
 
@@ -580,15 +581,30 @@ bot.onText(/\/update/, async (msg) => {
     { parse_mode: 'Markdown' }
   )
 
-  const lines = ['⬆️ *开始更新...*', '━━━━━━━━━━━━━━']
+  const lines = [
+    '⬆️ *开始更新...*',
+    '━━━━━━━━━━━━━━'
+  ]
 
   function updateDisplay() {
-    const display = lines.slice(-15).join('\n')
-    bot.editMessageText(display, {
-      chat_id: chatId,
-      message_id: statusMsg.message_id,
-      parse_mode: 'Markdown'
-    }).catch(() => {})
+    bot.editMessageText(
+      lines.slice(-15).join('\n'),
+      {
+        chat_id: chatId,
+        message_id: statusMsg.message_id,
+        parse_mode: 'Markdown'
+      }
+    ).catch(() => {})
+  }
+
+  function append(text) {
+    text
+      .split(/\r?\n/)
+      .map(s => s.trim())
+      .filter(Boolean)
+      .forEach(line => lines.push(line))
+
+    updateDisplay()
   }
 
   const proc = spawn('/bin/bash', [scriptPath], {
@@ -596,37 +612,54 @@ bot.onText(/\/update/, async (msg) => {
     stdio: ['ignore', 'pipe', 'pipe']
   })
 
-  proc.stdout.on('data', (data) => {
-    const text = data.toString().trim()
-    if (!text) return
-    lines.push(text)
-    // 转义 Markdown 特殊字符，Telegram 的 Markdown 模式下 * _ ` [ ] 需要转义
-    updateDisplay()
+  proc.stdout.on('data', data => {
+    append(data.toString())
   })
 
-  proc.stderr.on('data', (data) => {
-    const text = data.toString().trim()
-    if (!text) return
-    lines.push('⚠️ `' + text.replace(/`/g, '') + '`')
-    updateDisplay()
+  proc.stderr.on('data', data => {
+    append(
+      data
+        .toString()
+        .split(/\r?\n/)
+        .filter(Boolean)
+        .map(line => `⚠️ ${line}`)
+        .join('\n')
+    )
   })
 
-  proc.on('close', (code) => {
+  proc.on('close', code => {
+
     if (code === 0) {
-      lines.push('', '🎉 *更新成功*')
+
+      lines.push('')
+      lines.push('🎉 *更新成功*')
       updateDisplay()
-      // 脚本已完成，Bot 自行重启以加载新代码
+
+      // 更新完成后重启 Bot，自身加载最新代码
       setTimeout(() => {
-        spawn('pm2', ['restart', 'tennis_bot'], { detached: true, stdio: 'ignore' }).unref()
-      }, 1000)
+        spawn(
+          'pm2',
+          ['restart', 'tennis_bot'],
+          {
+            detached: true,
+            stdio: 'ignore'
+          }
+        ).unref()
+      }, 1500)
+
     } else {
-      lines.push('', '❌ *更新失败*（退出码: ' + code + '）')
+
+      lines.push('')
+      lines.push(`❌ *更新失败*（退出码 ${code}）`)
       updateDisplay()
+
     }
+
   })
 
-  proc.on('error', (err) => {
-    lines.push('', '❌ *脚本执行失败*：`' + (err.message || '').replace(/`/g, '') + '`')
+  proc.on('error', err => {
+    lines.push('')
+    lines.push(`❌ *脚本启动失败*：${err.message}`)
     updateDisplay()
   })
 })
