@@ -10,10 +10,12 @@ cd "$(dirname "$0")/.."
 OLD_COMMIT=$(git rev-parse HEAD)
 
 echo "📦 git fetch..."
-git fetch origin
+git fetch origin >/dev/null 2>&1
+echo "✔ git fetch 完成"
 
 echo "📦 git reset..."
-git reset --hard origin/main
+git reset --hard origin/main >/dev/null 2>&1
+git reset 完成
 
 NEW_COMMIT=$(git rev-parse HEAD)
 
@@ -62,5 +64,3 @@ booking)
 esac
 
 pm2 save >/dev/null
-
-echo "🎉 更新完成，正在重启服务..."
