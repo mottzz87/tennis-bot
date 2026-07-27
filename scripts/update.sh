@@ -9,27 +9,27 @@ cd "$(dirname "$0")/.."
 
 OLD_COMMIT=$(git rev-parse HEAD)
 
-echo "📦 git fetch..."
-git fetch origin >/dev/null 2>&1
-echo "✔ git fetch 完成"
+echo "📦 Fetching latest code..."
+git fetch origin >/dev/null
 
-echo "📦 git reset..."
-git reset --hard origin/main >/dev/null 2>&1
-git reset 完成
+echo "📦 Updating repository..."
+git reset --hard origin/main >/dev/null
 
 NEW_COMMIT=$(git rev-parse HEAD)
 
 if [ "$OLD_COMMIT" = "$NEW_COMMIT" ]; then
-    echo "✔ 已是最新版本"
+    echo "✔ Already up to date"
 else
     if git diff --name-only "$OLD_COMMIT" "$NEW_COMMIT" | grep -qx "package-lock.json"; then
-        echo "📦 更新依赖..."
-        npm ci >/dev/null 2>&1
-        echo "✔ 依赖更新完成"
+        echo "📦 Installing dependencies..."
+        npm ci >/dev/null
+        echo "✔ Dependencies updated"
     else
-        echo "✔ 依赖未变化"
+        echo "✔ Dependencies unchanged"
     fi
 fi
+
+echo "📦 Updating services..."
 
 case "${SERVER_ROLE:-}" in
 
@@ -40,6 +40,13 @@ monitor)
     else
         pm2 start apps/monitor-service/index.js \
             --name tennis_monitor >/dev/null
+    fi
+
+    if pm2 describe tennis_bot >/dev/null 2>&1; then
+        pm2 restart tennis_bot >/dev/null
+    else
+        pm2 start apps/telegram-bot/index.js \
+            --name tennis_bot >/dev/null
     fi
 
     ;;
@@ -57,10 +64,15 @@ booking)
 
 *)
 
-    echo "⚠️ SERVER_ROLE 未设置（monitor / booking）"
+    echo "❌ SERVER_ROLE is not set."
+    echo "Please set SERVER_ROLE=monitor or SERVER_ROLE=booking"
+    exit 1
 
     ;;
 
 esac
 
 pm2 save >/dev/null
+
+echo "━━━━━━━━━━━━━━"
+echo "🎉 Update completed"
