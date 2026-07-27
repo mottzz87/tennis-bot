@@ -614,10 +614,15 @@ bot.onText(/\/update/, async (msg) => {
   proc.on('close', (code) => {
     if (code === 0) {
       lines.push('', '🎉 *更新成功*')
+      updateDisplay()
+      // 脚本已完成，Bot 自行重启以加载新代码
+      setTimeout(() => {
+        spawn('pm2', ['restart', 'tennis_bot'], { detached: true, stdio: 'ignore' }).unref()
+      }, 1000)
     } else {
       lines.push('', '❌ *更新失败*（退出码: ' + code + '）')
+      updateDisplay()
     }
-    updateDisplay()
   })
 
   proc.on('error', (err) => {
@@ -751,7 +756,15 @@ bot.on('callback_query', async (query) => {
     const proc = spawn('/bin/bash', [scriptPath], { env: { ...process.env }, stdio: ['ignore', 'pipe', 'pipe'] })
     proc.stdout.on('data', d => { const t = d.toString().trim(); if (t) { lines.push(t); updateDisplay() } })
     proc.stderr.on('data', d => { const t = d.toString().trim(); if (t) { lines.push('⚠️ `' + t.replace(/`/g, '') + '`'); updateDisplay() } })
-    proc.on('close', code => { lines.push('', code === 0 ? '🎉 *更新成功*' : '❌ *更新失败*（退出码: ' + code + '）'); updateDisplay() })
+    proc.on('close', code => {
+      lines.push('', code === 0 ? '🎉 *更新成功*' : '❌ *更新失败*（退出码: ' + code + '）')
+      updateDisplay()
+      if (code === 0) {
+        setTimeout(() => {
+          spawn('pm2', ['restart', 'tennis_bot'], { detached: true, stdio: 'ignore' }).unref()
+        }, 1000)
+      }
+    })
     proc.on('error', err => { lines.push('', '❌ *脚本执行失败*：`' + (err.message || '').replace(/`/g, '') + '`'); updateDisplay() })
     return
   }

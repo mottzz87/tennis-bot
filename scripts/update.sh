@@ -6,6 +6,12 @@
 
 set -e
 
+# 强制 stdout 行缓冲：重新 exec 自己，stdbuf -oL 保证每行 echo 立即写出
+if command -v stdbuf &>/dev/null && [ -z "${_LINBUF:-}" ]; then
+  export _LINBUF=1
+  exec stdbuf -oL bash "$0" "$@"
+fi
+
 cd "$(dirname "$0")/.."
 
 echo '📦 git fetch...'
@@ -25,10 +31,6 @@ monitor)
     echo '📦 重启 tennis_monitor...'
     pm2 restart tennis_monitor
     echo '✔ tennis_monitor 已重启'
-
-    echo '📦 重启 tennis_bot...'
-    pm2 restart tennis_bot
-    echo '✔ tennis_bot 已重启'
     ;;
 booking)
     echo '📦 重启 tennis_book...'
