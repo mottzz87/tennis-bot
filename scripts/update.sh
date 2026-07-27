@@ -17,7 +17,7 @@ git reset --hard origin/main
 echo '✔ git reset 完成'
 
 echo '📦 pnpm install...'
-pnpm install --frozen-lockfile
+npm ci
 echo '✔ pnpm install 完成'
 
 case "${SERVER_ROLE}" in
@@ -39,5 +39,7 @@ booking)
     echo '⚠️ SERVER_ROLE 未设置，跳过服务重启'
     ;;
 esac
+
+pm2 save
 
 echo '🎉 更新成功'
