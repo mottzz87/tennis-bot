@@ -10,6 +10,8 @@
  */
 require('dotenv').config()
 const http = require('http')
+const { spawn } = require('child_process')
+const path = require('path')
 const TelegramBot = require('node-telegram-bot-api')
 const { formatSlotText, formatReminderButtonLabel, escapeMarkdown } = require('@tennis-bot/notifier')
 const { parseSlotStartDateTimeSafe, parseSlotDayKey, formatCourt, formatTimeDisplay } = require('@tennis-bot/utils')
@@ -134,6 +136,9 @@ function buildPanelKeyboard() {
       [
         { text: '⏸️ 暂停监控', callback_data: 'quick_pause' },
         { text: '▶️ 恢复监控', callback_data: 'quick_resume' }
+      ],
+      [
+        { text: '⬆️ 自动更新', callback_data: 'quick_update' }
       ]
     ]
   }
@@ -289,6 +294,7 @@ bot.setMyCommands([
   { command: 'panel', description: '🎛️ 控制面板' },
   { command: 'config', description: '⚙️ 查看配置' },
   { command: 'log', description: '📋 查看日志' },
+  { command: 'update', description: '⬆️ 自动更新' },
   { command: 'help', description: '❓ 帮助' }
 ])
 
@@ -563,6 +569,63 @@ bot.onText(/\/disableplace (.+)/, async (msg, match) => {
   }
 })
 
+bot.onText(/\/update/, async (msg) => {
+  if (!isAdmin(msg)) return
+  const chatId = msg.chat.id
+  const scriptPath = path.resolve(__dirname, '../../scripts/update.sh')
+
+  const statusMsg = await bot.sendMessage(
+    chatId,
+    '⬆️ *开始更新...*\n━━━━━━━━━━━━━━\n⏳ 准备中...',
+    { parse_mode: 'Markdown' }
+  )
+
+  const lines = ['⬆️ *开始更新...*', '━━━━━━━━━━━━━━']
+
+  function updateDisplay() {
+    const display = lines.slice(-15).join('\n')
+    bot.editMessageText(display, {
+      chat_id: chatId,
+      message_id: statusMsg.message_id,
+      parse_mode: 'Markdown'
+    }).catch(() => {})
+  }
+
+  const proc = spawn('/bin/bash', [scriptPath], {
+    env: { ...process.env },
+    stdio: ['ignore', 'pipe', 'pipe']
+  })
+
+  proc.stdout.on('data', (data) => {
+    const text = data.toString().trim()
+    if (!text) return
+    lines.push(text)
+    // 转义 Markdown 特殊字符，Telegram 的 Markdown 模式下 * _ ` [ ] 需要转义
+    updateDisplay()
+  })
+
+  proc.stderr.on('data', (data) => {
+    const text = data.toString().trim()
+    if (!text) return
+    lines.push('⚠️ `' + text.replace(/`/g, '') + '`')
+    updateDisplay()
+  })
+
+  proc.on('close', (code) => {
+    if (code === 0) {
+      lines.push('', '🎉 *更新成功*')
+    } else {
+      lines.push('', '❌ *更新失败*（退出码: ' + code + '）')
+    }
+    updateDisplay()
+  })
+
+  proc.on('error', (err) => {
+    lines.push('', '❌ *脚本执行失败*：`' + (err.message || '').replace(/`/g, '') + '`')
+    updateDisplay()
+  })
+})
+
 bot.onText(/\/help/, async (msg) => {
   if (!isAdmin(msg)) return
   const helpText =
@@ -570,6 +633,7 @@ bot.onText(/\/help/, async (msg) => {
     `【常用】\n` +
     `/panel  控制面板（下方按钮）\n` +
     `/run  立即扫描并推送\n` +
+    `/update  自动更新（git pull + pnpm install + pm2 restart）\n` +
     `/status  状态（含面板）\n` +
     `/listplace  场地开关\n` +
     `/booked  预约记录（可加条数，如 /booked 20）\n` +
@@ -664,6 +728,31 @@ bot.on('callback_query', async (query) => {
     } catch (e) {
       await bot.sendMessage(chatId, `❌ 获取状态失败: ${e.message}`)
     }
+    return
+  }
+
+  if (data === 'quick_update') {
+    await bot.answerCallbackQuery(query.id, { text: '⬆️ 开始更新...' })
+    // Reuse the /update command logic
+    const scriptPath = path.resolve(__dirname, '../../scripts/update.sh')
+    const statusMsg = await bot.sendMessage(
+      chatId,
+      '⬆️ *开始更新...*\n━━━━━━━━━━━━━━\n⏳ 准备中...',
+      { parse_mode: 'Markdown' }
+    )
+    const lines = ['⬆️ *开始更新...*', '━━━━━━━━━━━━━━']
+    const updateDisplay = () => {
+      bot.editMessageText(lines.slice(-15).join('\n'), {
+        chat_id: chatId,
+        message_id: statusMsg.message_id,
+        parse_mode: 'Markdown'
+      }).catch(() => {})
+    }
+    const proc = spawn('/bin/bash', [scriptPath], { env: { ...process.env }, stdio: ['ignore', 'pipe', 'pipe'] })
+    proc.stdout.on('data', d => { const t = d.toString().trim(); if (t) { lines.push(t); updateDisplay() } })
+    proc.stderr.on('data', d => { const t = d.toString().trim(); if (t) { lines.push('⚠️ `' + t.replace(/`/g, '') + '`'); updateDisplay() } })
+    proc.on('close', code => { lines.push('', code === 0 ? '🎉 *更新成功*' : '❌ *更新失败*（退出码: ' + code + '）'); updateDisplay() })
+    proc.on('error', err => { lines.push('', '❌ *脚本执行失败*：`' + (err.message || '').replace(/`/g, '') + '`'); updateDisplay() })
     return
   }
 
