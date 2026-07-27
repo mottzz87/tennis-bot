@@ -211,6 +211,26 @@ const server = http.createServer(async (req, res) => {
       return json(res, { success: true })
     }
 
+    // POST /api/booked/toggle-reminder
+    if (req.method === 'POST' && pathname === '/api/booked/toggle-reminder') {
+      const { uid } = await parseBody(req)
+      if (!uid) return json(res, { success: false, message: '缺少 uid' }, 400)
+      const slots = await storage.getBookedSlots()
+      let found = false
+      let newState = false
+      const updated = slots.map(s => {
+        if (s.uid === uid || s.ucode === uid) {
+          found = true
+          newState = s.reminderEnabled === false
+          return { ...s, reminderEnabled: newState }
+        }
+        return s
+      })
+      if (!found) return json(res, { success: false, message: '未找到' }, 404)
+      await storage.saveBookedSlots(updated)
+      return json(res, { success: true, reminderEnabled: newState })
+    }
+
     // DELETE /api/booked/:uid
     if (req.method === 'DELETE' && pathname.startsWith('/api/booked/')) {
       const uid = pathname.replace('/api/booked/', '')

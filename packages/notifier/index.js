@@ -45,9 +45,10 @@ function formatReminderButtonLabel(d, platformConfig) {
   const meta = platformConfig.PLACE_MAP?.[d.place] || {}
   const placeShort = (meta.short || d.place || '').trim()
   const court = String(formatCourt(d.court) || '').toUpperCase()
+  const date = d.dateDisplay || d.date
   const t = formatTimeDisplay(d.time || `${d.start}-${d.end}`)
   const em = meta.emoji || '🎾'
-  const s = `🔕 ${em} ${placeShort} ${court} · ${t}`
+  const s = `🔕 ${em} ${placeShort} ${court} · ${date} ${t}`
   return truncateTelegramButtonText(s)
 }
 

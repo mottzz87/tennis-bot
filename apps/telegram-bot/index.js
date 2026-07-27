@@ -12,7 +12,7 @@ require('dotenv').config()
 const http = require('http')
 const TelegramBot = require('node-telegram-bot-api')
 const { formatSlotText, formatReminderButtonLabel, escapeMarkdown } = require('@tennis-bot/notifier')
-const { parseSlotStartDateTimeSafe, parseSlotDayKey } = require('@tennis-bot/utils')
+const { parseSlotStartDateTimeSafe, parseSlotDayKey, formatCourt, formatTimeDisplay } = require('@tennis-bot/utils')
 
 const MONITOR_HOST = process.env.MONITOR_HOST || 'http://localhost:3000'
 const BOOKING_HOST = process.env.BOOKING_HOST || 'http://localhost:4000'
@@ -139,15 +139,17 @@ function buildPanelKeyboard() {
   }
 }
 
-function formatBookedLines(all, limit) {
-  const list = all.slice()
-    .sort((a, b) => (new Date(b.create || 0).getTime() || 0) - (new Date(a.create || 0).getTime() || 0))
-    .slice(0, limit)
-  const lines = list.map((d, i) => {
-    const status = d.reminderEnabled === false ? '🔕' : '🔔'
-    return `${i + 1}. ${formatSlotText(d, {}, { style: 'detail' })}   ${status}`
-  })
-  return { lines, list, total: all.length }
+const TG_BTN_MAX = 64
+
+function formatToggleButtonLabel(d, platformConfig) {
+  const meta = platformConfig.PLACE_MAP?.[d.place] || {}
+  const placeShort = (meta.short || d.place || '').trim()
+  const court = String(formatCourt(d.court) || '').toUpperCase()
+  const t = formatTimeDisplay(d.time || `${d.start}-${d.end}`)
+  const date = d.dateDisplay || d.date
+  const bell = d.reminderEnabled === false ? '🔕' : '🔔'
+  const s = `${bell} ${meta.emoji || '🎾'} ${placeShort} ${court} · ${date} ${t}`
+  return Array.from(s).length > TG_BTN_MAX ? Array.from(s).slice(0, TG_BTN_MAX - 1).join('') + '…' : s
 }
 
 // ========================
@@ -221,10 +223,13 @@ async function pushBookedReminder() {
       return ta - tb
     })
     const dayTitle = list[0].dateDisplay || dayKey
-    const buttons = list.map(d => [{
-      text: formatReminderButtonLabel(d, {}),
-      callback_data: `del_booked_${d.ucode}`
-    }])
+    const buttons = await Promise.all(list.map(async d => {
+      const pc = await getPlatformConfig(d.platform)
+      return [{
+        text: formatReminderButtonLabel(d, pc),
+        callback_data: `del_booked_${d.ucode}`
+      }]
+    }))
     const sent = await bot.sendMessage(
       ADMIN_ID,
       `📅 已预约提醒（${dayTitle}）\n━━━━━━━━━━━━━━\n`,
@@ -248,14 +253,15 @@ async function pushUpcomingReminder() {
     if (diffMin > 0 && diffMin <= 60) {
       if (remindedSet.has(d.uid)) continue
       remindedSet.add(d.uid)
+      const pc = await getPlatformConfig(d.platform)
       const sent = await bot.sendMessage(
         ADMIN_ID,
-        `⏰ *即将开始（1小时内）*\n━━━━━━━━━━━━━━\n${formatSlotText(d, {}, { style: 'detail' })}`,
+        `⏰ *即将开始（1小时内）*\n━━━━━━━━━━━━━━\n${formatSlotText(d, pc, { style: 'detail' })}`,
         {
           parse_mode: 'Markdown',
           reply_markup: {
             inline_keyboard: [[{
-              text: formatReminderButtonLabel(d, {}),
+              text: formatReminderButtonLabel(d, pc),
               callback_data: `del_booked_${d.ucode}`
             }]]
           }
@@ -355,9 +361,24 @@ bot.onText(/\/booked(?: (\d+))?/, async (msg, match) => {
       await bot.sendMessage(msg.chat.id, '📚 暂无历史预约记录')
       return
     }
-    const { lines, list, total } = formatBookedLines(slots, limit)
+    const list = slots.slice()
+      .sort((a, b) => (new Date(b.create || 0).getTime() || 0) - (new Date(a.create || 0).getTime() || 0))
+      .slice(0, limit)
+    const buttons = await Promise.all(list.map(async d => {
+      const pc = await getPlatformConfig(d.platform)
+      const meta = pc.PLACE_MAP?.[d.place] || {}
+      const placeShort = (meta.short || d.place || '').trim()
+      const court = String(formatCourt(d.court) || '').toUpperCase()
+      const t = formatTimeDisplay(d.time || `${d.start}-${d.end}`)
+      const date = d.dateDisplay || d.date
+      const bell = d.reminderEnabled === false ? '🔕' : '🔔'
+      const info = `${bell} ${meta.emoji || '🎾'} ${placeShort} ${court} · ${date} ${t}`
+      return [{ text: info, callback_data: `try_del_${d.ucode}` }]
+    }))
     await bot.sendMessage(msg.chat.id,
-      `📚 预约记录（最近 ${list.length}/${total} 条）\n━━━━━━━━━━━━━━\n${lines.join('\n\n')}`)
+      `📚 预约记录（最近 ${list.length}/${slots.length} 条）\n━━━━━━━━━━━━━━`,
+      { reply_markup: { inline_keyboard: buttons } }
+    )
   } catch (e) {
     await bot.sendMessage(msg.chat.id, `❌ 获取预约记录失败: ${e.message}`)
   }
@@ -372,12 +393,17 @@ bot.onText(/\/schedule/, async (msg) => {
       await bot.sendMessage(msg.chat.id, '📅 暂无未开始的预约')
       return
     }
-    const lines = slots.map((d, i) => {
-      const status = d.reminderEnabled === false ? '🔕' : '🔔'
-      return `${i + 1}. ${formatSlotText(d, {}, { style: 'detail' })}   ${status}`
-    })
+    const buttons = await Promise.all(slots.map(async d => {
+      const pc = await getPlatformConfig(d.platform)
+      return [{
+        text: formatToggleButtonLabel(d, pc),
+        callback_data: `toggle_remind_${d.ucode}`
+      }]
+    }))
     await bot.sendMessage(msg.chat.id,
-      `📅 预约日程（共 ${slots.length} 条，按时间排序）\n━━━━━━━━━━━━━━\n${lines.join('\n\n')}`)
+      `📅 预约日程（共 ${slots.length} 条）\n━━━━━━━━━━━━━━\n点击切换提醒状态`,
+      { reply_markup: { inline_keyboard: buttons } }
+    )
   } catch (e) {
     await bot.sendMessage(msg.chat.id, `❌ 获取预约日程失败: ${e.message}`)
   }
@@ -650,9 +676,24 @@ bot.on('callback_query', async (query) => {
         await bot.sendMessage(chatId, '📚 暂无预约记录')
         return
       }
-      const { lines, list, total } = formatBookedLines(slots, 12)
+      const list = slots.slice()
+        .sort((a, b) => (new Date(b.create || 0).getTime() || 0) - (new Date(a.create || 0).getTime() || 0))
+        .slice(0, 12)
+      const buttons = await Promise.all(list.map(async d => {
+        const pc = await getPlatformConfig(d.platform)
+        const meta = pc.PLACE_MAP?.[d.place] || {}
+        const placeShort = (meta.short || d.place || '').trim()
+        const court = String(formatCourt(d.court) || '').toUpperCase()
+        const t = formatTimeDisplay(d.time || `${d.start}-${d.end}`)
+        const date = d.dateDisplay || d.date
+        const bell = d.reminderEnabled === false ? '🔕' : '🔔'
+        const info = `${bell} ${meta.emoji || '🎾'} ${placeShort} ${court} · ${date} ${t}`
+        return [{ text: info, callback_data: `try_del_${d.ucode}` }]
+      }))
       await bot.sendMessage(chatId,
-        `📚 预约记录（最近 ${list.length}/${total} 条）\n━━━━━━━━━━━━━━\n${lines.join('\n\n')}`)
+        `📚 预约记录（最近 ${list.length}/${slots.length} 条）\n━━━━━━━━━━━━━━`,
+        { reply_markup: { inline_keyboard: buttons } }
+      )
     } catch (e) {
       await bot.sendMessage(chatId, `❌ 获取预约记录失败: ${e.message}`)
     }
@@ -668,12 +709,17 @@ bot.on('callback_query', async (query) => {
         await bot.sendMessage(chatId, '📅 暂无未开始的预约')
         return
       }
-      const lines = slots.map((d, i) => {
-        const status = d.reminderEnabled === false ? '🔕' : '🔔'
-        return `${i + 1}. ${formatSlotText(d, {}, { style: 'detail' })}   ${status}`
-      })
+      const buttons = await Promise.all(slots.map(async d => {
+        const pc = await getPlatformConfig(d.platform)
+        return [{
+          text: formatToggleButtonLabel(d, pc),
+          callback_data: `toggle_remind_${d.ucode}`
+        }]
+      }))
       await bot.sendMessage(chatId,
-        `📅 预约日程（共 ${slots.length} 条，按时间排序）\n━━━━━━━━━━━━━━\n${lines.join('\n\n')}`)
+        `📅 预约日程（共 ${slots.length} 条）\n━━━━━━━━━━━━━━\n点击切换提醒状态`,
+        { reply_markup: { inline_keyboard: buttons } }
+      )
     } catch (e) {
       await bot.sendMessage(chatId, `❌ 获取日程失败: ${e.message}`)
     }
@@ -733,6 +779,92 @@ bot.on('callback_query', async (query) => {
       await bot.answerCallbackQuery(query.id, { text: enabled ? '✅ 已开启' : '⏸️ 已关闭' })
     } catch (e) {
       await bot.answerCallbackQuery(query.id, { text: `❌ 操作失败` })
+    }
+    return
+  }
+
+  // --- Toggle reminder (schedule) ---
+  if (data.startsWith('toggle_remind_')) {
+    const ucode = data.replace('toggle_remind_', '')
+    try {
+      const res = await bookingApi('POST', '/api/booked/toggle-reminder', { uid: ucode })
+      if (!res.data?.success) {
+        await bot.answerCallbackQuery(query.id, { text: '⚠️ 未找到对应预约' })
+        return
+      }
+      const newBell = res.data.reminderEnabled ? '🔔' : '🔕'
+      const rows = query.message.reply_markup?.inline_keyboard || []
+      const newRows = rows.map(row => row.map(btn =>
+        btn.callback_data === data
+          ? { ...btn, text: btn.text.replace('🔔', newBell).replace('🔕', newBell) }
+          : btn
+      ))
+      try {
+        await bot.editMessageReplyMarkup({ inline_keyboard: newRows }, {
+          chat_id: query.message.chat.id,
+          message_id: query.message.message_id
+        })
+      } catch (e) {
+        console.warn('[toggle_remind] 更新消息失败:', e.message)
+      }
+      await bot.answerCallbackQuery(query.id, { text: newBell === '🔔' ? '🔔 已开启提醒' : '🔕 已关闭提醒' })
+    } catch (e) {
+      await bot.answerCallbackQuery(query.id, { text: '❌ 操作失败' })
+    }
+    return
+  }
+
+  // --- Try delete record (first click) ---
+  if (data.startsWith('try_del_')) {
+    const ucode = data.replace('try_del_', '')
+    const rows = query.message.reply_markup?.inline_keyboard || []
+    const newRows = rows.map(row => row.map(btn =>
+      btn.callback_data === data
+        ? { text: '🗑️ 确认删除?', callback_data: `confirm_del_${ucode}` }
+        : btn
+    ))
+    try {
+      await bot.editMessageReplyMarkup({ inline_keyboard: newRows }, {
+        chat_id: query.message.chat.id,
+        message_id: query.message.message_id
+      })
+    } catch (e) {
+      console.warn('[try_del] 更新消息失败:', e.message)
+    }
+    await bot.answerCallbackQuery(query.id, { text: '再点一次确认删除' })
+    return
+  }
+
+  // --- Confirm delete record ---
+  if (data.startsWith('confirm_del_')) {
+    const ucode = data.replace('confirm_del_', '')
+    try {
+      const res = await bookingApi('DELETE', `/api/booked/${encodeURIComponent(ucode)}`)
+      if (!res.data?.success) {
+        await bot.answerCallbackQuery(query.id, { text: '⚠️ 未找到对应预约记录' })
+        return
+      }
+      const rows = query.message.reply_markup?.inline_keyboard || []
+      const idx = rows.findIndex(row => row.some(btn => btn.callback_data === data))
+      const newRows = rows.filter((_, i) => i !== idx)
+      try {
+        if (newRows.length === 0) {
+          await bot.editMessageText('🗑️ 预约记录已全部删除', {
+            chat_id: query.message.chat.id,
+            message_id: query.message.message_id
+          })
+        } else {
+          await bot.editMessageReplyMarkup({ inline_keyboard: newRows }, {
+            chat_id: query.message.chat.id,
+            message_id: query.message.message_id
+          })
+        }
+      } catch (e) {
+        console.warn('[confirm_del] 更新消息失败:', e.message)
+      }
+      await bot.answerCallbackQuery(query.id, { text: '🗑️ 已删除' })
+    } catch (e) {
+      await bot.answerCallbackQuery(query.id, { text: '❌ 删除失败' })
     }
     return
   }
