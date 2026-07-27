@@ -6,7 +6,12 @@
 
 echo "SCRIPT: $(realpath "$0")"
 echo "PWD: $(pwd)"
+export FNM_PATH="$HOME/.local/share/fnm"
 
+if [ -d "$FNM_PATH" ]; then
+    export PATH="$FNM_PATH:$PATH"
+    eval "$("$FNM_PATH/fnm" env --shell bash)"
+fi
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
