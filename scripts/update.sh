@@ -86,3 +86,10 @@ pm2 save >/dev/null
 echo
 echo "━━━━━━━━━━━━━━"
 echo "🎉 更新成功"
+
+if [ "${SERVER_ROLE:-}" = "monitor" ]; then
+    (
+        sleep 2
+        pm2 restart tennis_bot
+    ) &
+fi
