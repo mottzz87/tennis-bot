@@ -15,6 +15,7 @@ const path = require('path')
 const TelegramBot = require('node-telegram-bot-api')
 const { formatSlotText, formatReminderButtonLabel, escapeMarkdown } = require('@tennis-bot/notifier')
 const { parseSlotStartDateTimeSafe, parseSlotDayKey, formatCourt, formatTimeDisplay } = require('@tennis-bot/utils')
+const readline = require('readline')
 
 const MONITOR_HOST = process.env.MONITOR_HOST || 'http://localhost:3000'
 const BOOKING_HOST = process.env.BOOKING_HOST || 'http://localhost:4000'
@@ -575,92 +576,108 @@ bot.onText(/\/update/, async (msg) => {
   const chatId = msg.chat.id
   const scriptPath = path.resolve(__dirname, '../../scripts/update.sh')
 
-  const statusMsg = await bot.sendMessage(
-    chatId,
-    '⬆️ *开始更新...*\n━━━━━━━━━━━━━━\n⏳ 准备中...',
-    { parse_mode: 'Markdown' }
-  )
-
   const lines = [
-    '⬆️ *开始更新...*',
+    '⬆️ 开始更新...',
     '━━━━━━━━━━━━━━'
   ]
 
-  function updateDisplay() {
-    bot.editMessageText(
-      lines.slice(-15).join('\n'),
-      {
-        chat_id: chatId,
-        message_id: statusMsg.message_id,
-        parse_mode: 'Markdown'
+  const statusMsg = await bot.sendMessage(chatId, lines.join('\n'))
+
+  async function updateDisplay() {
+    try {
+      await bot.editMessageText(
+        lines.slice(-20).join('\n'),
+        {
+          chat_id: chatId,
+          message_id: statusMsg.message_id
+        }
+      )
+    } catch (err) {
+      // Telegram "message is not modified" 可以忽略
+      if (
+        err.response?.body?.description?.includes('message is not modified')
+      ) {
+        return
       }
-    ).catch(() => {})
-  }
 
-  function append(text) {
-    text
-      .split(/\r?\n/)
-      .map(s => s.trim())
-      .filter(Boolean)
-      .forEach(line => lines.push(line))
-
-    updateDisplay()
+      console.error('editMessageText error:')
+      console.error(err.response?.body || err)
+    }
   }
 
   const proc = spawn('/bin/bash', [scriptPath], {
-    env: { ...process.env },
+    cwd: path.resolve(__dirname, '../..'),
+    env: process.env,
     stdio: ['ignore', 'pipe', 'pipe']
   })
 
-  proc.stdout.on('data', data => {
-    append(data.toString())
+  // stdout 按行读取
+  const stdout = readline.createInterface({
+    input: proc.stdout
   })
 
-  proc.stderr.on('data', data => {
-    append(
-      data
-        .toString()
-        .split(/\r?\n/)
-        .filter(Boolean)
-        .map(line => `⚠️ ${line}`)
-        .join('\n')
-    )
-  })
+  stdout.on('line', (line) => {
+    if (!line.trim()) return
 
-  proc.on('close', code => {
+    lines.push(line)
 
-    if (code === 0) {
-
-      lines.push('')
-      lines.push('🎉 *更新成功*')
-      updateDisplay()
-
-      // 更新完成后重启 Bot，自身加载最新代码
-      setTimeout(() => {
-        spawn(
-          'pm2',
-          ['restart', 'tennis_bot'],
-          {
-            detached: true,
-            stdio: 'ignore'
-          }
-        ).unref()
-      }, 1500)
-
-    } else {
-
-      lines.push('')
-      lines.push(`❌ *更新失败*（退出码 ${code}）`)
-      updateDisplay()
-
+    if (lines.length > 50) {
+      lines.splice(2, lines.length - 50)
     }
 
+    updateDisplay()
   })
 
-  proc.on('error', err => {
-    lines.push('')
-    lines.push(`❌ *脚本启动失败*：${err.message}`)
+  // stderr 按行读取
+  const stderr = readline.createInterface({
+    input: proc.stderr
+  })
+
+  stderr.on('line', (line) => {
+    if (!line.trim()) return
+
+    lines.push('⚠️ ' + line)
+
+    if (lines.length > 50) {
+      lines.splice(2, lines.length - 50)
+    }
+
     updateDisplay()
+  })
+
+  proc.on('close', async (code) => {
+    if (code === 0) {
+      lines.push('━━━━━━━━━━━━━━')
+      lines.push('🎉 更新成功')
+
+      await updateDisplay()
+
+      // monitor 服务器最后再重启自己
+      if (process.env.SERVER_ROLE === 'monitor') {
+        setTimeout(() => {
+          spawn(
+            'pm2',
+            ['restart', 'tennis_bot'],
+            {
+              detached: true,
+              stdio: 'ignore'
+            }
+          ).unref()
+        }, 1000)
+      }
+    } else {
+      lines.push('━━━━━━━━━━━━━━')
+      lines.push(`❌ 更新失败 (${code})`)
+      await updateDisplay()
+    }
+  })
+
+  proc.on('error', async (err) => {
+    lines.push('━━━━━━━━━━━━━━')
+    lines.push('❌ 无法执行更新脚本')
+    lines.push(err.message)
+
+    await updateDisplay()
   })
 })
 
