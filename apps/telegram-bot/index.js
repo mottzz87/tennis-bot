@@ -576,83 +576,46 @@ bot.onText(/\/update/, async (msg) => {
   const chatId = msg.chat.id
   const scriptPath = path.resolve(__dirname, '../../scripts/update.sh')
 
-  const lines = [
-    '⬆️ 开始更新...',
-    '━━━━━━━━━━━━━━'
-  ]
-
-  const statusMsg = await bot.sendMessage(chatId, lines.join('\n'))
-
-  async function updateDisplay() {
-    try {
-      await bot.editMessageText(
-        lines.slice(-20).join('\n'),
-        {
-          chat_id: chatId,
-          message_id: statusMsg.message_id
-        }
-      )
-    } catch (err) {
-      // Telegram "message is not modified" 可以忽略
-      if (
-        err.response?.body?.description?.includes('message is not modified')
-      ) {
-        return
-      }
-
-      console.error('editMessageText error:')
-      console.error(err.response?.body || err)
+  const statusMsg = await bot.sendMessage(
+    chatId,
+    [
+      '⬆️ *开始更新*',
+      '━━━━━━━━━━━━━━',
+      '⏳ 正在拉取代码并更新服务...',
+      '',
+      '请稍候，大约需要几秒钟。'
+    ].join('\n'),
+    {
+      parse_mode: 'Markdown'
     }
-  }
+  )
 
   const proc = spawn('/bin/bash', [scriptPath], {
     cwd: path.resolve(__dirname, '../..'),
     env: process.env,
-    stdio: ['ignore', 'pipe', 'pipe']
-  })
-
-  // stdout 按行读取
-  const stdout = readline.createInterface({
-    input: proc.stdout
-  })
-
-  stdout.on('line', (line) => {
-    if (!line.trim()) return
-
-    lines.push(line)
-
-    if (lines.length > 50) {
-      lines.splice(2, lines.length - 50)
-    }
-
-    updateDisplay()
-  })
-
-  // stderr 按行读取
-  const stderr = readline.createInterface({
-    input: proc.stderr
-  })
-
-  stderr.on('line', (line) => {
-    if (!line.trim()) return
-
-    lines.push('⚠️ ' + line)
-
-    if (lines.length > 50) {
-      lines.splice(2, lines.length - 50)
-    }
-
-    updateDisplay()
+    stdio: 'ignore' // 完全忽略 stdout / stderr
   })
 
   proc.on('close', async (code) => {
     if (code === 0) {
-      lines.push('━━━━━━━━━━━━━━')
-      lines.push('🎉 更新成功')
+      await bot.editMessageText(
+        [
+          '✅ *更新完成*',
+          '━━━━━━━━━━━━━━',
+          '🚀 服务已更新',
+          '',
+          `版本：\`${process.env.npm_package_version || 'latest'}\``,
+          '',
+          '🔄 正在重启 Telegram Bot...'
+        ].join('\n'),
+        {
+          chat_id: chatId,
+          message_id: statusMsg.message_id,
+          parse_mode: 'Markdown'
+        }
+      )
 
-      await updateDisplay()
-
-      // monitor 服务器最后再重启自己
+      // 最后重启自己
       if (process.env.SERVER_ROLE === 'monitor') {
         setTimeout(() => {
           spawn(
@@ -666,18 +629,34 @@ bot.onText(/\/update/, async (msg) => {
         }, 1000)
       }
     } else {
-      lines.push('━━━━━━━━━━━━━━')
-      lines.push(`❌ 更新失败 (${code})`)
-      await updateDisplay()
+      await bot.editMessageText(
+        [
+          '❌ *更新失败*',
+          '━━━━━━━━━━━━━━',
+          `退出码：${code}`
+        ].join('\n'),
+        {
+          chat_id: chatId,
+          message_id: statusMsg.message_id,
+          parse_mode: 'Markdown'
+        }
+      )
     }
   })
 
   proc.on('error', async (err) => {
-    lines.push('━━━━━━━━━━━━━━')
-    lines.push('❌ 无法执行更新脚本')
-    lines.push(err.message)
-
-    await updateDisplay()
+    await bot.editMessageText(
+      [
+        '❌ *更新失败*',
+        '━━━━━━━━━━━━━━',
+        err.message
+      ].join('\n'),
+      {
+        chat_id: chatId,
+        message_id: statusMsg.message_id,
+        parse_mode: 'Markdown'
+      }
+    )
   })
 })
 
