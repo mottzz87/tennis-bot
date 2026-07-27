@@ -137,9 +137,6 @@ function buildPanelKeyboard() {
       [
         { text: '⏸️ 暂停监控', callback_data: 'quick_pause' },
         { text: '▶️ 恢复监控', callback_data: 'quick_resume' }
-      ],
-      [
-        { text: '⬆️ 自动更新', callback_data: 'quick_update' }
       ]
     ]
   }
@@ -295,7 +292,6 @@ bot.setMyCommands([
   { command: 'panel', description: '🎛️ 控制面板' },
   { command: 'config', description: '⚙️ 查看配置' },
   { command: 'log', description: '📋 查看日志' },
-  { command: 'update', description: '⬆️ 自动更新' },
   { command: 'help', description: '❓ 帮助' }
 ])
 
@@ -570,95 +566,6 @@ bot.onText(/\/disableplace (.+)/, async (msg, match) => {
   }
 })
 
-bot.onText(/\/update/, async (msg) => {
-  if (!isAdmin(msg)) return
-
-  const chatId = msg.chat.id
-  const scriptPath = path.resolve(__dirname, '../../scripts/update.sh')
-
-  const statusMsg = await bot.sendMessage(
-    chatId,
-    [
-      '⬆️ *开始更新*',
-      '━━━━━━━━━━━━━━',
-      '⏳ 正在拉取代码并更新服务...',
-      '',
-      '请稍候，大约需要几秒钟。'
-    ].join('\n'),
-    {
-      parse_mode: 'Markdown'
-    }
-  )
-
-  const proc = spawn('/bin/bash', [scriptPath], {
-    cwd: path.resolve(__dirname, '../..'),
-    env: process.env,
-    stdio: 'ignore' // 完全忽略 stdout / stderr
-  })
-
-  proc.on('close', async (code) => {
-    if (code === 0) {
-      await bot.editMessageText(
-        [
-          '✅ *更新完成*',
-          '━━━━━━━━━━━━━━',
-          '🚀 服务已更新',
-          '',
-          `版本：\`${process.env.npm_package_version || 'latest'}\``,
-          '',
-          '🔄 正在重启 Telegram Bot...'
-        ].join('\n'),
-        {
-          chat_id: chatId,
-          message_id: statusMsg.message_id,
-          parse_mode: 'Markdown'
-        }
-      )
-
-      // 最后重启自己
-      if (process.env.SERVER_ROLE === 'monitor') {
-        setTimeout(() => {
-          spawn(
-            'pm2',
-            ['restart', 'tennis_bot'],
-            {
-              detached: true,
-              stdio: 'ignore'
-            }
-          ).unref()
-        }, 1000)
-      }
-    } else {
-      await bot.editMessageText(
-        [
-          '❌ *更新失败*',
-          '━━━━━━━━━━━━━━',
-          `退出码：${code}`
-        ].join('\n'),
-        {
-          chat_id: chatId,
-          message_id: statusMsg.message_id,
-          parse_mode: 'Markdown'
-        }
-      )
-    }
-  })
-
-  proc.on('error', async (err) => {
-    await bot.editMessageText(
-      [
-        '❌ *更新失败*',
-        '━━━━━━━━━━━━━━',
-        err.message
-      ].join('\n'),
-      {
-        chat_id: chatId,
-        message_id: statusMsg.message_id,
-        parse_mode: 'Markdown'
-      }
-    )
-  })
-})
 
 bot.onText(/\/help/, async (msg) => {
   if (!isAdmin(msg)) return
@@ -667,7 +574,6 @@ bot.onText(/\/help/, async (msg) => {
     `【常用】\n` +
     `/panel  控制面板（下方按钮）\n` +
     `/run  立即扫描并推送\n` +
-    `/update  自动更新（git pull + npm ci + pm2 restart）\n` +
     `/status  状态（含面板）\n` +
     `/listplace  场地开关\n` +
     `/booked  预约记录（可加条数，如 /booked 20）\n` +
@@ -762,39 +668,6 @@ bot.on('callback_query', async (query) => {
     } catch (e) {
       await bot.sendMessage(chatId, `❌ 获取状态失败: ${e.message}`)
     }
-    return
-  }
-
-  if (data === 'quick_update') {
-    await bot.answerCallbackQuery(query.id, { text: '⬆️ 开始更新...' })
-    // Reuse the /update command logic
-    const scriptPath = path.resolve(__dirname, '../../scripts/update.sh')
-    const statusMsg = await bot.sendMessage(
-      chatId,
-      '⬆️ *开始更新...*\n━━━━━━━━━━━━━━\n⏳ 准备中...',
-      { parse_mode: 'Markdown' }
-    )
-    const lines = ['⬆️ *开始更新...*', '━━━━━━━━━━━━━━']
-    const updateDisplay = () => {
-      bot.editMessageText(lines.slice(-15).join('\n'), {
-        chat_id: chatId,
-        message_id: statusMsg.message_id,
-        parse_mode: 'Markdown'
-      }).catch(() => {})
-    }
-    const proc = spawn('/bin/bash', [scriptPath], { env: { ...process.env }, stdio: ['ignore', 'pipe', 'pipe'] })
-    proc.stdout.on('data', d => { const t = d.toString().trim(); if (t) { lines.push(t); updateDisplay() } })
-    proc.stderr.on('data', d => { const t = d.toString().trim(); if (t) { lines.push('⚠️ `' + t.replace(/`/g, '') + '`'); updateDisplay() } })
-    proc.on('close', code => {
-      lines.push('', code === 0 ? '🎉 *更新成功*' : '❌ *更新失败*（退出码: ' + code + '）')
-      updateDisplay()
-      if (code === 0) {
-        setTimeout(() => {
-          spawn('pm2', ['restart', 'tennis_bot'], { detached: true, stdio: 'ignore' }).unref()
-        }, 1000)
-      }
-    })
-    proc.on('error', err => { lines.push('', '❌ *脚本执行失败*：`' + (err.message || '').replace(/`/g, '') + '`'); updateDisplay() })
     return
   }
 
