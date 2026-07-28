@@ -1,5 +1,5 @@
 {
-  "INTERVAL": 45,
+  "INTERVAL": 65,
   "AUTO_BOOK": false,
   "NOTIFY_ADDED": true,
   "NOTIFY_REMOVED": true,
