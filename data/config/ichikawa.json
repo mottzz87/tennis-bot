@@ -1,4 +1,5 @@
 {
+  "enabled": true,
   "TARGET_PLACE": [
     "福栄スポーツ広場テニスコート",
     "菅野終末処理場テニスコート"
@@ -12,7 +13,7 @@
   "AUTO_TIME_FILTER": [],
   "AUTO_WEEKDAY_FILTER": [
     "土",
-    "日" 
+    "日"
   ],
   "AUTO_PLACE_FILTER": [
     "福栄スポーツ広場テニスコート",

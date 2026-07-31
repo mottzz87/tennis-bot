@@ -24,9 +24,18 @@ function formatSlotText(d, platformConfig, options = {}) {
   }
 
   const shortTime = formatTimeDisplay(d.time || `${d.start}-${d.end}`)
+  const courts = d.courts // 合并时按拼接顺序排列的场地计数序列（如 "2AB"）
+  const totalHours = d.duration ? Math.round(Number(d.duration) / 60) : null
 
   if (style === 'detail') {
-    return `${emoji} ${placeShort}｜${courtDisplay}\n📅 ${shortDate} ⏰ ${shortTime}${bike}`
+    const courtPart = courts
+      ? `｜拼接 ${totalHours != null ? `${totalHours}h ` : ''}${courts}`
+      : `｜${courtDisplay}`
+    return `${emoji} ${placeShort}${courtPart}\n📅 ${shortDate} ⏰ ${shortTime}${bike}`
+  }
+  if (courts) {
+    const hPart = totalHours != null ? `${totalHours}h ｜ ` : ''
+    return `${emoji} ${placeShort} ${shortDate} ${shortTime}${bike} ｜ ${hPart}${courts}`
   }
   return `${emoji} ${placeShort} ${formatCourt(d.court)} ${shortDate} ${shortTime}${bike}`
 }

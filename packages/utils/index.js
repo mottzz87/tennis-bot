@@ -94,8 +94,18 @@ function formatDateDisplayFromIso(iso) {
 
 function formatTimeDisplay(time) {
   const raw = String(time || '').trim()
-  const m = raw.match(/^(\d{1,2})-(\d{1,2})$/)
-  if (m) return `${String(m[1]).padStart(2, '0')}:00–${String(m[2]).padStart(2, '0')}:00`
+  const parts = raw.split(/[~\-]/)
+  if (parts.length === 2) {
+    // 整点去掉 :00，非整点保留分钟（如 12:00-14:00 → 12-14，12:30-14:00 → 12:30-14）
+    const fmt = p => {
+      const m = String(p).trim().match(/^(\d{1,2})(?::(\d{2}))?$/)
+      if (!m) return String(p).trim()
+      const h = String(m[1]).padStart(2, '0')
+      const mm = m[2]
+      return mm === '00' || mm == null ? h : `${h}:${mm}`
+    }
+    return `${fmt(parts[0])}-${fmt(parts[1])}`
+  }
   return raw.replace('~', '–')
 }
 

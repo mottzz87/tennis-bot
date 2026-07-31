@@ -22,7 +22,7 @@
  * 自身不执行任何 Playwright 预约操作
  * 不处理 Telegram 用户交互（由 telegram-bot 处理）
  */
-require('dotenv').config()
+require('@tennis-bot/config/loadEnv')()
 const fs = require('fs')
 const path = require('path')
 const http = require('http')
@@ -233,6 +233,46 @@ function groupSlotsByPlatform(slots) {
   return map
 }
 
+// 场地优先级：PLACE_MAP.priority 越小越靠前（未配置按 999 排最后）
+function placePriority(d) {
+  const pc = getPlatformConfig(d.place)
+  const p = pc.PLACE_MAP?.[d.place]?.priority
+  return Number.isFinite(p) ? p : 999
+}
+
+function sortSlots(list) {
+  return list.slice().sort((a, b) => {
+    const pa = placePriority(a), pb = placePriority(b)
+    if (pa !== pb) return pa - pb
+    const ta = `${a.date || ''} ${a.start || a.time || ''}`
+    const tb = `${b.date || ''} ${b.start || b.time || ''}`
+    return ta < tb ? -1 : ta > tb ? 1 : 0
+  })
+}
+
+// 每条消息最多放的内联按钮数：避免 Telegram "reply markup is too long"
+const MAX_INLINE_BUTTONS = 10
+
+function placeMeta(place) {
+  const pc = getPlatformConfig(place)
+  return pc.PLACE_MAP?.[place] || {}
+}
+function placeShort(place) { return placeMeta(place).short || place }
+function placeEmoji(place) { return placeMeta(place).emoji || '🎾' }
+
+// 分批发送 book 按钮（每批 MAX_INLINE_BUTTONS 个）
+async function sendBookButtons(bot, chatId, slots, header) {
+  for (let i = 0; i < slots.length; i += MAX_INLINE_BUTTONS) {
+    const part = slots.slice(i, i + MAX_INLINE_BUTTONS)
+    const buttons = part.map(d => ({
+      text: formatSlotText(d, getPlatformConfig(d.place)),
+      callback_data: `book_${d.ucode}`
+    }))
+    const h = i === 0 ? header : `${header}\n（第 ${i / MAX_INLINE_BUTTONS + 1} 页）`
+    await bot.sendMessage(chatId, h, { reply_markup: { inline_keyboard: buttons.map(b => [b]) } })
+  }
+}
+
 async function sendTelegram(data, version, title = '🆕 可预约（点击直接预约）') {
   const grouped = groupSlotsByPlatform(data)
 
@@ -244,16 +284,45 @@ async function sendTelegram(data, version, title = '🆕 可预约（点击直�
       console.log(`[通知] ${platform} 未配置 Bot Token 或 Chat ID，跳过`)
       continue
     }
-    const buttons = slots.slice(0, maxPush).map(d => ({
-      text: formatSlotText(d, getPlatformConfig(d.place)),
-      callback_data: `book_${d.ucode}`
-    }))
+    const list = sortSlots(slots).slice(0, maxPush)
+    const byPlace = new Map()
+    for (const d of list) {
+      if (!byPlace.has(d.place)) byPlace.set(d.place, [])
+      byPlace.get(d.place).push(d)
+    }
+    const places = [...byPlace.keys()]
 
-    await botInstance.sendMessage(
+    // 单场地且空位少 → 直接全部 book 按钮（保持一键预约）
+    if (places.length === 1 && list.length <= MAX_INLINE_BUTTONS) {
+      await sendBookButtons(botInstance, chatId, list, title)
+      continue
+    }
+
+    // 多场地/空位多 → 两级导航：
+    //   第一个（优先级最高）场地直接给 book 按钮，其余场地给"查看空位"按钮
+    const firstPlace = places[0]
+    const firstSlots = byPlace.get(firstPlace)
+    await sendBookButtons(
+      botInstance,
       chatId,
-      title,
-      { reply_markup: { inline_keyboard: buttons.map(b => [b]) } }
+      firstSlots,
+      `${title}\n━━━━━━━━━━━━━━\n${placeEmoji(firstPlace)} ${placeShort(firstPlace)}（${firstSlots.length} 个）`
     )
+
+    const restRows = places.map(p =>
+      `${placeEmoji(p)} ${placeShort(p)} ×${byPlace.get(p).length}`
+    )
+    const restButtons = places.slice(1).map(p => [{
+      text: `🔍 ${placeShort(p)}（${byPlace.get(p).length}）查看空位`,
+      callback_data: `viewplace_${platform}|${p}`
+    }])
+    if (restButtons.length > 0) {
+      await botInstance.sendMessage(
+        chatId,
+        `${title}\n━━━━━━━━━━━━━━\n${restRows.join('\n')}`,
+        { reply_markup: { inline_keyboard: restButtons } }
+      )
+    }
   }
 }
 
@@ -268,10 +337,12 @@ async function sendRemovedTelegram(data) {
       continue
     }
     const maxPush = config.getEffective('MAX_PUSH', platform) || 100
-    const msg = slots.slice(0, maxPush)
+    const msg = sortSlots(slots).slice(0, maxPush)
       .map(d => `⚠️ 已被预约\n${formatSlotText(d, getPlatformConfig(d.place))}`)
       .join('\n\n')
-    await botInstance.sendMessage(chatId, msg)
+    for (const part of core.splitForTelegram(msg)) {
+      await botInstance.sendMessage(chatId, part)
+    }
   }
 }
 
@@ -678,6 +749,15 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && pathname === '/api/log') {
       const n = Math.min(200, Math.max(1, Number(url.searchParams.get('n')) || 50))
       return json(res, { lines: logBuffer.slice(-n) })
+    }
+
+    // GET /api/place/:platform/:place — 某场地当前空位（多场地推送的"查看空位"按钮）
+    if (req.method === 'GET' && pathname.startsWith('/api/place/')) {
+      const parts = decodeURIComponent(pathname.replace('/api/place/', '')).split('/')
+      const platform = parts[0]
+      const place = parts.slice(1).join('/')
+      const slots = sortSlots((currentData || []).filter(s => s.platform === platform && s.place === place))
+      return json(res, { success: true, slots })
     }
 
     // GET /api/slot/:ucode

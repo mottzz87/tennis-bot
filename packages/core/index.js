@@ -21,14 +21,34 @@ const {
 // ========================
 
 function matchTime(dTime, filter) {
+  // 每个过滤项是一个时间段（如 "6-11" 表示起始时间 6:00-11:00），
+  // 单项如 "12" 表示起始时间 >= 12:00；命中任意一个时间段即保留
   const start = String(dTime).split(/[～~\-]/)[0]
   const startMin = toMinutes(start)
-  if (filter.length === 1) return startMin >= toMinutes(filter[0])
-  if (filter.length === 2) {
-    const [min, max] = filter.map(toMinutes)
-    return startMin >= min && startMin <= max
+  for (const item of filter) {
+    const parts = String(item).trim().split(/[～~\-]/)
+    const min = toMinutes(parts[0])
+    if (parts.length < 2) {
+      if (startMin >= min) return true
+    } else {
+      const max = toMinutes(parts[1])
+      if (startMin >= min && startMin <= max) return true
+    }
   }
-  return true
+  return false
+}
+
+// 从 dateDisplay（如 "8.08（土）"）或 date（ISO）解析星期，解析失败返回 null
+function resolveWeekday(d) {
+  const display = String(d.dateDisplay || '')
+  const m1 = display.match(/[（(]([月火水木金土日])[）)]/)
+  if (m1) return m1[1]
+  if (/^\d{4}-\d{2}-\d{2}$/.test(String(d.date || '').trim())) {
+    const [y, mo, day] = String(d.date).split('-').map(Number)
+    return WEEKDAY_JP[new Date(y, mo - 1, day).getDay()]
+  }
+  const m2 = String(d.date || '').match(/[（(]([月火水木金土日])[）)]/)
+  return m2 ? m2[1] : null
 }
 
 function filterSlotsByRules(data, rules) {
@@ -38,23 +58,14 @@ function filterSlotsByRules(data, rules) {
   const PLACE_FILTER = rules.PLACE_FILTER || []
 
   return data.filter(d => {
-    if (TIME_FILTER.length > 0) {
+    const weekday = resolveWeekday(d)
+
+    // 周末（土/日）默认全天可扫，不受 TIME_FILTER 限制
+    if (TIME_FILTER.length > 0 && weekday !== '土' && weekday !== '日') {
       if (!matchTime(d.time || d.start, TIME_FILTER)) return false
     }
 
     if (WEEKDAY_FILTER.length > 0) {
-      let weekday = null
-      const display = String(d.dateDisplay || '')
-      const m1 = display.match(/[（(]([月火水木金土日])[）)]/)
-      if (m1) {
-        weekday = m1[1]
-      } else if (/^\d{4}-\d{2}-\d{2}$/.test(String(d.date || '').trim())) {
-        const [y, mo, day] = String(d.date).split('-').map(Number)
-        weekday = WEEKDAY_JP[new Date(y, mo - 1, day).getDay()]
-      } else {
-        const m2 = String(d.date || '').match(/[（(]([月火水木金土日])[）)]/)
-        if (m2) weekday = m2[1]
-      }
       if (!weekday || !WEEKDAY_FILTER.includes(weekday)) return false
     }
 
@@ -116,6 +127,89 @@ function filterSlotsAuto(data, platformConfig) {
     rules.PLACE_FILTER = expanded
   }
   return filterSlotsByRules(data, rules)
+}
+
+// ========================
+// 连续时段合并
+// ========================
+
+// 同一 (place, date) 内、跨场地的连续空位拼接为一个时段：
+// 只要前一段的 end 等于后一段的 start（不要求同一场地），即可串联。
+// 只有总时长 >= minMinutes 的连续段才保留，不足阈值则丢弃。
+// 输出带 courts 字段：按拼接先后顺序排列的场地字母（如 "ABCD"），连续同一场地去重。
+function mergeContiguousSlots(slots, minMinutes) {
+  if (!Array.isArray(slots) || slots.length === 0) return []
+  const groups = new Map()
+  for (const s of slots) {
+    const key = `${s.place}|${s.date}`
+    if (!groups.has(key)) groups.set(key, [])
+    groups.get(key).push(s)
+  }
+
+  const out = []
+  for (const list of groups.values()) {
+    const run = []
+    const flush = () => {
+      if (run.length === 0) return
+      const totalMin = run.reduce((a, s) => a + Number(s.duration || 60), 0)
+      if (totalMin >= minMinutes) {
+        out.push({
+          platform: run[0].platform,
+          place: run[0].place,
+          court: run[0].court,
+          date: run[0].date,
+          start: run[0].start,
+          end: run[run.length - 1].end,
+          duration: totalMin,
+          available: true,
+          courts: courtSeq(run)
+        })
+      }
+      run.length = 0
+    }
+    list
+      .slice()
+      .sort((a, b) => String(a.start).localeCompare(String(b.start)))
+      .forEach(s => {
+        const prev = run[run.length - 1]
+        if (prev && prev.end === s.start) {
+          run.push(s)
+        } else {
+          flush()
+          run.push(s)
+        }
+      })
+    flush()
+  }
+  return out
+}
+
+// 拼接顺序的场地序列：连续同一场地合并为"N字母"，N>1 才带小时数
+// （Ａ面12-13+Ａ面13-14 → "2A"；Ａ面12-13+Ｂ面13-14 → "AB"）
+function courtSeq(run) {
+  const groups = []
+  for (const s of run) {
+    const letter = courtLetter(s.court)
+    const hours = (Number(s.duration) || 60) / 60
+    const last = groups[groups.length - 1]
+    if (last && last.letter === letter) last.hours += hours
+    else groups.push({ letter, hours })
+  }
+  return groups.map(g => g.hours > 1 ? `${trimHourNum(g.hours)}${g.letter}` : g.letter).join('')
+}
+
+function trimHourNum(h) {
+  return Number.isInteger(h) ? String(h) : String(+h.toFixed(1))
+}
+
+// "水辺テニスＡ面" → "A"；"Ａ面" → "A"；兜底取名字首字符
+function courtLetter(court) {
+  const name = String(court || '')
+  const m = name.match(/([Ａ-Ｚ])(?=面)/)
+  if (m) return String.fromCharCode(m[1].charCodeAt(0) - 0xFEE0)
+  const m2 = name.match(/([A-Z])(?=面)/)
+  if (m2) return m2[1]
+  return name.slice(0, 1) || '?'
 }
 
 // ========================
@@ -369,6 +463,7 @@ function splitForTelegram(text, maxLen = 3800) {
 module.exports = {
   filterSlotsByRules,
   filterSlotsByConfig,
+  mergeContiguousSlots,
   getAutoRules,
   filterSlotsAuto,
   buildUcode,

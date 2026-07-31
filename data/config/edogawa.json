@@ -1,7 +1,66 @@
 {
-  "enabled": false,
-  "TARGET_PLACE": [],
-  "PLACE_MAP": {},
+  "enabled": true,
+  "TARGET_PLACE": [
+    "谷河内テニスコート",
+    "西葛西テニスコート",
+    "水辺のスポーツガーデン"
+  ],
+  "PLACE_MAP": {
+    "松江テニスコート": {
+      "short": "松江",
+      "emoji": "⛳",
+      "courtCode": "matsue",
+      "bike": "🚴 40分",
+      "priority": 6
+    },
+    "西葛西テニスコート": {
+      "short": "西葛西",
+      "emoji": "🎯",
+      "courtCode": "nishikasai",
+      "bike": "🚇 20分",
+      "priority": 3
+    },
+    "小岩テニスコート": {
+      "short": "小岩",
+      "emoji": "🚩",
+      "courtCode": "koiwa",
+      "bike": "🚴 35分",
+      "priority": 5
+    },
+    "谷河内テニスコート": {
+      "short": "谷河内",
+      "emoji": "🏆",
+      "courtCode": "yagouchi",
+      "bike": "🚴 25分",
+      "priority": 1
+    },
+    "スポーツランド": {
+      "short": "江户川",
+      "emoji": "🏟️",
+      "courtCode": "sportsland",
+      "bike": "🚴 20分",
+      "priority": 4
+    },
+    "水辺のスポーツガーデン": {
+      "short": "水辺",
+      "emoji": "🏸",
+      "courtCode": "mizube",
+      "bike": "🚴 20分",
+      "priority": 2
+    }
+  },
+  "TIME_FILTER": [
+    "6-11",
+    "17-21"
+  ],
+  "WEEKDAY_FILTER": [],
+  "COURT_NUM_FILTER": [],
+  "AUTO_TIME_FILTER": [],
+  "AUTO_WEEKDAY_FILTER": [],
+  "AUTO_PLACE_FILTER": [],
+  "AUTO_COURT_NUM_FILTER": [],
+  "SCAN_DAYS": 14,
+  "MIN_CONTINUOUS_HOURS": 2,
   "BOOK_DURATION": 60,
   "SEARCH_MODE": "hour"
 }

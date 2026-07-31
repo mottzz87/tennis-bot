@@ -15,7 +15,7 @@
  *   DELETE /api/booked/:uid
  *   GET  /status               -> { busy, currentTask }
  */
-require('dotenv').config()
+require('@tennis-bot/config/loadEnv')()
 const http = require('http')
 const { loadPlatform } = require('@tennis-bot/platform')
 const FileStorage = require('@tennis-bot/storage/file/FileStorage')
