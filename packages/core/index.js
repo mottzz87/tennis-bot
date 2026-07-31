@@ -133,38 +133,37 @@ function filterSlotsAuto(data, platformConfig) {
 // 连续时段合并
 // ========================
 
-// 同一 (place, date) 内、跨场地的连续空位拼接为一个时段：
-// 只要前一段的 end 等于后一段的 start（不要求同一场地），即可串联。
-// 只有总时长 >= minMinutes 的连续段才保留，不足阈值则丢弃。
-// 输出带 courts 字段：按拼接先后顺序排列的场地字母（如 "ABCD"），连续同一场地去重。
+// 连续时段合并，两级优先：
+//   1) 同场地（place+date+court）内时间连续的，优先拼成整段（如 Ａ面 11-15 → "4A"）；
+//   2) 只剩单条空位的，再跨场地按时间拼接凑满阈值（如 Ｄ面10-11 + Ｃ面11-12 → "DC"）。
+// 已拼入整段的场地不会被二次使用；所有输出总时长均 >= minMinutes，不足阈值（含 1h 单条）丢弃。
+// 输出带 courts 字段：按拼接先后顺序排列的场地计数序列（如 "4J" / "DC"）。
 function mergeContiguousSlots(slots, minMinutes) {
   if (!Array.isArray(slots) || slots.length === 0) return []
-  const groups = new Map()
-  for (const s of slots) {
-    const key = `${s.place}|${s.date}`
-    if (!groups.has(key)) groups.set(key, [])
-    groups.get(key).push(s)
-  }
 
   const out = []
-  for (const list of groups.values()) {
+  const leftover = []
+
+  const buildMerged = run => {
+    const totalMin = run.reduce((a, s) => a + Number(s.duration || 60), 0)
+    return {
+      platform: run[0].platform,
+      place: run[0].place,
+      court: run[0].court,
+      date: run[0].date,
+      start: run[0].start,
+      end: run[run.length - 1].end,
+      duration: totalMin,
+      available: true,
+      courts: courtSeq(run)
+    }
+  }
+
+  const chainSorted = (list, emit) => {
     const run = []
     const flush = () => {
       if (run.length === 0) return
-      const totalMin = run.reduce((a, s) => a + Number(s.duration || 60), 0)
-      if (totalMin >= minMinutes) {
-        out.push({
-          platform: run[0].platform,
-          place: run[0].place,
-          court: run[0].court,
-          date: run[0].date,
-          start: run[0].start,
-          end: run[run.length - 1].end,
-          duration: totalMin,
-          available: true,
-          courts: courtSeq(run)
-        })
-      }
+      emit(run)
       run.length = 0
     }
     list
@@ -172,15 +171,46 @@ function mergeContiguousSlots(slots, minMinutes) {
       .sort((a, b) => String(a.start).localeCompare(String(b.start)))
       .forEach(s => {
         const prev = run[run.length - 1]
-        if (prev && prev.end === s.start) {
-          run.push(s)
-        } else {
-          flush()
-          run.push(s)
-        }
+        if (prev && prev.end === s.start) run.push(s)
+        else { flush(); run.push(s) }
       })
     flush()
   }
+
+  // 阶段一：同场地优先拼接
+  const groups = new Map()
+  for (const s of slots) {
+    const key = `${s.place}|${s.date}|${s.court}`
+    if (!groups.has(key)) groups.set(key, [])
+    groups.get(key).push(s)
+  }
+  for (const list of groups.values()) {
+    chainSorted(list, run => {
+      const totalMin = run.reduce((a, s) => a + Number(s.duration || 60), 0)
+      if (run.length === 1 && totalMin < minMinutes) {
+        leftover.push(run[0]) // 单条且不足阈值 → 阶段二尝试跨场地
+      } else if (totalMin >= minMinutes) {
+        out.push(buildMerged(run))
+      } else {
+        leftover.push(...run) // 罕见：多段但不足阈值 → 退回单条
+      }
+    })
+  }
+
+  // 阶段二：单条空位跨场地按时间拼接，不足 minMinutes（含凑不满的单条）丢弃
+  const looseGroups = new Map()
+  for (const s of leftover) {
+    const key = `${s.place}|${s.date}`
+    if (!looseGroups.has(key)) looseGroups.set(key, [])
+    looseGroups.get(key).push(s)
+  }
+  for (const list of looseGroups.values()) {
+    chainSorted(list, run => {
+      const totalMin = run.reduce((a, s) => a + Number(s.duration || 60), 0)
+      if (totalMin >= minMinutes) out.push(buildMerged(run))
+    })
+  }
+
   return out
 }
 

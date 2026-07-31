@@ -71,6 +71,17 @@ function getBotForPlatform(platformName) {
   return bots[0]
 }
 
+// 当前 bot 负责哪些平台：手动 /run 时只扫这些平台，各平台通知仍推送到各自 bot
+async function getPlatformsForBot(bot) {
+  try {
+    const res = await monitorApi('GET', '/api/status')
+    const names = Object.keys(res.data?.config?.platforms || {})
+    return names.filter(p => getBotForPlatform(p) === bot)
+  } catch {
+    return []
+  }
+}
+
 // 场地开关等列表按 bot 归属过滤：每个 bot 只显示自己绑定的平台场地。
 // 通过 <PLATFORM>_BOT_TOKEN（或 BOT_TOKEN 兜底）判断场地归属哪个 bot；
 // 一个 bot 绑定到唯一平台时过滤，绑定多个/无归属时显示全部（保持原行为）。
@@ -377,7 +388,8 @@ function registerHandlers(bot) {
   bot.onText(/\/run/, async (msg) => {
     if (!isAdmin(msg)) return
     await bot.sendMessage(msg.chat.id, `🚀 *手动执行监控*\n━━━━━━━━━━━━━━\n⏳ 正在抓取最新数据...`, { parse_mode: 'Markdown' })
-    await monitorApi('POST', '/api/run')
+    const platforms = await getPlatformsForBot(bot)
+    await monitorApi('POST', '/api/run', { platforms })
   })
   
   bot.onText(/\/pause/, async (msg) => {
@@ -690,7 +702,8 @@ function registerHandlers(bot) {
     // --- Quick action buttons ---
     if (data === 'quick_run') {
       await bot.answerCallbackQuery(query.id, { text: '🚀 执行中...' })
-      await monitorApi('POST', '/api/run')
+      const platforms = await getPlatformsForBot(bot)
+      await monitorApi('POST', '/api/run', { platforms })
       return
     }
   
@@ -1049,8 +1062,8 @@ function registerHandlers(bot) {
             `🎉 *预约成功！*\n━━━━━━━━━━━━━━\n${formatSlotText(raw, pc, { showBike: true, style: 'detail' })}`,
             { parse_mode: 'Markdown' }
           )
-          // Trigger re-scan
-          await monitorApi('POST', '/api/run')
+          // Trigger re-scan（只刷预约所在平台）
+          await monitorApi('POST', '/api/run', { platforms: [raw.platform] })
         } else {
           await bot.sendMessage(
             chatId,

@@ -9,7 +9,7 @@
  *
  * HTTP API:
  *   GET  /api/status
- *   POST /api/run
+ *   POST /api/run           body: { platforms?: string[] }（省略则全平台扫描）
  *   POST /api/pause
  *   POST /api/resume
  *   GET  /api/places
@@ -166,6 +166,14 @@ function getPlatformConfig(place) {
     if (pc.PLACE_MAP?.[place]) return pc
   }
   return {}
+}
+
+function getPlatformNameByPlace(place) {
+  for (const name of config.getPlatformNames()) {
+    const pc = config.getPlatform(name)
+    if (pc.PLACE_MAP?.[place]) return name
+  }
+  return null
 }
 
 /**
@@ -369,6 +377,49 @@ async function callBookingService(slotData, platformName) {
 }
 
 // ========================
+// 手动单平台扫描
+// ========================
+// 只扫描指定平台并推送到该平台对应的 bot，不更新全局 diff 状态（lastSet/currentData），
+// 避免手动 /run 干扰定时扫描的去重与减少通知。
+async function runPlatformOnce(platformName) {
+  const platformConfig = config.getPlatform(platformName)
+  if (platformConfig.enabled === false) return
+  const adapter = loadPlatform(platformName)
+  if (!adapter) return
+  if (!platformConfig.TARGET_PLACE?.length) return
+
+  try {
+    const slots = await adapter.fetchSlots(platformConfig)
+    console.log(`[手动] ${platformName} 获取 ${slots.length} 个空位`)
+
+    const enriched = slots.map(s => {
+      const time = s.time || `${s.start}-${s.end}`
+      const dateDisplay = s.dateDisplay || formatDateDisplayFromIso(s.date)
+      const ucode = core.buildUcode({ ...s, time, dateDisplay }, platformConfig)
+      const uid = `${s.place}_${s.court}_${s.date}_${time}`
+      return { ...s, time, dateDisplay, ucode, uid }
+    })
+    const filtered = core.filterSlotsByConfig(enriched, platformConfig)
+
+    if (filtered.length > 0) {
+      await sendTelegram(filtered, Date.now())
+    } else {
+      const b = getBotForPlatform(platformName)
+      const chatId = getPlatformChatId(platformName)
+      if (b && chatId) {
+        await b.sendMessage(
+          chatId,
+          `📭 *暂无可预约*\n━━━━━━━━━━━━━━\n可以稍后再试 /run`,
+          { parse_mode: 'Markdown' }
+        )
+      }
+    }
+  } catch (e) {
+    console.log(`[手动] ${platformName} 扫描失败:`, e.message)
+  }
+}
+
+// ========================
 // 扫描
 // ========================
 async function monitor(options = {}) {
@@ -441,7 +492,7 @@ async function monitor(options = {}) {
   const removedUids = [...lastSet].filter(k => !currentUids.has(k))
   const removed = removedUids.map(k => {
     const [place, court, date, time] = k.split('_')
-    return { place, court, date, time, uid: k }
+    return { platform: getPlatformNameByPlace(place) || undefined, place, court, date, time, uid: k }
   })
 
   core.recordStats('added', added)
@@ -616,9 +667,17 @@ const server = http.createServer(async (req, res) => {
       })
     }
 
-    // POST /api/run
+    // POST /api/run   body: { platforms?: string[] }
     if (req.method === 'POST' && pathname === '/api/run') {
-      monitor({ forcePush: true }).catch(e => console.error('[/api/run] error:', e))
+      const body = await parseBody(req).catch(() => null)
+      const platforms = Array.isArray(body?.platforms) ? body.platforms : null
+      if (platforms && platforms.length > 0) {
+        ;(async () => {
+          for (const p of platforms) await runPlatformOnce(p)
+        })().catch(e => console.error('[/api/run] error:', e))
+      } else {
+        monitor({ forcePush: true }).catch(e => console.error('[/api/run] error:', e))
+      }
       return json(res, { success: true, message: '扫描已触发' })
     }
 
