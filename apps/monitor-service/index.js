@@ -181,6 +181,30 @@ function getEffectiveInterval() {
 }
 
 /**
+ * 获取生效的最大随机抖动（秒）
+ */
+function getEffectiveJitter() {
+  return config.getEffective('JITTER_MAX') || 45
+}
+
+/**
+ * 以递归 setTimeout 替代 setInterval，支持随机抖动
+ */
+function scheduleNext() {
+  const baseMs = getEffectiveInterval() * 1000
+  const jitterMaxMs = getEffectiveJitter() * 1000
+  const jitter = Math.floor(Math.random() * (jitterMaxMs + 1))
+  const delay = baseMs + jitter
+  console.log(`[定时] 下次扫描: ${(baseMs/1000)}s + 随机 ${(jitter/1000).toFixed(1)}s = ${(delay/1000).toFixed(1)}s`)
+  timer = setTimeout(() => {
+    timer = null
+    monitor().finally(() => {
+      if (!timer) scheduleNext()
+    })
+  }, delay)
+}
+
+/**
  * 向所有已配置的平台发送"暂无可预约"提示
  * 跳过没有 Bot Token 的平台
  */
@@ -513,6 +537,7 @@ const server = http.createServer(async (req, res) => {
         slotCount: currentData.length,
         version: currentVersion,
         interval: getEffectiveInterval(),
+        jitterMax: getEffectiveJitter(),
         config: {
           global: config.global,
           platforms: config.getAllPlatforms()
@@ -529,7 +554,7 @@ const server = http.createServer(async (req, res) => {
     // POST /api/pause
     if (req.method === 'POST' && pathname === '/api/pause') {
       if (timer) {
-        clearInterval(timer)
+        clearTimeout(timer)
         timer = null
       }
       return json(res, { success: true, message: '已暂停' })
@@ -538,8 +563,7 @@ const server = http.createServer(async (req, res) => {
     // POST /api/resume
     if (req.method === 'POST' && pathname === '/api/resume') {
       if (!timer) {
-        const interval = getEffectiveInterval() * 1000
-        timer = setInterval(() => monitor(), interval)
+        scheduleNext()
       }
       return json(res, { success: true, message: '已恢复' })
     }
@@ -698,9 +722,8 @@ async function start() {
   // 首次扫描
   await monitor()
 
-  // 定时扫描
-  const interval = getEffectiveInterval() * 1000
-  timer = setInterval(() => monitor(), interval)
+  // 定时扫描（含随机抖动）
+  scheduleNext()
 
   // 清理旧日志
   setInterval(() => cleanOldLogs(30), 24 * 60 * 60 * 1000)
