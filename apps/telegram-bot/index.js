@@ -20,6 +20,8 @@ const readline = require('readline')
 const MONITOR_HOST = process.env.MONITOR_HOST || 'http://localhost:3000'
 const BOOKING_HOST = process.env.BOOKING_HOST || 'http://localhost:4000'
 
+console.log('[ENV] BOOKING_HOST =', BOOKING_HOST)
+
 // 收集所有 Bot Token：BOT_TOKEN + 所有 <PLATFORM>_BOT_TOKEN，去重
 function collectBotTokens() {
   const tokens = []
@@ -101,6 +103,12 @@ function filterPlacesByBot(places, bot) {
 function httpRequest(host, method, path, body) {
   return new Promise((resolve, reject) => {
     const url = new URL(path, host)
+    console.log('==========================')
+    console.log('[HTTP REQUEST]')
+    console.log('host =', host)
+    console.log('path =', path)
+    console.log('url  =', url.href)
+    console.log('==========================')
     const opts = {
       method,
       hostname: url.hostname,
@@ -112,6 +120,11 @@ function httpRequest(host, method, path, body) {
       let data = ''
       res.on('data', chunk => { data += chunk })
       res.on('end', () => {
+        console.log('==========================')
+        console.log('[HTTP RESPONSE]')
+        console.log('status =', res.statusCode)
+        console.log(data)
+        console.log('==========================')
         try { resolve({ status: res.statusCode, data: JSON.parse(data) }) }
         catch { resolve({ status: res.statusCode, data }) }
       })
@@ -469,7 +482,9 @@ function registerHandlers(bot) {
     if (!isAdmin(msg)) return
     try {
       const res = await bookingApi('GET', '/api/booked/schedule')
+      console.log('[schedule] res =', JSON.stringify(res, null, 2))
       const slots = res.data?.slots || []
+      console.log('[schedule] slots.length =', slots.length)
       if (slots.length === 0) {
         await bot.sendMessage(msg.chat.id, '📅 暂无未开始的预约')
         return
