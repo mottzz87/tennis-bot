@@ -14,8 +14,60 @@ const { spawn } = require('child_process')
 const path = require('path')
 const TelegramBot = require('node-telegram-bot-api')
 const { formatSlotText, formatReminderButtonLabel, escapeMarkdown } = require('@tennis-bot/notifier')
-const { parseSlotStartDateTimeSafe, parseSlotDayKey, formatCourt, formatTimeDisplay } = require('@tennis-bot/utils')
+const { parseSlotStartDateTimeSafe, parseSlotDayKey, formatCourt, formatTimeDisplay, toMinutes } = require('@tennis-bot/utils')
 const readline = require('readline')
+
+// 时段总小时数：优先 duration（分钟），缺省时按起止时间推算
+function slotHours(d) {
+  let minutes = Number(d.duration)
+  if (!minutes || minutes <= 0) {
+    const s = toMinutes(d.start)
+    const e = toMinutes(d.end)
+    if (e > s) minutes = e - s
+  }
+  return minutes > 0 ? minutes / 60 : 0
+}
+
+function hoursLabel(hours) {
+  const h = Number(hours)
+  if (!h || h <= 0) return ''
+  return `${Number.isInteger(h) ? h : +h.toFixed(1)}h`
+}
+
+// 执行预约（book_ 与 confirm_book_ 共用）：取最新 slot → POST /api/book → 结果通知 → 触发重扫
+async function doBook(bot, chatId, ucode) {
+  try {
+    const slotRes = await monitorApi('GET', `/api/slot/${encodeURIComponent(ucode)}`)
+    if (!slotRes.data?.success || !slotRes.data?.slot) {
+      await bot.sendMessage(chatId, '⚠️ 数据已过期，请重新获取')
+      return
+    }
+    const raw = slotRes.data.slot
+    const pc = await getPlatformConfig(raw.platform)
+    const bookRes = await bookingApi('POST', '/api/book', { platform: raw.platform, slot: raw })
+    if (bookRes.data?.success) {
+      await bot.sendMessage(
+        chatId,
+        `🎉 *预约成功！*\n━━━━━━━━━━━━━━\n${formatSlotText(raw, pc, { showBike: true, style: 'detail' })}`,
+        { parse_mode: 'Markdown' }
+      )
+      // Trigger re-scan（只刷预约所在平台）
+      await monitorApi('POST', '/api/run', { platforms: [raw.platform] })
+    } else {
+      await bot.sendMessage(
+        chatId,
+        `❌ *预约失败*\n━━━━━━━━━━━━━━\n${formatSlotText(raw, pc, { style: 'detail' })}\n\n🧨 ${escapeMarkdown(bookRes.data?.message || '未知错误')}`,
+        { parse_mode: 'Markdown' }
+      )
+    }
+  } catch (e) {
+    await bot.sendMessage(
+      chatId,
+      `❌ *预约失败*\n━━━━━━━━━━━━━━\n${escapeMarkdown(e.message)}`,
+      { parse_mode: 'Markdown' }
+    )
+  }
+}
 
 const MONITOR_HOST = process.env.MONITOR_HOST || 'http://localhost:3000'
 const BOOKING_HOST = process.env.BOOKING_HOST || 'http://localhost:4000'
@@ -1041,46 +1093,85 @@ function registerHandlers(bot) {
     // --- Book slot ---
     if (data.startsWith('book_')) {
       const ucode = data.replace('book_', '')
-  
-      // Check if already processing a booking
-      // Look up slot from Monitor Service
+
       try {
         const slotRes = await monitorApi('GET', `/api/slot/${encodeURIComponent(ucode)}`)
         if (!slotRes.data?.success || !slotRes.data?.slot) {
           await bot.answerCallbackQuery(query.id, { text: '⚠️ 数据已过期，请重新获取' })
           return
         }
-  
         const raw = slotRes.data.slot
-        await bot.answerCallbackQuery(query.id, { text: '🚀 开始预约...' })
-  
-        const pc = await getPlatformConfig(raw.platform)
-        const bookRes = await bookingApi('POST', '/api/book', { platform: raw.platform, slot: raw })
-        if (bookRes.data?.success) {
-          await bot.sendMessage(
-            chatId,
-            `🎉 *预约成功！*\n━━━━━━━━━━━━━━\n${formatSlotText(raw, pc, { showBike: true, style: 'detail' })}`,
-            { parse_mode: 'Markdown' }
-          )
-          // Trigger re-scan（只刷预约所在平台）
-          await monitorApi('POST', '/api/run', { platforms: [raw.platform] })
-        } else {
-          await bot.sendMessage(
-            chatId,
-            `❌ *预约失败*\n━━━━━━━━━━━━━━\n${formatSlotText(raw, pc, { style: 'detail' })}\n\n🧨 ${escapeMarkdown(bookRes.data?.message || '未知错误')}`,
-            { parse_mode: 'Markdown' }
-          )
+        const hours = slotHours(raw)
+        const startDate = parseSlotStartDateTimeSafe(raw)
+        const soon = !!(startDate && startDate.getTime() > Date.now() && startDate.getTime() - Date.now() <= 7 * 24 * 3600 * 1000)
+        if (hours > 2 || soon) {
+          // 时段多于 2h 或 7 天内 → 行内二次确认（不弹窗，替换原按钮）
+          const reason = hours > 2 ? `该时段 ${hoursLabel(hours)}` : '7天内时段'
+          const rows = query.message.reply_markup?.inline_keyboard || []
+          const newRows = rows.map(row => {
+            if (!row.some(btn => btn.callback_data === data)) return row
+            return [
+              { text: `✅ 确认预约${hours > 2 ? ` ${hoursLabel(hours)}` : ''}`, callback_data: `confirm_book_${ucode}` },
+              { text: '❌ 取消', callback_data: `cancel_book_${ucode}` }
+            ]
+          })
+          try {
+            await bot.editMessageReplyMarkup({ inline_keyboard: newRows }, {
+              chat_id: query.message.chat.id,
+              message_id: query.message.message_id
+            })
+          } catch (e) {
+            console.warn('[book] 更新确认按钮失败:', e.message)
+          }
+          await bot.answerCallbackQuery(query.id, { text: `🕐 ${reason}，请确认是否预约` })
+          return
         }
+        await bot.answerCallbackQuery(query.id, { text: '🚀 开始预约...' })
+        await doBook(bot, chatId, ucode)
       } catch (e) {
-        await bot.sendMessage(
-          chatId,
-          `❌ *预约失败*\n━━━━━━━━━━━━━━\n${escapeMarkdown(e.message)}`,
-          { parse_mode: 'Markdown' }
-        )
+        await bot.answerCallbackQuery(query.id, { text: '❌ 操作失败' })
       }
       return
     }
-  
+
+    // --- Confirm booking (>2h / 7天内 二次确认) ---
+    if (data.startsWith('confirm_book_')) {
+      const ucode = data.replace('confirm_book_', '')
+      await bot.answerCallbackQuery(query.id, { text: '🚀 开始预约...' })
+      await doBook(bot, chatId, ucode)
+      return
+    }
+
+    // --- Cancel booking (>2h / 7天内 二次确认取消) ---
+    if (data.startsWith('cancel_book_')) {
+      const ucode = data.replace('cancel_book_', '')
+      try {
+        const slotRes = await monitorApi('GET', `/api/slot/${encodeURIComponent(ucode)}`)
+        if (slotRes.data?.success && slotRes.data?.slot) {
+          const pc = await getPlatformConfig(slotRes.data.slot.platform)
+          const restore = [{ text: formatSlotText(slotRes.data.slot, pc), callback_data: `book_${ucode}` }]
+          const rows = query.message.reply_markup?.inline_keyboard || []
+          const newRows = rows.map(row =>
+            row.some(b => b.callback_data === `confirm_book_${ucode}` || b.callback_data === `cancel_book_${ucode}`)
+              ? restore
+              : row
+          )
+          try {
+            await bot.editMessageReplyMarkup({ inline_keyboard: newRows }, {
+              chat_id: query.message.chat.id,
+              message_id: query.message.message_id
+            })
+          } catch (e) {
+            console.warn('[cancel_book] 恢复按钮失败:', e.message)
+          }
+        }
+      } catch (e) {
+        console.warn('[cancel_book] 恢复按钮失败:', e.message)
+      }
+      await bot.answerCallbackQuery(query.id, { text: '已取消' })
+      return
+    }
+
     await bot.answerCallbackQuery(query.id, { text: '⚠️ 无效操作' })
   })
 }

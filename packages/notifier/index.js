@@ -4,15 +4,35 @@
  * 目前仅支持 Telegram，但通过抽象保持良好的接口，
  * 未来可扩展 LINE / Discord 等。
  */
-const { formatCourt, formatTimeDisplay, formatDateDisplayFromIso } = require('@tennis-bot/utils')
+const { formatCourt, formatCourtShort, formatTimeDisplay, formatDateDisplayFromIso, toMinutes } = require('@tennis-bot/utils')
 
+// 拼接序列的场地字母串（去掉小时数）："2HF" → "HF"，"3F" → "F"，"A2B" → "AB"
+function courtSeqShort(courts) {
+  return String(courts || '').replace(/\d+/g, '')
+}
+
+// 总小时数：优先 duration，缺省时由起止时间推算；返回 "2h" / "2.5h"，无则 ''
+function hoursLabel(d) {
+  let minutes = Number(d.duration)
+  if (!minutes || minutes <= 0) {
+    const s = toMinutes(d.start)
+    const e = toMinutes(d.end)
+    if (e > s) minutes = e - s
+  }
+  if (!minutes || minutes <= 0) return ''
+  const h = minutes / 60
+  return `${Number.isInteger(h) ? h : +h.toFixed(1)}h`
+}
+
+// 统一通知样式：🎯 西葛西 Ｇ面 8.14（金） 10-12 | 2h
+// 拼接时段场地显示字母序列（HF/DB），单面显示短场地名（Ｇ面）
 function formatSlotText(d, platformConfig, options = {}) {
   const { showBike = false, style = 'compact' } = options
   const meta = platformConfig.PLACE_MAP?.[d.place] || {}
   const placeShort = meta.short || d.place
   const emoji = meta.emoji || '🎾'
   const bike = showBike && meta.bike ? ` ${meta.bike}` : ''
-  const courtDisplay = String(formatCourt(d.court) || '').toUpperCase()
+  const courtDisplay = courtSeqShort(d.courts) || formatCourtShort(d.court)
 
   let shortDate = d.dateDisplay
   if (!shortDate && /^\d{4}-\d{2}-\d{2}$/.test(String(d.date || '').trim())) {
@@ -24,20 +44,14 @@ function formatSlotText(d, platformConfig, options = {}) {
   }
 
   const shortTime = formatTimeDisplay(d.time || `${d.start}-${d.end}`)
-  const courts = d.courts // 合并时按拼接顺序排列的场地计数序列（如 "2AB"）
-  const totalHours = d.duration ? Math.round(Number(d.duration) / 60) : null
+  const hours = hoursLabel(d)
+  const hoursPart = hours ? ` | ${hours}` : ''
 
+  const line = `${emoji} ${placeShort} ${courtDisplay} • ${shortDate} ${shortTime}${hoursPart}${bike}`
   if (style === 'detail') {
-    const courtPart = courts
-      ? `｜拼接 ${totalHours != null ? `${totalHours}h ` : ''}${courts}`
-      : `｜${courtDisplay}`
-    return `${emoji} ${placeShort}${courtPart}\n📅 ${shortDate} ⏰ ${shortTime}${bike}`
+    return `${emoji} ${placeShort} ${courtDisplay}\n📅 ${shortDate} ⏰ ${shortTime}${hoursPart}${bike}`
   }
-  if (courts) {
-    const hPart = totalHours != null ? `${totalHours}h ｜ ` : ''
-    return `${emoji} ${placeShort} ${shortDate} ${shortTime}${bike} ｜ ${hPart}${courts}`
-  }
-  return `${emoji} ${placeShort} ${formatCourt(d.court)} ${shortDate} ${shortTime}${bike}`
+  return line
 }
 
 const TG_INLINE_BTN_TEXT_MAX = 64

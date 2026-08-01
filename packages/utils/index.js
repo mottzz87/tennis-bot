@@ -21,6 +21,15 @@ function formatCourt(court) {
   return `c${match[1]}`
 }
 
+// 短场地名："西葛西テニスＧ面" → "Ｇ面"；"Ａ面" → "Ａ面"；"第2コート" → "c2"
+function formatCourtShort(court) {
+  if (!court) return ''
+  const s = String(court).replace(/　/g, ' ').replace(/[０-９]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0))
+  const m = s.match(/([Ａ-Ｚ]|[A-Z])面/)
+  if (m) return m[0]
+  return formatCourt(s)
+}
+
 function normalizeCourtAlias(str) {
   const s = normalizeText(str)
   let match = s.match(/(\d+)/)
@@ -132,6 +141,7 @@ module.exports = {
   sleep,
   normalizeText,
   formatCourt,
+  formatCourtShort,
   normalizeCourtAlias,
   parseSlotDayKey,
   parseTimeSafe,

@@ -138,11 +138,30 @@ function filterSlotsAuto(data, platformConfig) {
 //   2) 只剩单条空位的，再跨场地按时间拼接凑满阈值（如 Ｄ面10-11 + Ｃ面11-12 → "DC"）。
 // 已拼入整段的场地不会被二次使用；所有输出总时长均 >= minMinutes，不足阈值（含 1h 单条）丢弃。
 // 输出带 courts 字段：按拼接先后顺序排列的场地计数序列（如 "4J" / "DC"）。
-function mergeContiguousSlots(slots, minMinutes) {
+// preferredWindows（可选，如 ["7-9","16-18"]）：黄金时段。连续链在黄金时段边界处断开，
+// 使拼接结果尽可能落在某个黄金时段内（如 7-11 → 7-9 + 9-11），不配置时保持原最长链行为。
+function mergeContiguousSlots(slots, minMinutes, preferredWindows) {
   if (!Array.isArray(slots) || slots.length === 0) return []
 
   const out = []
   const leftover = []
+
+  const hasGolden = Array.isArray(preferredWindows) && preferredWindows.length > 0
+
+  // cell [start, end] 是否完整落在某个黄金时段内
+  const inGoldenWindow = s => {
+    if (!hasGolden) return false
+    const st = toMinutes(s.start)
+    const en = toMinutes(s.end)
+    if (!st || !en) return false
+    return preferredWindows.some(w => {
+      const [gs, ge] = String(w).split(/[~\-]/)
+      const gsMin = toMinutes(gs)
+      const geMin = toMinutes(ge)
+      if (!gsMin || !geMin || geMin <= gsMin) return false
+      return st >= gsMin && en <= geMin
+    })
+  }
 
   const buildMerged = run => {
     const totalMin = run.reduce((a, s) => a + Number(s.duration || 60), 0)
@@ -159,8 +178,10 @@ function mergeContiguousSlots(slots, minMinutes) {
     }
   }
 
+  // 排序后连续拼接；golden 边界（黄金时段内/外切换）处也断开
   const chainSorted = (list, emit) => {
     const run = []
+    let curInside = false
     const flush = () => {
       if (run.length === 0) return
       emit(run)
@@ -171,8 +192,11 @@ function mergeContiguousSlots(slots, minMinutes) {
       .sort((a, b) => String(a.start).localeCompare(String(b.start)))
       .forEach(s => {
         const prev = run[run.length - 1]
-        if (prev && prev.end === s.start) run.push(s)
-        else { flush(); run.push(s) }
+        const inside = inGoldenWindow(s)
+        const goldenBreak = prev && curInside !== inside
+        if (prev && (prev.end !== s.start || goldenBreak)) flush()
+        if (run.length === 0) curInside = inside
+        run.push(s)
       })
     flush()
   }

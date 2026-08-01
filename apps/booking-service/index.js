@@ -233,7 +233,7 @@ const server = http.createServer(async (req, res) => {
 
     // DELETE /api/booked/:uid
     if (req.method === 'DELETE' && pathname.startsWith('/api/booked/')) {
-      const uid = pathname.replace('/api/booked/', '')
+      const uid = decodeURIComponent(pathname.replace('/api/booked/', ''))
       if (!uid) return json(res, { success: false, message: '缺少 uid' }, 400)
       const slots = await storage.getBookedSlots()
       const filtered = slots.filter(s => s.uid !== uid && s.ucode !== uid)

@@ -62,5 +62,13 @@
   "SCAN_DAYS": 14,
   "MIN_CONTINUOUS_HOURS": 2,
   "BOOK_DURATION": 60,
-  "SEARCH_MODE": "hour"
+  "SEARCH_MODE": "hour",
+  "BOOK_PURPOSE": "テニス（硬・軟式）",
+  "BOOK_PEOPLE": 6,
+  "BOOK_EVENT_NAME": "テニス練習",
+  "GOLDEN_TIME_FILTER": [
+    "7-10",
+    "16-18",
+    "19-21"
+  ]
 }
