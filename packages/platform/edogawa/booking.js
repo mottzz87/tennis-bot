@@ -311,7 +311,7 @@ async function bookSlot(adapter, slotData, platformConfig) {
   }
   const scanDays = Number(platformConfig.SCAN_DAYS) > 0 ? Number(platformConfig.SCAN_DAYS) : 14
 
-  const browser = await chromium.launch({ headless: false, args: ['--no-sandbox'] })
+  const browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] })
   try {
     const context = await browser.newContext({ userAgent: USER_AGENT })
     const req = createReq(context, baseUrl)
