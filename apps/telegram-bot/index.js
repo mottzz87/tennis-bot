@@ -273,9 +273,11 @@ function formatToggleButtonLabel(d, platformConfig) {
 // ========================
 // Reminder helpers
 // ========================
-function getBookedReminderIntervalMs() {
-  // Default 2 hours, read from env
-  const hours = Number(process.env.BOOKED_REMINDER_INTERVAL_HOURS)
+async function getBookedReminderIntervalMs(platformName) {
+  // 默认 2 小时，从配置读取（global + 平台配置合并，平台优先），不再从 env 取
+  const globalCfg = await getGlobalConfig()
+  const pc = platformName ? await getPlatformConfig(platformName) : {}
+  const hours = Number({ ...globalCfg, ...pc }.BOOKED_REMINDER_INTERVAL_HOURS)
   if (Number.isFinite(hours) && hours > 0) return Math.floor(hours * 60 * 60 * 1000)
   return 2 * 60 * 60 * 1000
 }
@@ -324,7 +326,12 @@ async function deleteReminderMessagesByUcode(ucode) {
 async function pushBookedReminder() {
   const res = await bookingApi('GET', '/api/booked/schedule')
   if (!res.data?.slots) return
-  const future = res.data.slots.filter(s => eligibleForBookedSummary(s, getBookedReminderIntervalMs()))
+  // 每个平台独立读取提醒间隔（global + 平台配置合并），同一平台只请求一次
+  const intervals = new Map()
+  for (const p of [...new Set(res.data.slots.map(s => s.platform))]) {
+    intervals.set(p, await getBookedReminderIntervalMs(p))
+  }
+  const future = res.data.slots.filter(s => eligibleForBookedSummary(s, intervals.get(s.platform)))
   if (future.length === 0) return
 
   // 按平台分组，每个平台各发一条合并消息（不再按日期拆）
@@ -405,7 +412,9 @@ async function pushUpcomingReminder() {
 
 async function pushBookedReminderBySchedule() {
   const now = Date.now()
-  if (now - lastBookedReminderAt < getBookedReminderIntervalMs()) return
+  // 调度是全局定时器，无平台上下文：取默认活动平台的合并配置
+  const intervalMs = await getBookedReminderIntervalMs(await getActivePlatform())
+  if (now - lastBookedReminderAt < intervalMs) return
   await pushBookedReminder()
   lastBookedReminderAt = now
 }
