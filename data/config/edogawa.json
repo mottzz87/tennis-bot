@@ -2,8 +2,7 @@
   "enabled": true,
   "TARGET_PLACE": [
     "谷河内テニスコート",
-    "西葛西テニスコート",
-    "水辺のスポーツガーデン"
+    "西葛西テニスコート"
   ],
   "PLACE_MAP": {
     "松江テニスコート": {
@@ -59,7 +58,7 @@
   "AUTO_WEEKDAY_FILTER": [],
   "AUTO_PLACE_FILTER": [],
   "AUTO_COURT_NUM_FILTER": [],
-  "SCAN_DAYS": 14,
+  "SCAN_DAYS": 30,
   "MIN_CONTINUOUS_HOURS": 2,
   "BOOK_DURATION": 60,
   "SEARCH_MODE": "hour",
