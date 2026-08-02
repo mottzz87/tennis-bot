@@ -2,6 +2,27 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
 
+function randomInt(min, max) {
+  return Math.floor(Math.random() * (max - min + 1)) + min
+}
+
+// 模拟人输入：逐字敲入，每个字符带随机停顿，避免瞬间填满表单
+async function humanType(locator, text, { minDelay = 40, maxDelay = 140 } = {}) {
+  const s = String(text)
+  if (!s) return
+  await locator.click()
+  // 先全选已有内容（登录页/预约表单一般为空，此步无副作用），防止默认值残留
+  await locator.press(process.platform === 'darwin' ? 'Meta+a' : 'Control+a')
+  for (const ch of s) {
+    await locator.pressSequentially(ch, { delay: randomInt(minDelay, maxDelay) })
+  }
+}
+
+// 模拟人在两个操作之间的思考/移动停顿
+async function humanPause(minMs = 300, maxMs = 900) {
+  await sleep(randomInt(minMs, maxMs))
+}
+
 function normalizeText(str) {
   if (!str) return ''
   return String(str)
@@ -139,6 +160,9 @@ async function clickByText(page, text) {
 
 module.exports = {
   sleep,
+  randomInt,
+  humanType,
+  humanPause,
   normalizeText,
   formatCourt,
   formatCourtShort,
