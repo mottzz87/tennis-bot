@@ -24,7 +24,7 @@ function hoursLabel(d) {
   return `${Number.isInteger(h) ? h : +h.toFixed(1)}h`
 }
 
-// 统一通知样式：🎯 西葛西 Ｇ面 8.14（金） 10-12 | 2h
+// 统一通知样式：🎯 西葛西 Ｇ面 8.14（金） 10-12 • 2h
 // 拼接时段场地显示字母序列（HF/DB），单面显示短场地名（Ｇ面）
 function formatSlotText(d, platformConfig, options = {}) {
   const { showBike = false, style = 'compact' } = options
@@ -45,7 +45,7 @@ function formatSlotText(d, platformConfig, options = {}) {
 
   const shortTime = formatTimeDisplay(d.time || `${d.start}-${d.end}`)
   const hours = hoursLabel(d)
-  const hoursPart = hours ? ` | ${hours}` : ''
+  const hoursPart = hours ? ` • ${hours}` : ''
 
   const line = `${emoji} ${placeShort} ${courtDisplay} • ${shortDate} ${shortTime}${hoursPart}${bike}`
   if (style === 'detail') {

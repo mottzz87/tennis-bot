@@ -565,7 +565,7 @@ async function monitor(options = {}) {
 
         console.log(
           `[${trace}] AUTO_BOOK 准备预约 ${targets.length} 个：`,
-          targets.map(d => `${d.place} ${d.time}`).join(' | ')
+          targets.map(d => `${d.place} ${d.time}`).join(' · ')
         )
 
         autoBooking = true
