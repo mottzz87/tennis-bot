@@ -4,20 +4,40 @@
  * 目前仅支持 Telegram，但通过抽象保持良好的接口，
  * 未来可扩展 LINE / Discord 等。
  */
-const { formatCourt, formatCourtShort, formatTimeDisplay, formatDateDisplayFromIso, toMinutes } = require('@tennis-bot/utils')
+const { formatCourtShort, formatTimeDisplay, formatDateDisplayFromIso, toMinutes } = require('@tennis-bot/utils')
 
-// 拼接序列的场地字母串（去掉小时数）："2HF" → "HF"，"3F" → "F"，"A2B" → "AB"
-function courtSeqShort(courts) {
-  return String(courts || '').replace(/\d+/g, '')
+// 场地展示：跨面拼接（多面）直接显示压缩场地序列（"GB"/"2GB"/"CGB"），单面/同面多时段回退短场地名
+function displayCourt(d) {
+  const raw = String(d.courts || '').replace(/\s+/g, '')
+  if (raw) {
+    const letters = raw.replace(/\d+/g, '')
+    if (letters && new Set(letters).size > 1) return raw
+  }
+  return formatCourtShort(d.court)
 }
 
-// 总小时数：优先 duration，缺省时由起止时间推算；返回 "2h" / "2.5h"，无则 ''
+// 费用展示：只展示页面合计字段，无费用时返回空串
+function formatFeeLine(d) {
+  const total = Number(d?.totalFee)
+  if (!Number.isFinite(total) || total <= 0) return ''
+  return `💰 ${total.toLocaleString('ja-JP')}円`
+}
+
+// 总小时数：优先 duration，缺省时由起止时间推算，再缺省由 time 推算；返回 "2h" / "2.5h"，无则 ''
 function hoursLabel(d) {
   let minutes = Number(d.duration)
   if (!minutes || minutes <= 0) {
     const s = toMinutes(d.start)
     const e = toMinutes(d.end)
     if (e > s) minutes = e - s
+  }
+  if (!minutes || minutes <= 0) {
+    const parts = String(d.time || '').split(/[~\-]/)
+    if (parts.length === 2) {
+      const sm = toMinutes(parts[0])
+      const em = toMinutes(parts[1])
+      if (em > sm) minutes = em - sm
+    }
   }
   if (!minutes || minutes <= 0) return ''
   const h = minutes / 60
@@ -27,12 +47,12 @@ function hoursLabel(d) {
 // 统一通知样式：🎯 西葛西 Ｇ面 8.14（金） 10-12 • 2h
 // 拼接时段场地显示字母序列（HF/DB），单面显示短场地名（Ｇ面）
 function formatSlotText(d, platformConfig, options = {}) {
-  const { showBike = false, style = 'compact' } = options
+  const { showBike = false, showFee = false, style = 'compact' } = options
   const meta = platformConfig.PLACE_MAP?.[d.place] || {}
   const placeShort = meta.short || d.place
   const emoji = meta.emoji || '🎾'
   const bike = showBike && meta.bike ? ` ${meta.bike}` : ''
-  const courtDisplay = courtSeqShort(d.courts) || formatCourtShort(d.court)
+  const courtDisplay = displayCourt(d)
 
   let shortDate = d.dateDisplay
   if (!shortDate && /^\d{4}-\d{2}-\d{2}$/.test(String(d.date || '').trim())) {
@@ -49,7 +69,8 @@ function formatSlotText(d, platformConfig, options = {}) {
 
   const line = `${emoji} ${placeShort} ${courtDisplay} • ${shortDate} ${shortTime}${hoursPart}${bike}`
   if (style === 'detail') {
-    return `${emoji} ${placeShort} ${courtDisplay}\n📅 ${shortDate} ⏰ ${shortTime}${hoursPart}${bike}`
+    const feeLine = showFee ? formatFeeLine(d) : ''
+    return `${emoji} ${placeShort} ${courtDisplay} ${feeLine ? `\n${feeLine}` : ''}\n📅 ${shortDate} ⏰ ${shortTime}${hoursPart}${bike}`
   }
   return line
 }
@@ -67,7 +88,7 @@ function truncateTelegramButtonText(s, max = TG_INLINE_BTN_TEXT_MAX) {
 function formatReminderButtonLabel(d, platformConfig) {
   const meta = platformConfig.PLACE_MAP?.[d.place] || {}
   const placeShort = (meta.short || d.place || '').trim()
-  const court = String(formatCourt(d.court) || '').toUpperCase()
+  const court = displayCourt(d)
   const date = d.dateDisplay || d.date
   const t = formatTimeDisplay(d.time || `${d.start}-${d.end}`)
   const em = meta.emoji || '🎾'
@@ -85,5 +106,7 @@ function escapeMarkdown(text) {
 module.exports = {
   formatSlotText,
   formatReminderButtonLabel,
-  escapeMarkdown
+  escapeMarkdown,
+  displayCourt,
+  formatFeeLine
 }

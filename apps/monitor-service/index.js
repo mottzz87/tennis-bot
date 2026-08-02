@@ -570,9 +570,11 @@ async function monitor(options = {}) {
 
         autoBooking = true
         try {
+          const bookedFees = new Map()
           for (const target of targets) {
             const result = await callBookingService(target, target.platform)
             if (result.success) {
+              if (result.fee?.total != null) bookedFees.set(target.ucode, result.fee.total)
               const dayKey = parseSlotDayKey(target)
               if (dayKey) autoBookedDayKeys.add(dayKey)
               autoBookedUIDs.add(target.uid)
@@ -588,7 +590,11 @@ async function monitor(options = {}) {
             await abBot.sendMessage(
               abChat,
               `🎉 *自动预约成功！*\n━━━━━━━━━━━━━━\n` +
-              targets.map(d => formatSlotText(d, getPlatformConfig(d.place), { showBike: true, style: 'detail' })).join('\n\n'),
+              targets.map(d => formatSlotText(
+                bookedFees.has(d.ucode) ? { ...d, totalFee: bookedFees.get(d.ucode) } : d,
+                getPlatformConfig(d.place),
+                { showBike: true, showFee: true, style: 'detail' }
+              )).join('\n\n'),
               { parse_mode: 'Markdown' }
             )
           }

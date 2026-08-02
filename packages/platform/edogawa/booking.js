@@ -307,6 +307,56 @@ async function submitApply(page) {
   return { ok: true, url: page.url() }
 }
 
+// 从申请明细页抓取费用：
+//   - 设施费: dt 含「施設使用料」的 dl，其 dd 金额求和
+//   - 照明料: dt 含「備品使用料」的 dl，其 dd 金额求和
+//   - 合计: class=total-fee 下 class=fee 的文本
+// 任一缺失即返回 null（不阻断预约）
+async function extractFee(page) {
+  try {
+    const total = await page
+      .locator('.total-fee .fee')
+      .first()
+      .textContent({ timeout: 3000 })
+      .then(t => parseYen(t))
+      .catch(() => null)
+
+    const sums = await page.evaluate(() => {
+      const out = { facility: 0, lighting: 0 }
+      for (const dl of document.querySelectorAll('dl.dl-item.mr-2')) {
+        // 每个利用枠的费用行会在折叠体表单区重复一份（带 narrow wide 类），只统计 header 的实际行
+        if (dl.classList.contains('narrow')) continue
+        const dt = dl.querySelector('dt')
+        const dd = dl.querySelector('dd')
+        if (!dt || !dd) continue
+        const label = dt.textContent || ''
+        const n = parseInt(String(dd.textContent || '').replace(/[^\d]/g, ''), 10)
+        if (Number.isNaN(n)) continue
+        if (label.includes('施設使用料')) out.facility += n
+        if (label.includes('備品使用料')) out.lighting += n
+      }
+      return out
+    })
+
+    const fee = {
+      facility: sums.facility || null,
+      lighting: sums.lighting || null,
+      total: total ?? null
+    }
+    if (fee.facility == null && fee.lighting == null && fee.total == null) return null
+    return fee
+  } catch {
+    return null
+  }
+}
+
+// "1,234 円" / "1234円" → 1234；解析失败返回 null
+function parseYen(text) {
+  const m = String(text || '').match(/(\d[\d,]*)\s*円/)
+  if (!m) return null
+  return Number(m[1].replace(/,/g, ''))
+}
+
 /**
  * 执行预约
  * @param {EdogawaAdapter} adapter - 平台适配器（提供 _baseUrl）
@@ -393,13 +443,14 @@ async function bookSlot(adapter, slotData, platformConfig) {
 
     // 7. 申请明细
     await fillApplyDetail(page, platformConfig)
+    const fee = await extractFee(page)
 
     // 8. 提交（含确认弹窗）
     const result = await submitApply(page)
     if (!result.ok) return { success: false, message: result.message }
 
-    console.log(`[edogawa] 预约成功: ${slotData.place} ${slotData.date} ${slotData.time}`)
-    return { success: true, message: `已提交预约: ${slotData.place} ${slotData.date} ${slotData.time}` }
+    console.log(`[edogawa] 预约成功: ${slotData.place} ${slotData.date} ${slotData.time}`, fee ? `费用 ${fee.total ?? '-'}円` : '')
+    return { success: true, message: `已提交预约: ${slotData.place} ${slotData.date} ${slotData.time}`, fee }
   } catch (e) {
     console.log(`[edogawa] 预约失败:`, e.message)
     return { success: false, message: e.message }
@@ -420,5 +471,6 @@ module.exports = {
   handleLogin,
   fillApplyDetail,
   submitApply,
+  extractFee,
   toHHMM
 }

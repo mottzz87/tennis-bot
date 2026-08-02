@@ -13,8 +13,8 @@ const http = require('http')
 const { spawn } = require('child_process')
 const path = require('path')
 const TelegramBot = require('node-telegram-bot-api')
-const { formatSlotText, formatReminderButtonLabel, escapeMarkdown } = require('@tennis-bot/notifier')
-const { parseSlotStartDateTimeSafe, parseSlotDayKey, formatCourt, formatTimeDisplay, toMinutes } = require('@tennis-bot/utils')
+const { formatSlotText, formatReminderButtonLabel, displayCourt, escapeMarkdown } = require('@tennis-bot/notifier')
+const { parseSlotStartDateTimeSafe, parseSlotDayKey, formatTimeDisplay, toMinutes } = require('@tennis-bot/utils')
 const readline = require('readline')
 
 // 时段总小时数：优先 duration（分钟），缺省时按起止时间推算
@@ -46,9 +46,10 @@ async function doBook(bot, chatId, ucode) {
     const pc = await getPlatformConfig(raw.platform)
     const bookRes = await bookingApi('POST', '/api/book', { platform: raw.platform, slot: raw })
     if (bookRes.data?.success) {
+      const shown = bookRes.data?.fee?.total != null ? { ...raw, totalFee: bookRes.data.fee.total } : raw
       await bot.sendMessage(
         chatId,
-        `🎉 *预约成功！*\n━━━━━━━━━━━━━━\n${formatSlotText(raw, pc, { showBike: true, style: 'detail' })}`,
+        `🎉 *预约成功！*\n━━━━━━━━━━━━━━\n${formatSlotText(shown, pc, { showBike: true, showFee: true, style: 'detail' })}`,
         { parse_mode: 'Markdown' }
       )
       // Trigger re-scan（只刷预约所在平台）
@@ -262,11 +263,12 @@ const TG_BTN_MAX = 64
 function formatToggleButtonLabel(d, platformConfig) {
   const meta = platformConfig.PLACE_MAP?.[d.place] || {}
   const placeShort = (meta.short || d.place || '').trim()
-  const court = String(formatCourt(d.court) || '').toUpperCase()
+  const court = displayCourt(d)
   const t = formatTimeDisplay(d.time || `${d.start}-${d.end}`)
   const date = d.dateDisplay || d.date
   const bell = d.reminderEnabled === false ? '🔕' : '🔔'
-  const s = `${bell} ${meta.emoji || '🎾'} ${placeShort} ${court} · ${date} ${t}`
+  const fee = d.totalFee ? ` 💰${d.totalFee}` : ''
+  const s = `${bell} ${meta.emoji || '🎾'} ${placeShort} ${court} · ${date} ${t}${fee}`
   return Array.from(s).length > TG_BTN_MAX ? Array.from(s).slice(0, TG_BTN_MAX - 1).join('') + '…' : s
 }
 
@@ -504,17 +506,18 @@ function registerHandlers(bot) {
         return
       }
       const list = slots.slice()
-        .sort((a, b) => (new Date(b.create || 0).getTime() || 0) - (new Date(a.create || 0).getTime() || 0))
+        .sort((a, b) => (parseSlotStartDateTimeSafe(b)?.getTime() || 0) - (parseSlotStartDateTimeSafe(a)?.getTime() || 0))
         .slice(0, limit)
       const buttons = await Promise.all(list.map(async d => {
         const pc = await getPlatformConfig(d.platform)
         const meta = pc.PLACE_MAP?.[d.place] || {}
         const placeShort = (meta.short || d.place || '').trim()
-        const court = String(formatCourt(d.court) || '').toUpperCase()
+        const court = displayCourt(d)
         const t = formatTimeDisplay(d.time || `${d.start}-${d.end}`)
         const date = d.dateDisplay || d.date
         const bell = d.reminderEnabled === false ? '🔕' : '🔔'
-        const info = `${bell} ${meta.emoji || '🎾'} ${placeShort} ${court} · ${date} ${t}`
+        const fee = d.totalFee ? ` 💰${d.totalFee}` : ''
+        const info = `${bell} ${meta.emoji || '🎾'} ${placeShort} ${court} · ${date} ${t}${fee}`
         return [{ text: info, callback_data: `try_del_${d.ucode}` }]
       }))
       await bot.sendMessage(msg.chat.id,
@@ -842,17 +845,18 @@ function registerHandlers(bot) {
           return
         }
         const list = slots.slice()
-          .sort((a, b) => (new Date(b.create || 0).getTime() || 0) - (new Date(a.create || 0).getTime() || 0))
+          .sort((a, b) => (parseSlotStartDateTimeSafe(b)?.getTime() || 0) - (parseSlotStartDateTimeSafe(a)?.getTime() || 0))
           .slice(0, 12)
         const buttons = await Promise.all(list.map(async d => {
           const pc = await getPlatformConfig(d.platform)
           const meta = pc.PLACE_MAP?.[d.place] || {}
           const placeShort = (meta.short || d.place || '').trim()
-          const court = String(formatCourt(d.court) || '').toUpperCase()
+          const court = displayCourt(d)
           const t = formatTimeDisplay(d.time || `${d.start}-${d.end}`)
           const date = d.dateDisplay || d.date
           const bell = d.reminderEnabled === false ? '🔕' : '🔔'
-          const info = `${bell} ${meta.emoji || '🎾'} ${placeShort} ${court} · ${date} ${t}`
+          const fee = d.totalFee ? ` 💰${d.totalFee}` : ''
+          const info = `${bell} ${meta.emoji || '🎾'} ${placeShort} ${court} · ${date} ${t}${fee}`
           return [{ text: info, callback_data: `try_del_${d.ucode}` }]
         }))
         await bot.sendMessage(chatId,

@@ -165,16 +165,17 @@ function mergeContiguousSlots(slots, minMinutes, preferredWindows) {
 
   const buildMerged = run => {
     const totalMin = run.reduce((a, s) => a + Number(s.duration || 60), 0)
+    const courts = courtSeq(run)
     return {
       platform: run[0].platform,
       place: run[0].place,
-      court: run[0].court,
+      court: combinedCourtName(run, courts),
       date: run[0].date,
       start: run[0].start,
       end: run[run.length - 1].end,
       duration: totalMin,
       available: true,
-      courts: courtSeq(run)
+      courts
     }
   }
 
@@ -254,6 +255,13 @@ function courtSeq(run) {
 
 function trimHourNum(h) {
   return Number.isInteger(h) ? String(h) : String(+h.toFixed(1))
+}
+
+// 跨面拼接时用组合场地名（"GB" → "GB面"，"2GB" → "2GB面"），单面/同面多时段保留原名
+function combinedCourtName(run, courts) {
+  const letters = String(courts || '').replace(/\d+/g, '')
+  if (letters && new Set(letters).size > 1) return `${courts}面`
+  return run[0].court
 }
 
 // "水辺テニスＡ面" → "A"；"Ａ面" → "A"；兜底取名字首字符

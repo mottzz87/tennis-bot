@@ -127,16 +127,21 @@ async function handleBook(body) {
       const ucode = slot.ucode || `${slot.place}_${slot.court}_${slot.date}_${slot.time}`
       const exists = bookedSlots.some(s => s.uid === slot.uid || s.ucode === ucode)
       if (!exists) {
+        const fee = result.fee || null
         bookedSlots.push({
           uid: slot.uid || ucode,
           ucode,
           platform: platformName,
           place: slot.place,
           court: slot.court,
+          courts: slot.courts || null,
           date: slot.date,
           time: slot.time,
           dateDisplay: slot.dateDisplay || '',
           reminderEnabled: true,
+          facilityFee: fee?.facility ?? null,
+          lightingFee: fee?.lighting ?? null,
+          totalFee: fee?.total ?? null,
           bookedAt: Date.now(),
           create: new Date().toLocaleString()
         })
