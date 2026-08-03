@@ -394,6 +394,109 @@ async function pushBookedReminderBySchedule() {
 }
 
 // ========================
+// Quick actions（面板内联键盘 & 回复键盘托盘共用）
+// ========================
+async function quickRun(bot) {
+  const platforms = await getPlatformsForBot(bot)
+  await monitorApi('POST', '/api/run', { platforms })
+}
+
+async function quickStats(bot, chatId) {
+  const res = await monitorApi('GET', '/api/stats')
+  const parts = res.data?.parts || ['📊 暂无统计']
+  for (const part of parts) await bot.sendMessage(chatId, part)
+}
+
+async function quickResume(bot, chatId) {
+  await monitorApi('POST', '/api/resume')
+  await bot.sendMessage(chatId, '▶️ 监控已恢复')
+}
+
+async function quickPause(bot, chatId) {
+  await monitorApi('POST', '/api/pause')
+  await bot.sendMessage(chatId, '⏸️ 监控已暂停')
+}
+
+async function quickStatus(bot, chatId) {
+  try {
+    const mRes = await monitorApi('GET', '/api/status')
+    const pRes = await monitorApi('GET', '/api/places')
+    const status = mRes.data
+    const places = pRes.data?.places || []
+
+    const placeLines = places.map(p =>
+      `${p.enabled ? '🟢' : '⚪'} ${p.emoji} ${p.short}`
+    )
+    const text =
+      `📊 *系统状态*\n━━━━━━━━━━━━━━\n` +
+      `📡 监控：${status.running ? '运行中' : '已暂停'}\n` +
+      `🤖 自动预约：${status.autoBooking ? '进行中' : '空闲'}\n` +
+      `📋 当前列表：${status.slotCount} 条\n\n` +
+      `🏟️ *场地*\n━━━━━━━━━━━━━━\n${placeLines.join('\n') || '（无）'}\n\n` +
+      `⏱️ 间隔 ${status.interval || 45}s`
+    await bot.sendMessage(chatId, text, { parse_mode: 'Markdown' })
+  } catch (e) {
+    await bot.sendMessage(chatId, `❌ 获取状态失败: ${e.message}`)
+  }
+}
+
+async function quickBooked(bot, chatId) {
+  try {
+    const res = await bookingApi('GET', '/api/booked')
+    const slots = res.data?.slots || []
+    if (slots.length === 0) {
+      await bot.sendMessage(chatId, '📚 暂无预约记录')
+      return
+    }
+    const list = slots.slice()
+      .sort((a, b) => (parseSlotStartDateTimeSafe(b)?.getTime() || 0) - (parseSlotStartDateTimeSafe(a)?.getTime() || 0))
+      .slice(0, 12)
+    const buttons = await Promise.all(list.map(async d => {
+      const pc = await getPlatformConfig(d.platform)
+      const meta = pc.PLACE_MAP?.[d.place] || {}
+      const placeShort = (meta.short || d.place || '').trim()
+      const court = displayCourt(d)
+      const t = formatTimeDisplay(d.time || `${d.start}-${d.end}`)
+      const date = d.dateDisplay || d.date
+      const bell = d.reminderEnabled === false ? '🔕' : '🔔'
+      const fee = d.totalFee ? ` 💰${d.totalFee}` : ''
+      const info = `${bell} ${meta.emoji || '🎾'} ${placeShort} ${court} · ${date} ${t}${fee}`
+      return [{ text: info, callback_data: `try_del_${d.ucode}` }]
+    }))
+    await bot.sendMessage(chatId,
+      `📚 预约记录（最近 ${list.length}/${slots.length} 条）\n━━━━━━━━━━━━━━`,
+      { reply_markup: { inline_keyboard: buttons } }
+    )
+  } catch (e) {
+    await bot.sendMessage(chatId, `❌ 获取预约记录失败: ${e.message}`)
+  }
+}
+
+async function quickSchedule(bot, chatId) {
+  try {
+    const res = await bookingApi('GET', '/api/booked/schedule')
+    const slots = res.data?.slots || []
+    if (slots.length === 0) {
+      await bot.sendMessage(chatId, '📅 暂无未开始的预约')
+      return
+    }
+    const buttons = await Promise.all(slots.map(async d => {
+      const pc = await getPlatformConfig(d.platform)
+      return [{
+        text: formatToggleButtonLabel(d, pc),
+        callback_data: `toggle_remind_${d.ucode}`
+      }]
+    }))
+    await bot.sendMessage(chatId,
+      `📅 预约日程（共 ${slots.length} 条）\n━━━━━━━━━━━━━━\n点击切换提醒状态`,
+      { reply_markup: { inline_keyboard: buttons } }
+    )
+  } catch (e) {
+    await bot.sendMessage(chatId, `❌ 获取日程失败: ${e.message}`)
+  }
+}
+
+// ========================
 // Commands
 // ========================
 function registerHandlers(bot) {
@@ -425,9 +528,19 @@ function registerHandlers(bot) {
     ]
   })
 
+  // 回复键盘托盘：输入区上方常驻按钮，点击直接把面板动作当文本发出
+  const buildPanelTray = () => ({
+    keyboard: [
+      [{ text: '📊 系统状态' }, { text: '📈 抢场统计' }],
+      [{ text: '📅 预约日程' }, { text: '📚 预约记录' }],
+      [{ text: '⏸️ 暂停监控' }, { text: '▶️ 恢复监控' }]
+    ],
+    resize_keyboard: true
+  })
+
   bot.onText(/\/panel/, async (msg) => {
     if (!isAdmin(msg)) return
-  
+
     await bot.sendMessage(
       msg.chat.id,
       '🎛️ *控制面板*\n━━━━━━━━━━━━━━\n选择操作：',
@@ -436,8 +549,26 @@ function registerHandlers(bot) {
         reply_markup: buildPanelKeyboard()
       }
     )
+    // 弹出输入区上方的常驻按钮托盘
+    await bot.sendMessage(msg.chat.id, '👇 也可点击下方按钮直接操作', {
+      reply_markup: buildPanelTray()
+    })
   })
-  
+
+  // 托盘按钮点击 → 直接执行对应动作（无需走面板内联键盘）
+  const trayActions = {
+    '📊 系统状态': quickStatus,
+    '📈 抢场统计': quickStats,
+    '📅 预约日程': quickSchedule,
+    '📚 预约记录': quickBooked,
+    '⏸️ 暂停监控': quickPause,
+    '▶️ 恢复监控': quickResume
+  }
+  bot.onText(/^(📊 系统状态|📈 抢场统计|📅 预约日程|📚 预约记录|⏸️ 暂停监控|▶️ 恢复监控)$/, async (msg) => {
+    if (!isAdmin(msg)) return
+    await trayActions[msg.text]?.(bot, msg.chat.id)
+  })
+
   bot.onText(/\/run/, async (msg) => {
     if (!isAdmin(msg)) return
     await bot.sendMessage(msg.chat.id, `🚀 *手动执行监控*\n━━━━━━━━━━━━━━\n⏳ 正在抓取最新数据...`, { parse_mode: 'Markdown' })
@@ -756,132 +887,43 @@ function registerHandlers(bot) {
     // --- Quick action buttons ---
     if (data === 'quick_run') {
       await bot.answerCallbackQuery(query.id, { text: '🚀 执行中...' })
-      const platforms = await getPlatformsForBot(bot)
-      await monitorApi('POST', '/api/run', { platforms })
+      await quickRun(bot)
       return
     }
-  
+
     if (data === 'quick_stats') {
       await bot.answerCallbackQuery(query.id, { text: '📈 获取统计' })
-  
-      const res = await monitorApi('GET', '/api/stats')
-      const parts = res.data?.parts || ['📊 暂无统计']
-  
-      for (const part of parts) {
-        await bot.sendMessage(chatId, part)
-      }
-  
+      await quickStats(bot, chatId)
       return
     }
-  
+
     if (data === 'quick_resume') {
       await bot.answerCallbackQuery(query.id, { text: '▶️ 恢复中' })
-  
-      await monitorApi('POST', '/api/resume')
-  
-      await bot.sendMessage(
-        chatId,
-        '▶️ 监控已恢复'
-      )
-  
+      await quickResume(bot, chatId)
       return
     }
-  
+
     if (data === 'quick_pause') {
       await bot.answerCallbackQuery(query.id, { text: '⏸️ 暂停中' })
-  
-      await monitorApi('POST', '/api/pause')
-  
-      await bot.sendMessage(
-        chatId,
-        '⏸️ 监控已暂停'
-      )
-  
+      await quickPause(bot, chatId)
       return
     }
-  
+
     if (data === 'quick_status') {
       await bot.answerCallbackQuery(query.id, { text: '已生成' })
-      try {
-        const mRes = await monitorApi('GET', '/api/status')
-        const pRes = await monitorApi('GET', '/api/places')
-        const status = mRes.data
-        const places = pRes.data?.places || []
-  
-        const placeLines = places.map(p =>
-          `${p.enabled ? '🟢' : '⚪'} ${p.emoji} ${p.short}`
-        )
-        const text =
-          `📊 *系统状态*\n━━━━━━━━━━━━━━\n` +
-          `📡 监控：${status.running ? '运行中' : '已暂停'}\n` +
-          `🤖 自动预约：${status.autoBooking ? '进行中' : '空闲'}\n` +
-          `📋 当前列表：${status.slotCount} 条\n\n` +
-          `🏟️ *场地*\n━━━━━━━━━━━━━━\n${placeLines.join('\n') || '（无）'}\n\n` +
-          `⏱️ 间隔 ${status.interval || 45}s`
-        await bot.sendMessage(chatId, text, { parse_mode: 'Markdown' })
-      } catch (e) {
-        await bot.sendMessage(chatId, `❌ 获取状态失败: ${e.message}`)
-      }
+      await quickStatus(bot, chatId)
       return
     }
-  
+
     if (data === 'quick_booked') {
       await bot.answerCallbackQuery(query.id, { text: '📚 …' })
-      try {
-        const res = await bookingApi('GET', '/api/booked')
-        const slots = res.data?.slots || []
-        if (slots.length === 0) {
-          await bot.sendMessage(chatId, '📚 暂无预约记录')
-          return
-        }
-        const list = slots.slice()
-          .sort((a, b) => (parseSlotStartDateTimeSafe(b)?.getTime() || 0) - (parseSlotStartDateTimeSafe(a)?.getTime() || 0))
-          .slice(0, 12)
-        const buttons = await Promise.all(list.map(async d => {
-          const pc = await getPlatformConfig(d.platform)
-          const meta = pc.PLACE_MAP?.[d.place] || {}
-          const placeShort = (meta.short || d.place || '').trim()
-          const court = displayCourt(d)
-          const t = formatTimeDisplay(d.time || `${d.start}-${d.end}`)
-          const date = d.dateDisplay || d.date
-          const bell = d.reminderEnabled === false ? '🔕' : '🔔'
-          const fee = d.totalFee ? ` 💰${d.totalFee}` : ''
-          const info = `${bell} ${meta.emoji || '🎾'} ${placeShort} ${court} · ${date} ${t}${fee}`
-          return [{ text: info, callback_data: `try_del_${d.ucode}` }]
-        }))
-        await bot.sendMessage(chatId,
-          `📚 预约记录（最近 ${list.length}/${slots.length} 条）\n━━━━━━━━━━━━━━`,
-          { reply_markup: { inline_keyboard: buttons } }
-        )
-      } catch (e) {
-        await bot.sendMessage(chatId, `❌ 获取预约记录失败: ${e.message}`)
-      }
+      await quickBooked(bot, chatId)
       return
     }
-  
+
     if (data === 'quick_schedule') {
       await bot.answerCallbackQuery(query.id, { text: '📅 …' })
-      try {
-        const res = await bookingApi('GET', '/api/booked/schedule')
-        const slots = res.data?.slots || []
-        if (slots.length === 0) {
-          await bot.sendMessage(chatId, '📅 暂无未开始的预约')
-          return
-        }
-        const buttons = await Promise.all(slots.map(async d => {
-          const pc = await getPlatformConfig(d.platform)
-          return [{
-            text: formatToggleButtonLabel(d, pc),
-            callback_data: `toggle_remind_${d.ucode}`
-          }]
-        }))
-        await bot.sendMessage(chatId,
-          `📅 预约日程（共 ${slots.length} 条）\n━━━━━━━━━━━━━━\n点击切换提醒状态`,
-          { reply_markup: { inline_keyboard: buttons } }
-        )
-      } catch (e) {
-        await bot.sendMessage(chatId, `❌ 获取日程失败: ${e.message}`)
-      }
+      await quickSchedule(bot, chatId)
       return
     }
   
