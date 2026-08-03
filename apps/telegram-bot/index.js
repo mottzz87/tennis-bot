@@ -239,25 +239,6 @@ let lastBookedReminderAt = 0
 // ========================
 // Panel / Formatting
 // ========================
-function buildPanelKeyboard() {
-  return {
-    inline_keyboard: [
-      [
-        { text: '📊 系统状态', callback_data: 'quick_status' },
-        { text: '📈 抢场统计', callback_data: 'quick_stats' }
-      ],
-      [
-        { text: '📅 预约日程', callback_data: 'quick_schedule' },
-        { text: '📚 预约记录', callback_data: 'quick_booked' },
-      ],
-      [
-        { text: '⏸️ 暂停监控', callback_data: 'quick_pause' },
-        { text: '▶️ 恢复监控', callback_data: 'quick_resume' }
-      ]
-    ]
-  }
-}
-
 const TG_BTN_MAX = 64
 
 function formatToggleButtonLabel(d, platformConfig) {
@@ -336,34 +317,25 @@ async function pushBookedReminder() {
   const future = res.data.slots.filter(s => eligibleForBookedSummary(s, intervals.get(s.platform)))
   if (future.length === 0) return
 
-  // 按平台分组，每个平台各发一条合并消息（不再按日期拆）
-  const byPlatform = new Map()
-  for (const d of future) {
-    if (!byPlatform.has(d.platform)) byPlatform.set(d.platform, [])
-    byPlatform.get(d.platform).push(d)
-  }
+  // 全部平台合并为一条消息推送，不再按平台分开
+  future.sort((a, b) => {
+    const ta = parseSlotStartDateTimeSafe(a)?.getTime() ?? 0
+    const tb = parseSlotStartDateTimeSafe(b)?.getTime() ?? 0
+    return ta - tb
+  })
 
   const CHUNK = 10
-  for (const [platform, list] of byPlatform) {
-    list.sort((a, b) => {
-      const ta = parseSlotStartDateTimeSafe(a)?.getTime() ?? 0
-      const tb = parseSlotStartDateTimeSafe(b)?.getTime() ?? 0
-      return ta - tb
-    })
-    const pc = await getPlatformConfig(platform)
-    const buttons = await Promise.all(list.map(async d => [{
-      text: formatReminderButtonLabel(d, pc),
-      callback_data: `del_booked_${d.ucode}`
-    }]))
-    const reminderBot = getBotForPlatform(platform)
-    for (let i = 0; i < buttons.length; i += CHUNK) {
-      const part = buttons.slice(i, i + CHUNK)
-      const pageSlots = list.slice(i, i + CHUNK)
-      const h = `📅 已预约提醒（${list.length} 条）${i === 0 ? '' : `\n（第 ${i / CHUNK + 1} 页）`}`
-      const sent = await reminderBot.sendMessage(ADMIN_ID, h, { reply_markup: { inline_keyboard: part } })
-      for (const d of pageSlots) {
-        registerReminderMessage(d.ucode, sent.chat.id, sent.message_id, reminderBot)
-      }
+  const reminderBot = bots[0] // 跨平台合并后统一走默认 bot
+  for (let i = 0; i < future.length; i += CHUNK) {
+    const pageSlots = future.slice(i, i + CHUNK)
+    const buttons = await Promise.all(pageSlots.map(async d => {
+      const pc = await getPlatformConfig(d.platform)
+      return [{ text: formatReminderButtonLabel(d, pc), callback_data: `del_booked_${d.ucode}` }]
+    }))
+    const h = `📅 已预约提醒（${future.length} 条）${i === 0 ? '' : `\n（第 ${i / CHUNK + 1} 页）`}`
+    const sent = await reminderBot.sendMessage(ADMIN_ID, h, { reply_markup: { inline_keyboard: buttons } })
+    for (const d of pageSlots) {
+      registerReminderMessage(d.ucode, sent.chat.id, sent.message_id, reminderBot)
     }
   }
 }
@@ -382,32 +354,32 @@ async function pushUpcomingReminder() {
   if (imminent.length === 0) return
   for (const d of imminent) remindedSet.add(d.uid)
 
-  // 按平台分组，每个平台各发一条合并消息（不再逐条发）
-  const byPlatform = new Map()
-  for (const d of imminent) {
-    if (!byPlatform.has(d.platform)) byPlatform.set(d.platform, [])
-    byPlatform.get(d.platform).push(d)
-  }
+  // 全部平台合并为一条消息推送，不再按平台分开
+  imminent.sort((a, b) => {
+    const ta = parseSlotStartDateTimeSafe(a)?.getTime() ?? 0
+    const tb = parseSlotStartDateTimeSafe(b)?.getTime() ?? 0
+    return ta - tb
+  })
 
   const CHUNK = 10
-  for (const [platform, list] of byPlatform) {
-    const pc = await getPlatformConfig(platform)
-    const reminderBot = getBotForPlatform(platform)
-    for (let i = 0; i < list.length; i += CHUNK) {
-      const pageSlots = list.slice(i, i + CHUNK)
-      const lines = pageSlots.map(d => formatSlotText(d, pc, { style: 'detail' })).join('\n\n')
-      const buttons = await Promise.all(pageSlots.map(async d => [{
-        text: formatReminderButtonLabel(d, pc),
-        callback_data: `del_booked_${d.ucode}`
-      }]))
-      const h = `⏰ *即将开始（1小时内）*\n━━━━━━━━━━━━━━\n${lines}${i === 0 ? '' : `\n（第 ${i / CHUNK + 1} 页）`}`
-      const sent = await reminderBot.sendMessage(ADMIN_ID, h, {
-        parse_mode: 'Markdown',
-        reply_markup: { inline_keyboard: buttons }
-      })
-      for (const d of pageSlots) {
-        registerReminderMessage(d.ucode, sent.chat.id, sent.message_id, reminderBot)
-      }
+  const reminderBot = bots[0] // 跨平台合并后统一走默认 bot
+  for (let i = 0; i < imminent.length; i += CHUNK) {
+    const pageSlots = imminent.slice(i, i + CHUNK)
+    const lines = await Promise.all(pageSlots.map(async d => {
+      const pc = await getPlatformConfig(d.platform)
+      return formatSlotText(d, pc, { style: 'detail' })
+    }))
+    const buttons = await Promise.all(pageSlots.map(async d => {
+      const pc = await getPlatformConfig(d.platform)
+      return [{ text: formatReminderButtonLabel(d, pc), callback_data: `del_booked_${d.ucode}` }]
+    }))
+    const h = `⏰ *即将开始（1小时内）*\n━━━━━━━━━━━━━━\n${lines.join('\n\n')}${i === 0 ? '' : `\n（第 ${i / CHUNK + 1} 页）`}`
+    const sent = await reminderBot.sendMessage(ADMIN_ID, h, {
+      parse_mode: 'Markdown',
+      reply_markup: { inline_keyboard: buttons }
+    })
+    for (const d of pageSlots) {
+      registerReminderMessage(d.ucode, sent.chat.id, sent.message_id, reminderBot)
     }
   }
 }
@@ -434,7 +406,25 @@ function registerHandlers(bot) {
     { command: 'log', description: '📋 查看日志' },
     { command: 'help', description: '❓ 帮助' }
   ])
-  
+
+  // 每个 bot 各自的控制面板键盘实例（闭包），当前内容相同，后续可按平台各自定制
+  const buildPanelKeyboard = () => ({
+    inline_keyboard: [
+      [
+        { text: '📊 系统状态', callback_data: 'quick_status' },
+        { text: '📈 抢场统计', callback_data: 'quick_stats' }
+      ],
+      [
+        { text: '📅 预约日程', callback_data: 'quick_schedule' },
+        { text: '📚 预约记录', callback_data: 'quick_booked' }
+      ],
+      [
+        { text: '⏸️ 暂停监控', callback_data: 'quick_pause' },
+        { text: '▶️ 恢复监控', callback_data: 'quick_resume' }
+      ]
+    ]
+  })
+
   bot.onText(/\/panel/, async (msg) => {
     if (!isAdmin(msg)) return
   
