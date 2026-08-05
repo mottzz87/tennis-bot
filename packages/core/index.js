@@ -175,7 +175,8 @@ function mergeContiguousSlots(slots, minMinutes, preferredWindows) {
       end: run[run.length - 1].end,
       duration: totalMin,
       available: true,
-      courts
+      courts,
+      group: run[0].group
     }
   }
 
@@ -223,9 +224,10 @@ function mergeContiguousSlots(slots, minMinutes, preferredWindows) {
   }
 
   // 阶段二：单条空位跨场地按时间拼接，不足 minMinutes（含凑不满的单条）丢弃
+  // 按 场地+日期+组 分组，同组才拼（硬地/人工芝不互相拼接）
   const looseGroups = new Map()
   for (const s of leftover) {
-    const key = `${s.place}|${s.date}`
+    const key = `${s.place}|${s.date}|${s.group || ''}`
     if (!looseGroups.has(key)) looseGroups.set(key, [])
     looseGroups.get(key).push(s)
   }
@@ -272,6 +274,55 @@ function courtLetter(court) {
   const m2 = name.match(/([A-Z])(?=面)/)
   if (m2) return m2[1]
   return name.slice(0, 1) || '?'
+}
+
+// ========================
+// 场地组（court group）判定
+// ========================
+
+// 归一化配置里的字母："Ａ"/"ａ"/"a" → "A"
+function normalizeCourtLetter(s) {
+  return String(s || '')
+    .replace(/[Ａ-Ｚ]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0))
+    .replace(/[ａ-ｚ]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0))
+    .toUpperCase()
+    .replace(/\s+/g, '')
+}
+
+// 某场地是否命中组规则：命中任意 letters（字母）或 keywords（场地名关键词）即算命中
+function matchCourtGroup(g, letter, courtNorm) {
+  if (Array.isArray(g.letters) && g.letters.length) {
+    const letters = g.letters.map(normalizeCourtLetter).filter(Boolean)
+    if (letter && letters.includes(letter)) return true
+  }
+  if (Array.isArray(g.keywords) && g.keywords.length) {
+    if (g.keywords.some(k => courtNorm.includes(normalizeText(k)))) return true
+  }
+  return false
+}
+
+/**
+ * 按配置 COURT_GROUPS 判定某场地的组标签。
+ * @param {string} court - 场地名（如 "西葛西テニスＡ面"）
+ * @param {string} place - 场地名（如 "西葛西テニスコート"）
+ * @param {Object} platformConfig - 平台配置（COURT_GROUPS）
+ * @returns {string|undefined} 组标签；未配置或无匹配返回 undefined
+ */
+function resolveCourtGroup(court, place, platformConfig) {
+  const groups = platformConfig?.COURT_GROUPS?.[place]
+  if (!Array.isArray(groups) || groups.length === 0) return undefined
+  const letter = courtLetter(court)
+  const courtNorm = normalizeText(court)
+  let defaultGroup = null
+  for (const g of groups) {
+    if (!g || typeof g.group !== 'string' || !g.group) continue
+    if (g.default) {
+      if (!defaultGroup) defaultGroup = g.group
+      continue
+    }
+    if (matchCourtGroup(g, letter, courtNorm)) return g.group
+  }
+  return defaultGroup
 }
 
 // ========================
@@ -525,6 +576,7 @@ function splitForTelegram(text, maxLen = 3800) {
 module.exports = {
   filterSlotsByRules,
   filterSlotsByConfig,
+  resolveCourtGroup,
   mergeContiguousSlots,
   getAutoRules,
   filterSlotsAuto,

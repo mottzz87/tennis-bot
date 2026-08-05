@@ -281,6 +281,52 @@ async function sendBookButtons(bot, chatId, slots, header) {
   }
 }
 
+// slot 的显示组标签：
+//   有 group → 该组；配置了 COURT_GROUPS 但未命中任何组 → "其他"；未配置 → ''（不分组）
+function sectionGroupOf(d, platformConfig) {
+  if (d.group) return d.group
+  if (platformConfig?.COURT_GROUPS?.[d.place]) return '其他'
+  return ''
+}
+
+// section 显示名：有组显示 "场・组"（如 "西葛西・硬地"），无组只显示场地名
+function sectionLabel(section, platformConfig) {
+  return section.group ? `${placeShort(section.place)}・${section.group}` : placeShort(section.place)
+}
+
+// 同一场地内组顺序：按 COURT_GROUPS 数组顺序；"其他"（未配置的组）排最后
+function sectionGroupIdx(section, platformConfig) {
+  const groups = platformConfig?.COURT_GROUPS?.[section.place]
+  if (!Array.isArray(groups)) return section.group === '' ? -1 : 999
+  const i = groups.findIndex(g => g.group === section.group)
+  return i >= 0 ? i : groups.length
+}
+
+// 按 场地优先级 + 组顺序 排序 section
+function sortSections(sections, platformConfig) {
+  return sections.slice().sort((a, b) => {
+    const pa = placePriority(a.slots[0]), pb = placePriority(b.slots[0])
+    if (pa !== pb) return pa - pb
+    return sectionGroupIdx(a, platformConfig) - sectionGroupIdx(b, platformConfig)
+  })
+}
+
+// 按 场地+组 分 section（同一场地硬地/人工芝拆开）
+function buildSections(list, platformConfig) {
+  const bySec = new Map()
+  for (const d of list) {
+    const group = sectionGroupOf(d, platformConfig)
+    const key = `${d.place}|${group}`
+    if (!bySec.has(key)) bySec.set(key, { place: d.place, group, slots: [] })
+    bySec.get(key).slots.push(d)
+  }
+  return sortSections([...bySec.values()], platformConfig)
+}
+
+function sectionHeader(title, section, platformConfig) {
+  return `${title}\n━━━━━━━━━━━━━━\n${placeEmoji(section.place)} ${sectionLabel(section, platformConfig)}（${section.slots.length} 个）`
+}
+
 async function sendTelegram(data, version, title = '🆕 可预约（点击直接预约）') {
   const grouped = groupSlotsByPlatform(data)
 
@@ -292,37 +338,32 @@ async function sendTelegram(data, version, title = '🆕 可预约（点击直�
       console.log(`[通知] ${platform} 未配置 Bot Token 或 Chat ID，跳过`)
       continue
     }
+    const platformConfig = config.getPlatform(platform)
     const list = sortSlots(slots).slice(0, maxPush)
-    const byPlace = new Map()
-    for (const d of list) {
-      if (!byPlace.has(d.place)) byPlace.set(d.place, [])
-      byPlace.get(d.place).push(d)
-    }
-    const places = [...byPlace.keys()]
+    const sections = buildSections(list, platformConfig)
 
-    // 单场地且空位少 → 直接全部 book 按钮（保持一键预约）
-    if (places.length === 1 && list.length <= MAX_INLINE_BUTTONS) {
-      await sendBookButtons(botInstance, chatId, list, title)
+    // 单 section 且空位少 → 直接全部 book 按钮（保持一键预约）
+    if (sections.length === 1 && sections[0].slots.length <= MAX_INLINE_BUTTONS) {
+      await sendBookButtons(botInstance, chatId, sections[0].slots, title)
       continue
     }
 
-    // 多场地/空位多 → 两级导航：
-    //   第一个（优先级最高）场地直接给 book 按钮，其余场地给"查看空位"按钮
-    const firstPlace = places[0]
-    const firstSlots = byPlace.get(firstPlace)
+    // 多 section → 两级导航：
+    //   第一个 section 直接给 book 按钮，其余 section 给"查看空位"按钮
+    const first = sections[0]
     await sendBookButtons(
       botInstance,
       chatId,
-      firstSlots,
-      `${title}\n━━━━━━━━━━━━━━\n${placeEmoji(firstPlace)} ${placeShort(firstPlace)}（${firstSlots.length} 个）`
+      first.slots,
+      sectionHeader(title, first, platformConfig)
     )
 
-    const restRows = places.map(p =>
-      `${placeEmoji(p)} ${placeShort(p)} ×${byPlace.get(p).length}`
+    const restRows = sections.slice(1).map(s =>
+      `${placeEmoji(s.place)} ${sectionLabel(s, platformConfig)} ×${s.slots.length}`
     )
-    const restButtons = places.slice(1).map(p => [{
-      text: `🔍 ${placeShort(p)}（${byPlace.get(p).length}）查看空位`,
-      callback_data: `viewplace_${platform}|${p}`
+    const restButtons = sections.slice(1).map(s => [{
+      text: `🔍 ${sectionLabel(s, platformConfig)}（${s.slots.length}）查看空位`,
+      callback_data: `viewplace_${platform}|${s.place}|${s.group}`
     }])
     if (restButtons.length > 0) {
       await botInstance.sendMessage(
@@ -816,12 +857,16 @@ const server = http.createServer(async (req, res) => {
       return json(res, { lines: logBuffer.slice(-n) })
     }
 
-    // GET /api/place/:platform/:place — 某场地当前空位（多场地推送的"查看空位"按钮）
+    // GET /api/place/:platform/:place?group= — 某场地（或某组）当前空位（推送的"查看空位"按钮）
     if (req.method === 'GET' && pathname.startsWith('/api/place/')) {
       const parts = decodeURIComponent(pathname.replace('/api/place/', '')).split('/')
       const platform = parts[0]
       const place = parts.slice(1).join('/')
-      const slots = sortSlots((currentData || []).filter(s => s.platform === platform && s.place === place))
+      const group = url.searchParams.get('group')
+      const slots = sortSlots((currentData || []).filter(s =>
+        s.platform === platform && s.place === place &&
+        (group == null ? true : group === '' ? !s.group : s.group === group)
+      ))
       return json(res, { success: true, slots })
     }
 

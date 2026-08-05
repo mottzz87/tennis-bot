@@ -48,6 +48,21 @@
       "priority": 2
     }
   },
+  "COURT_GROUPS": {
+    "西葛西テニスコート": [
+      {
+        "group": "硬地",
+        "letters": [
+          "A",
+          "B"
+        ]
+      },
+      {
+        "group": "人工芝",
+        "default": true
+      }
+    ]
+  },
   "TIME_FILTER": [
     "6-11",
     "17-22"

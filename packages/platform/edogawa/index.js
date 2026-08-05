@@ -151,6 +151,10 @@ class EdogawaAdapter {
       }
       slots.push(...parseTimePage(timeHtml))
     }
+    // 打场地组标签（硬地/人工芝等），拼接时同组才拼，避免混合类型拼成一段
+    for (const s of slots) {
+      s.group = core.resolveCourtGroup(s.court, s.place, platformConfig)
+    }
     const merged = core.mergeContiguousSlots(slots, this._minMinutes, this._goldenFilter)
     if (merged.length !== slots.length) {
       const goldenNote = this._goldenFilter.length ? `, 黄金时段 ${this._goldenFilter.join('/')}` : ''
