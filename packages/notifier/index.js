@@ -92,7 +92,8 @@ function formatReminderButtonLabel(d, platformConfig) {
   const date = d.dateDisplay || d.date
   const t = formatTimeDisplay(d.time || `${d.start}-${d.end}`)
   const em = meta.emoji || '🎾'
-  const s = `🔕 ${em} ${placeShort} ${court} · ${date} ${t}`
+  const fee = formatFeeLine(d)
+  const s = `🔕 ${em} ${placeShort} ${court} · ${date} ${t}${fee ? ` ${fee}` : ''}`
   return truncateTelegramButtonText(s)
 }
 

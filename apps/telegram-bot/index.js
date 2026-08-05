@@ -367,7 +367,7 @@ async function pushUpcomingReminder() {
     const pageSlots = imminent.slice(i, i + CHUNK)
     const lines = await Promise.all(pageSlots.map(async d => {
       const pc = await getPlatformConfig(d.platform)
-      return formatSlotText(d, pc, { style: 'detail' })
+      return formatSlotText(d, pc, { style: 'detail', showFee: true })
     }))
     const buttons = await Promise.all(pageSlots.map(async d => {
       const pc = await getPlatformConfig(d.platform)
@@ -952,24 +952,21 @@ function registerHandlers(bot) {
       return
     }
 
-    // --- View place（推送里的"查看空位"按钮，数据为 platform|place|group） ---
+    // --- View place（推送里的"查看空位"按钮，数据为 platform|place） ---
     if (data.startsWith('viewplace_')) {
       const rest = data.replace('viewplace_', '')
       const parts = rest.split('|')
       const platform = parts[0]
-      const place = parts[1] || ''
-      const group = parts.slice(2).join('|')
+      const place = parts.slice(1).join('|')
       await bot.answerCallbackQuery(query.id, { text: '🔍 加载中...' })
       try {
-        const qs = group ? `?group=${encodeURIComponent(group)}` : ''
-        const res = await monitorApi('GET', `/api/place/${encodeURIComponent(platform)}/${encodeURIComponent(place)}${qs}`)
+        const res = await monitorApi('GET', `/api/place/${encodeURIComponent(platform)}/${encodeURIComponent(place)}`)
         const slots = res.data?.slots || []
         if (slots.length === 0) {
           await bot.sendMessage(chatId, '📍 该场地当前暂无空位')
           return
         }
         const pc = await getPlatformConfig(platform)
-        const label = group ? `${place}・${group}` : place
         const CHUNK = 10
         for (let i = 0; i < slots.length; i += CHUNK) {
           const part = slots.slice(i, i + CHUNK)
@@ -977,7 +974,7 @@ function registerHandlers(bot) {
             text: formatSlotText(d, pc),
             callback_data: `book_${d.ucode}`
           }])
-          const h = `📍 ${label}（${slots.length} 个）${i === 0 ? '' : `\n（第 ${i / CHUNK + 1} 页）`}`
+          const h = `📍 ${place}（${slots.length} 个）${i === 0 ? '' : `\n（第 ${i / CHUNK + 1} 页）`}`
           await bot.sendMessage(chatId, h, { reply_markup: { inline_keyboard: buttons } })
         }
       } catch (e) {

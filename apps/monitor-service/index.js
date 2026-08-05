@@ -289,42 +289,44 @@ function sectionGroupOf(d, platformConfig) {
   return ''
 }
 
-// section 显示名：有组显示 "场・组"（如 "西葛西・硬地"），无组只显示场地名
-function sectionLabel(section, platformConfig) {
-  return section.group ? `${placeShort(section.place)}・${section.group}` : placeShort(section.place)
+// 是否周末（土/日）
+function isWeekend(d) {
+  const m = String(d.dateDisplay || '').match(/[（(]([月火水木金土日])[）)]/)
+  if (m) return m[1] === '土' || m[1] === '日'
+  if (/^\d{4}-\d{2}-\d{2}$/.test(String(d.date || ''))) {
+    const [y, mo, day] = String(d.date).split('-').map(Number)
+    const w = new Date(y, mo - 1, day).getDay()
+    return w === 0 || w === 6
+  }
+  return false
 }
 
-// 同一场地内组顺序：按 COURT_GROUPS 数组顺序；"其他"（未配置的组）排最后
-function sectionGroupIdx(section, platformConfig) {
-  const groups = platformConfig?.COURT_GROUPS?.[section.place]
-  if (!Array.isArray(groups)) return section.group === '' ? -1 : 999
-  const i = groups.findIndex(g => g.group === section.group)
-  return i >= 0 ? i : groups.length
-}
-
-// 按 场地优先级 + 组顺序 排序 section
-function sortSections(sections, platformConfig) {
-  return sections.slice().sort((a, b) => {
-    const pa = placePriority(a.slots[0]), pb = placePriority(b.slots[0])
-    if (pa !== pb) return pa - pb
-    return sectionGroupIdx(a, platformConfig) - sectionGroupIdx(b, platformConfig)
+// 周末在前，周末/平日各自按 日期+时间 先后
+function sortWeekendFirst(list) {
+  return list.slice().sort((a, b) => {
+    const wa = isWeekend(a) ? 0 : 1
+    const wb = isWeekend(b) ? 0 : 1
+    if (wa !== wb) return wa - wb
+    const ta = `${a.date || ''} ${a.start || a.time || ''}`
+    const tb = `${b.date || ''} ${b.start || b.time || ''}`
+    return ta < tb ? -1 : ta > tb ? 1 : 0
   })
 }
 
-// 按 场地+组 分 section（同一场地硬地/人工芝拆开）
-function buildSections(list, platformConfig) {
-  const bySec = new Map()
-  for (const d of list) {
-    const group = sectionGroupOf(d, platformConfig)
-    const key = `${d.place}|${group}`
-    if (!bySec.has(key)) bySec.set(key, { place: d.place, group, slots: [] })
-    bySec.get(key).slots.push(d)
+// 场地摘要一行：场地名出现一次，组计数内联（"🎯 西葛西（硬地 ×3 ・ 人工芝 ×13）"），无组只显示场地
+function placeSummaryLine(place, slots, platformConfig) {
+  const counts = new Map()
+  for (const d of slots) {
+    const g = sectionGroupOf(d, platformConfig)
+    counts.set(g, (counts.get(g) || 0) + 1)
   }
-  return sortSections([...bySec.values()], platformConfig)
-}
-
-function sectionHeader(title, section, platformConfig) {
-  return `${title}\n━━━━━━━━━━━━━━\n${placeEmoji(section.place)} ${sectionLabel(section, platformConfig)}（${section.slots.length} 个）`
+  const cfgGroups = platformConfig?.COURT_GROUPS?.[place]
+  const labels = cfgGroups
+    ? [...cfgGroups.map(g => g.group), '其他', ''].filter(g => counts.has(g))
+    : [''].filter(g => counts.has(g))
+  const base = `${placeEmoji(place)} ${placeShort(place)}`
+  if (labels.length === 1 && labels[0] === '') return `${base} ×${counts.get('')}`
+  return `${base}（${labels.map(g => g ? `${g} ×${counts.get(g)}` : `其他 ×${counts.get(g)}`).join(' ・ ')}）`
 }
 
 async function sendTelegram(data, version, title = '🆕 可预约（点击直接预约）') {
@@ -340,30 +342,35 @@ async function sendTelegram(data, version, title = '🆕 可预约（点击直�
     }
     const platformConfig = config.getPlatform(platform)
     const list = sortSlots(slots).slice(0, maxPush)
-    const sections = buildSections(list, platformConfig)
 
-    // 单 section 且空位少 → 直接全部 book 按钮（保持一键预约）
-    if (sections.length === 1 && sections[0].slots.length <= MAX_INLINE_BUTTONS) {
-      await sendBookButtons(botInstance, chatId, sections[0].slots, title)
+    // 按场地分组（一个场地一个"查看空位"按钮；场地内硬地/人工芝在摘要行内联）
+    const byPlace = new Map()
+    for (const d of list) {
+      if (!byPlace.has(d.place)) byPlace.set(d.place, [])
+      byPlace.get(d.place).push(d)
+    }
+    const places = [...byPlace.keys()]
+
+    // 单场地且空位少 → 直接全部 book 按钮（周末在前，保持一键预约）
+    if (places.length === 1 && list.length <= MAX_INLINE_BUTTONS) {
+      await sendBookButtons(botInstance, chatId, sortWeekendFirst(list), title)
       continue
     }
 
-    // 多 section → 两级导航：
-    //   第一个 section 直接给 book 按钮，其余 section 给"查看空位"按钮
-    const first = sections[0]
+    // 多场地 → 两级导航：第一个场地直接给 book 按钮（周末在前），其余场地给"查看空位"按钮
+    const firstPlace = places[0]
+    const firstSlots = sortWeekendFirst(byPlace.get(firstPlace))
     await sendBookButtons(
       botInstance,
       chatId,
-      first.slots,
-      sectionHeader(title, first, platformConfig)
+      firstSlots,
+      `${title}\n━━━━━━━━━━━━━━\n${placeEmoji(firstPlace)} ${placeShort(firstPlace)}（${byPlace.get(firstPlace).length} 个）`
     )
 
-    const restRows = sections.slice(1).map(s =>
-      `${placeEmoji(s.place)} ${sectionLabel(s, platformConfig)} ×${s.slots.length}`
-    )
-    const restButtons = sections.slice(1).map(s => [{
-      text: `🔍 ${sectionLabel(s, platformConfig)}（${s.slots.length}）查看空位`,
-      callback_data: `viewplace_${platform}|${s.place}|${s.group}`
+    const restRows = places.slice(1).map(p => placeSummaryLine(p, byPlace.get(p), platformConfig))
+    const restButtons = places.slice(1).map(p => [{
+      text: `🔍 ${placeShort(p)}（${byPlace.get(p).length}）查看空位`,
+      callback_data: `viewplace_${platform}|${p}`
     }])
     if (restButtons.length > 0) {
       await botInstance.sendMessage(
@@ -857,15 +864,13 @@ const server = http.createServer(async (req, res) => {
       return json(res, { lines: logBuffer.slice(-n) })
     }
 
-    // GET /api/place/:platform/:place?group= — 某场地（或某组）当前空位（推送的"查看空位"按钮）
+    // GET /api/place/:platform/:place — 某场地当前空位（推送的"查看空位"按钮，周末在前）
     if (req.method === 'GET' && pathname.startsWith('/api/place/')) {
       const parts = decodeURIComponent(pathname.replace('/api/place/', '')).split('/')
       const platform = parts[0]
       const place = parts.slice(1).join('/')
-      const group = url.searchParams.get('group')
-      const slots = sortSlots((currentData || []).filter(s =>
-        s.platform === platform && s.place === place &&
-        (group == null ? true : group === '' ? !s.group : s.group === group)
+      const slots = sortWeekendFirst((currentData || []).filter(s =>
+        s.platform === platform && s.place === place
       ))
       return json(res, { success: true, slots })
     }
