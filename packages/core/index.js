@@ -56,6 +56,7 @@ function filterSlotsByRules(data, rules) {
   const WEEKDAY_FILTER = rules.WEEKDAY_FILTER || []
   const COURT_NUM_FILTER = rules.COURT_NUM_FILTER || []
   const PLACE_FILTER = rules.PLACE_FILTER || []
+  const COURT_GROUP_FILTER = rules.COURT_GROUP_FILTER || []
 
   return data.filter(d => {
     const weekday = resolveWeekday(d)
@@ -85,6 +86,11 @@ function filterSlotsByRules(data, rules) {
       if (!hit) return false
     }
 
+    // 场地组过滤（如 AUTO_COURT_GROUP: ["硬地"]，只自动抢硬地）
+    if (COURT_GROUP_FILTER.length > 0 && !COURT_GROUP_FILTER.includes(d.group)) {
+      return false
+    }
+
     return true
   })
 }
@@ -110,6 +116,9 @@ function getAutoRules(platformConfig) {
       : [],
     PLACE_FILTER: Array.isArray(platformConfig.AUTO_PLACE_FILTER)
       ? platformConfig.AUTO_PLACE_FILTER
+      : [],
+    COURT_GROUP_FILTER: Array.isArray(platformConfig.AUTO_COURT_GROUP)
+      ? platformConfig.AUTO_COURT_GROUP
       : []
   }
 }

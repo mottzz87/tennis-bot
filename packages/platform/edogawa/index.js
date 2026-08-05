@@ -71,7 +71,7 @@ class EdogawaAdapter {
 
     const http = this._createHttp()
     try {
-      return await this._scan(http, targets)
+      return await this._scan(http, targets, platformConfig)
     } catch (e) {
       console.log(`[edogawa] 扫描失败: ${e.message}`)
       return []
@@ -98,7 +98,7 @@ class EdogawaAdapter {
 
   // ---------- 流程步骤 ----------
 
-  async _scan(req, targets) {
+  async _scan(req, targets, platformConfig) {
     // 1-6. 导航到月视图
     const nav = await navigateToMonth(req, targets, this._scanDays)
     if (!nav) return []
