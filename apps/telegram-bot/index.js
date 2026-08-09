@@ -35,11 +35,23 @@ function hoursLabel(hours) {
 }
 
 // 执行预约（book_ 与 confirm_book_ 共用）：取最新 slot → POST /api/book → 结果通知 → 触发重扫
-async function doBook(bot, chatId, ucode) {
+// 传入 progressMsgId 时，把这条"预约中"消息编辑成结果（没有则直接发新消息）
+async function doBook(bot, chatId, ucode, progressMsgId) {
+  const sendResult = async (text, extra) => {
+    if (progressMsgId) {
+      try {
+        await bot.editMessageText(text, { ...extra, chat_id: chatId, message_id: progressMsgId })
+        return
+      } catch (e) {
+        console.warn('[doBook] 编辑结果消息失败，改为新发:', e.message)
+      }
+    }
+    await bot.sendMessage(chatId, text, extra)
+  }
   try {
     const slotRes = await monitorApi('GET', `/api/slot/${encodeURIComponent(ucode)}`)
     if (!slotRes.data?.success || !slotRes.data?.slot) {
-      await bot.sendMessage(chatId, '⚠️ 数据已过期，请重新获取')
+      await sendResult('⚠️ 数据已过期，请重新获取')
       return
     }
     const raw = slotRes.data.slot
@@ -47,23 +59,20 @@ async function doBook(bot, chatId, ucode) {
     const bookRes = await bookingApi('POST', '/api/book', { platform: raw.platform, slot: raw })
     if (bookRes.data?.success) {
       const shown = bookRes.data?.fee?.total != null ? { ...raw, totalFee: bookRes.data.fee.total } : raw
-      await bot.sendMessage(
-        chatId,
+      await sendResult(
         `🎉 *预约成功！*\n━━━━━━━━━━━━━━\n${formatSlotText(shown, pc, { showBike: true, showFee: true, style: 'detail' })}`,
         { parse_mode: 'Markdown' }
       )
       // Trigger re-scan（只刷预约所在平台）
       await monitorApi('POST', '/api/run', { platforms: [raw.platform] })
     } else {
-      await bot.sendMessage(
-        chatId,
+      await sendResult(
         `❌ *预约失败*\n━━━━━━━━━━━━━━\n${formatSlotText(raw, pc, { style: 'detail' })}\n\n🧨 ${escapeMarkdown(bookRes.data?.message || '未知错误')}`,
         { parse_mode: 'Markdown' }
       )
     }
   } catch (e) {
-    await bot.sendMessage(
-      chatId,
+    await sendResult(
       `❌ *预约失败*\n━━━━━━━━━━━━━━\n${escapeMarkdown(e.message)}`,
       { parse_mode: 'Markdown' }
     )
@@ -1149,10 +1158,15 @@ function registerHandlers(bot) {
         const raw = slotRes.data.slot
         const hours = slotHours(raw)
         const startDate = parseSlotStartDateTimeSafe(raw)
-        const soon = !!(startDate && startDate.getTime() > Date.now() && startDate.getTime() - Date.now() <= 7 * 24 * 3600 * 1000)
+        // 距开始 DOUBLE_CONFIRM_DAYS 天内的时段需要二次确认（平台 > 全局 > 默认 7，设 0 关闭）
+        const globalCfg = await getGlobalConfig()
+        const pc = await getPlatformConfig(raw.platform)
+        const confirmDays = Number({ ...globalCfg, ...pc }.DOUBLE_CONFIRM_DAYS)
+        const confirmMs = Number.isFinite(confirmDays) && confirmDays > 0 ? confirmDays * 24 * 3600 * 1000 : 0
+        const soon = confirmMs > 0 && !!(startDate && startDate.getTime() > Date.now() && startDate.getTime() - Date.now() <= confirmMs)
         if (hours > 2 || soon) {
-          // 时段多于 2h 或 7 天内 → 行内二次确认（不弹窗，替换原按钮）
-          const reason = hours > 2 ? `该时段 ${hoursLabel(hours)}` : '7天内时段'
+          // 时段多于 2h 或 N 天内 → 行内二次确认（不弹窗，替换原按钮）
+          const reason = hours > 2 ? `该时段 ${hoursLabel(hours)}` : `${confirmDays}天内时段`
           const rows = query.message.reply_markup?.inline_keyboard || []
           const newRows = rows.map(row => {
             if (!row.some(btn => btn.callback_data === data)) return row
@@ -1173,18 +1187,24 @@ function registerHandlers(bot) {
           return
         }
         await bot.answerCallbackQuery(query.id, { text: '🚀 开始预约...' })
-        await doBook(bot, chatId, ucode)
+        const progress = await bot.sendMessage(chatId, '🚀 开始预约，正在预约中...')
+        await doBook(bot, chatId, ucode, progress.message_id)
       } catch (e) {
         await bot.answerCallbackQuery(query.id, { text: '❌ 操作失败' })
       }
       return
     }
 
-    // --- Confirm booking (>2h / 7天内 二次确认) ---
+    // --- Confirm booking (>2h / DOUBLE_CONFIRM_DAYS 天内 二次确认) ---
     if (data.startsWith('confirm_book_')) {
       const ucode = data.replace('confirm_book_', '')
-      await bot.answerCallbackQuery(query.id, { text: '🚀 开始预约...' })
-      await doBook(bot, chatId, ucode)
+      try {
+        await bot.answerCallbackQuery(query.id, { text: '🚀 开始预约...' })
+        const progress = await bot.sendMessage(chatId, '🚀 开始预约，正在预约中...')
+        await doBook(bot, chatId, ucode, progress.message_id)
+      } catch (e) {
+        await bot.answerCallbackQuery(query.id, { text: '❌ 操作失败' })
+      }
       return
     }
 

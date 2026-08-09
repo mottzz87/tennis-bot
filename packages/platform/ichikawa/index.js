@@ -9,7 +9,7 @@
  * 每个方法自行管理浏览器生命周期
  */
 const { chromium } = require('playwright')
-const { sleep, createTrace, normalizeTimeRange, formatDateDisplayFromIso } = require('@tennis-bot/utils')
+const { sleep, createTrace, normalizeTimeRange, formatDateDisplayFromIso, setHumanPauseRange } = require('@tennis-bot/utils')
 const { parsePage } = require('./parser')
 const { clickSlot } = require('./booking')
 const {
@@ -115,6 +115,7 @@ class IchikawaAdapter {
    */
   async book(slotData, platformConfig) {
     const trace = createTrace()
+    setHumanPauseRange(platformConfig.HUMAN_DELAY_MIN, platformConfig.HUMAN_DELAY_MAX, platformConfig.HUMAN_INPUT_EXTRA_MS)
     const browser = await chromium.launch({
       headless: true,
       args: ['--no-sandbox']

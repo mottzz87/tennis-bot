@@ -1,0 +1,66 @@
+# ===== 平台开关 =====
+enabled: true          # 平台是否启用（false 则不扫描也不预约）
+
+# ===== 空位过滤（扫描出的空位满足这些条件才推送）=====
+TARGET_PLACE:          # 要扫描的场地
+  - 福栄スポーツ広場テニスコート
+  - 菅野終末処理場テニスコート
+TIME_FILTER: []        # 只推送时段匹配的时间区间，如 ["6-11","17-22"]；空 = 全部
+WEEKDAY_FILTER: []     # 只推送星期匹配的日期，如 ["土","日"]；空 = 全部
+COURT_NUM_FILTER: []   # 只推送指定场地编号的球场；空 = 全部
+SKIP_COURT_CONTAINS:   # 场地名包含这些关键词的跳过
+  - 塩焼中央
+
+# ===== 自动预约（配合 global.AUTO_BOOK: true 使用）=====
+AUTO_TIME_FILTER: []      # 自动预约只约该时间区间
+AUTO_WEEKDAY_FILTER:      # 自动预约只约这些星期
+  - 土
+  - 日
+AUTO_PLACE_FILTER:        # 自动预约只约这些场地
+  - 福栄スポーツ広場テニスコート
+  - 菅野終末処理場テニスコート
+AUTO_COURT_NUM_FILTER: [] # 自动预约只约指定场地编号的球场
+
+# ===== 场地展示与代码别名（short=推送里显示的短名，emoji=图标，courtCode=代码别名，bike=移动方式）=====
+PLACE_MAP:
+  国府台テニスコート:
+    short: 国府台
+    emoji: 🥶
+    courtCode: guofutai
+    bike: 🚴 35分
+  菅野終末処理場テニスコート:
+    short: 菅野
+    emoji: 🔥
+    courtCode: jianye
+    bike: 🚴 25分
+  塩浜市民体育館テニスコート:
+    short: 塩浜
+    emoji: 💧
+    courtCode: yanbin
+    bike: 🚴 18分
+  福栄スポーツ広場テニスコート:
+    short: 福栄
+    emoji: 🍌
+    courtCode: furong
+    bike: 🚴 35分
+  行徳・塩焼中央公園テニスコート:
+    short: 行徳中央
+    emoji: ⚡
+    courtCode: xingde
+    bike: 🚴 15分
+
+# ===== 预约 =====
+BOOK_DURATION: 30     # 预约的表示期间（对应 BOOK_DURATION_MAP 的 key）
+BOOK_DURATION_MAP:    # 表示期间选项
+  "1": 1日
+  "7": 1週間
+  "14": 2週間
+  "30": 1ヶ月
+
+# ===== 可覆盖的全局字段 =====
+# 取消注释即可覆盖 global.yaml 的默认值：
+# HUMAN_DELAY_MIN: 150        # 人类操作停顿下限（毫秒）
+# HUMAN_DELAY_MAX: 450        # 人类操作停顿上限（毫秒）
+# HUMAN_INPUT_EXTRA_MS: 400   # 输入框操作后额外叠加的停顿（毫秒）
+# DOUBLE_CONFIRM_DAYS: 0      # 距开始 N 天内时段二次确认（0 = 关闭）
+# STEP_DELAY: 400             # 选场地/期间每步停顿（毫秒）

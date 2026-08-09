@@ -1,5 +1,55 @@
 const fs = require('fs')
 const path = require('path')
+const yaml = require('js-yaml')
+
+// 剥离 JSON 字符串中的 // 行注释与 /* */ 块注释（字符串内的 // 会保留），支持配置文件里的注释
+function stripJsonComments(jsonStr) {
+  let inString = false
+  let inLineComment = false
+  let inBlockComment = false
+  let out = ''
+  for (let i = 0; i < jsonStr.length; i++) {
+    const c = jsonStr[i]
+    const next = jsonStr[i + 1]
+    if (inLineComment) {
+      if (c === '\n') { inLineComment = false; out += c }
+      continue
+    }
+    if (inBlockComment) {
+      if (c === '*' && next === '/') { inBlockComment = false; i++ }
+      continue
+    }
+    if (inString) {
+      out += c
+      if (c === '\\') { out += next || ''; i++ }
+      else if (c === '"') inString = false
+      continue
+    }
+    if (c === '"') { inString = true; out += c; continue }
+    if (c === '/' && next === '/') { inLineComment = true; i++; continue }
+    if (c === '/' && next === '*') { inBlockComment = true; i++; continue }
+    out += c
+  }
+  return out
+}
+
+// 按 .yaml → .yml → .json 顺序返回第一个存在的配置文件路径（都不存在返回 null）
+function resolveConfigPath(configDir, name) {
+  for (const ext of ['.yaml', '.yml', '.json']) {
+    const p = path.join(configDir, name + ext)
+    if (fs.existsSync(p)) return p
+  }
+  return null
+}
+
+// 按扩展名解析配置文件：.yaml/.yml 用 js-yaml，.json 用 JSON（兼容注释）
+function readConfigFile(filePath) {
+  const content = fs.readFileSync(filePath, 'utf-8')
+  if (/\.ya?ml$/i.test(filePath)) {
+    return yaml.load(content)
+  }
+  return JSON.parse(stripJsonComments(content))
+}
 
 class ConfigManager {
   constructor(dataDir) {
@@ -7,28 +57,32 @@ class ConfigManager {
     this.configDir = path.join(dataDir, 'config')
     this.global = {}
     this._platforms = {}
+    this._globalPath = null
+    this._platformPaths = {}
   }
 
   load() {
     fs.mkdirSync(this.configDir, { recursive: true })
 
-    // 加载全局配置
-    const globalPath = path.join(this.configDir, 'global.json')
-    if (fs.existsSync(globalPath)) {
-      this.global = JSON.parse(fs.readFileSync(globalPath, 'utf-8'))
+    // 加载全局配置（支持 global.yaml / global.yml / global.json）
+    this._globalPath = resolveConfigPath(this.configDir, 'global')
+    if (this._globalPath) {
+      this.global = readConfigFile(this._globalPath)
     } else {
       this.global = {}
     }
 
-    // 加载所有平台配置
+    // 加载所有平台配置（跳过 global 文件，按去扩展名的 basename 作为平台名）
     this._platforms = {}
+    this._platformPaths = {}
     const files = fs.readdirSync(this.configDir)
     for (const file of files) {
-      if (file === 'global.json') continue
-      if (!file.endsWith('.json')) continue
-      const platformName = file.replace('.json', '')
+      if (!/\.(json|yaml|yml)$/i.test(file)) continue
+      const platformName = file.replace(/\.(json|yaml|yml)$/i, '')
+      if (platformName === 'global') continue
       const filePath = path.join(this.configDir, file)
-      this._platforms[platformName] = JSON.parse(fs.readFileSync(filePath, 'utf-8'))
+      this._platforms[platformName] = readConfigFile(filePath)
+      this._platformPaths[platformName] = filePath
     }
 
     return this
@@ -47,12 +101,23 @@ class ConfigManager {
   }
 
   save() {
-    const globalPath = path.join(this.configDir, 'global.json')
-    fs.writeFileSync(globalPath, JSON.stringify(this.global, null, 2))
+    const writeFile = (filePath, data) => {
+      if (/\.ya?ml$/i.test(filePath)) {
+        fs.writeFileSync(filePath, yaml.dump(data, { noRefs: true, lineWidth: -1 }))
+      } else {
+        fs.writeFileSync(filePath, JSON.stringify(data, null, 2))
+      }
+    }
+
+    if (this._globalPath) {
+      writeFile(this._globalPath, this.global)
+    } else if (Object.keys(this.global).length > 0) {
+      writeFile(path.join(this.configDir, 'global.yaml'), this.global)
+    }
 
     for (const [name, config] of Object.entries(this._platforms)) {
-      const filePath = path.join(this.configDir, `${name}.json`)
-      fs.writeFileSync(filePath, JSON.stringify(config, null, 2))
+      const filePath = this._platformPaths[name] || path.join(this.configDir, `${name}.yaml`)
+      writeFile(filePath, config)
     }
   }
 

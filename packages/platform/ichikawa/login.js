@@ -13,9 +13,9 @@ async function handleLoginIfNeeded(page) {
   console.log('[ichikawa] 需要登录')
 
   await humanType(page.locator('#txtID'), process.env.USER_ID)
-  await humanPause(400, 1000)
+  await humanPause()
   await humanType(page.locator('#txtPass'), process.env.PASSWORD)
-  await humanPause(500, 1200)
+  await humanPause()
 
   await Promise.all([
     page.waitForNavigation(),
@@ -29,7 +29,7 @@ async function clickApply(page) {
 
   if (value.includes('申込')) {
     console.log('[ichikawa] 提交预约')
-    await humanPause(600, 1500)
+    await humanPause()
     await Promise.all([
       page.waitForNavigation(),
       btn.click()

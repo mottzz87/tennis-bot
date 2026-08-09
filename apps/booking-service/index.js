@@ -111,7 +111,8 @@ async function handleBook(body) {
     return { success: false, message: `平台 ${platformName} 未找到` }
   }
 
-  const platformConfig = config.getPlatform(platformName)
+  // 合并 global + 平台配置（平台优先），让 global 里的默认值（如 HUMAN_DELAY_MIN/MAX）对预约生效
+  const platformConfig = config.getMergedConfig(platformName)
   if (platformConfig.enabled === false) {
     return { success: false, message: `平台 ${platformName} 未启用` }
   }

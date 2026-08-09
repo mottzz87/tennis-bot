@@ -1,5 +1,8 @@
 {
   "name": "@tennis-bot/config",
   "version": "1.0.0",
-  "main": "index.js"
+  "main": "index.js",
+  "dependencies": {
+    "js-yaml": "^4.1.0"
+  }
 }

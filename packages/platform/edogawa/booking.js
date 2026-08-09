@@ -7,7 +7,7 @@
  *    → 按拼接序列逐小时勾选目标时段 → 次へ進む → (登录) → 申请明细 → 申込 → 确认弹窗 はい
  */
 const { chromium } = require('playwright')
-const { humanType, humanPause } = require('@tennis-bot/utils')
+const { humanType, humanPause, humanPauseAfterInput, setHumanPauseRange } = require('@tennis-bot/utils')
 const {
   USER_AGENT,
   navigateToMonth,
@@ -225,9 +225,9 @@ async function handleLogin(page) {
   console.log('[edogawa] 需要登录')
   await humanPause()
   await humanType(page.locator('#UserLoginInputModel_Id'), process.env.EDOGAWA_USER_ID)
-  await humanPause(400, 1000)
+  await humanPause()
   await humanType(page.locator('#password'), process.env.EDOGAWA_PASSWORD)
-  await humanPause(500, 1200)
+  await humanPause()
   await page.click('.buttons button:has-text("ログイン")')
   await page.waitForLoadState('networkidle').catch(() => {})
   await page.waitForTimeout(2000)
@@ -243,7 +243,7 @@ async function fillApplyDetail(page, platformConfig) {
   const purposeCount = await purposeLabels.count()
   for (let i = 0; i < purposeCount; i++) {
     await purposeLabels.nth(i).click()
-    await humanPause(300, 800)
+    await humanPause()
   }
 
   // 利用枠表格循环：站点按利用枠（可能按小时拆成多个表格）分别填 利用人数 + 催し物名
@@ -252,7 +252,7 @@ async function fillApplyDetail(page, platformConfig) {
   if (itemCount === 0) throw new Error('未找到利用人数输入框')
   for (let i = 0; i < itemCount; i++) {
     await humanType(numberInputs.nth(i), people)
-    await humanPause(300, 900)
+    await humanPauseAfterInput()
     const itemIdx = await numberInputs.nth(i).evaluate(el => {
       const m = el.name.match(/Items\[(\d+)\]/)
       return m ? m[1] : null
@@ -261,7 +261,7 @@ async function fillApplyDetail(page, platformConfig) {
       const content = page.locator(`input[name="AvailabilityDetailModel.Items[${itemIdx}].Reservation.ObjectContents[1].Content"][type="text"]`)
       if (await content.count() > 0) {
         await humanType(content, eventName)
-        await humanPause(300, 800)
+        await humanPauseAfterInput()
       }
     }
   }
@@ -275,7 +275,7 @@ async function fillApplyDetail(page, platformConfig) {
     return false
   })
   if (!agreeClicked) throw new Error('未找到同意条款 label')
-  await humanPause(500, 1000)
+  await humanPause()
 }
 
 // 申込按钮初始 disabled，填完表单后启用；点击后弹确认框，再点 はい
@@ -287,7 +287,7 @@ async function submitApply(page) {
   }, { timeout: 20000 }).then(() => true).catch(() => false)
   if (!enabled) return { ok: false, message: '申込按钮一直不可用' }
 
-  await humanPause(600, 1500)
+  await humanPause()
   await page.locator('.fixed-bottom ul.buttons button:has-text("申込")').click({ timeout: 15000 })
   await page.waitForTimeout(2000)
 
@@ -300,7 +300,7 @@ async function submitApply(page) {
     return { ok: false, message: `未出现确认弹窗, URL: ${page.url()}` }
   }
 
-  await humanPause(400, 1000)
+  await humanPause()
   await confirmBtn.first().click()
   await page.waitForTimeout(2500)
   await page.waitForLoadState('networkidle').catch(() => {})
@@ -370,6 +370,7 @@ async function bookSlot(adapter, slotData, platformConfig) {
   if (!process.env.EDOGAWA_USER_ID || !process.env.EDOGAWA_PASSWORD) {
     return { success: false, message: 'EDOGAWA_USER_ID / EDOGAWA_PASSWORD 未配置' }
   }
+  setHumanPauseRange(platformConfig.HUMAN_DELAY_MIN, platformConfig.HUMAN_DELAY_MAX, platformConfig.HUMAN_INPUT_EXTRA_MS)
   const scanDays = Number(platformConfig.SCAN_DAYS) > 0 ? Number(platformConfig.SCAN_DAYS) : 14
 
   const browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] })

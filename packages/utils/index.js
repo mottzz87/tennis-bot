@@ -18,9 +18,33 @@ async function humanType(locator, text, { minDelay = 40, maxDelay = 140 } = {}) 
   }
 }
 
-// 模拟人在两个操作之间的思考/移动停顿
-async function humanPause(minMs = 300, maxMs = 900) {
-  await sleep(randomInt(minMs, maxMs))
+// 模拟人在两个操作之间的思考/移动停顿，区间由配置 HUMAN_DELAY_MIN / HUMAN_DELAY_MAX 控制
+// HUMAN_INPUT_EXTRA_MS 是在输入框操作（逐字敲入）之后额外叠加的停顿，让输入场景更接近人手手感；登录页不叠加
+let humanPauseMin = 300
+let humanPauseMax = 900
+let humanInputExtra = 300
+
+function setHumanPauseRange(min, max, inputExtra) {
+  const m = Number(min)
+  const M = Number(max)
+  if (Number.isFinite(m) && Number.isFinite(M) && m >= 0 && M >= m) {
+    humanPauseMin = m
+    humanPauseMax = M
+  } else {
+    humanPauseMin = 300
+    humanPauseMax = 900
+  }
+  const e = Number(inputExtra)
+  humanInputExtra = Number.isFinite(e) && e >= 0 ? e : 0
+}
+
+async function humanPause() {
+  await sleep(randomInt(humanPauseMin, humanPauseMax))
+}
+
+// 输入框操作后的停顿：在基础区间上整体加 HUMAN_INPUT_EXTRA_MS
+async function humanPauseAfterInput() {
+  await sleep(randomInt(humanPauseMin + humanInputExtra, humanPauseMax + humanInputExtra))
 }
 
 function normalizeText(str) {
@@ -163,6 +187,8 @@ module.exports = {
   randomInt,
   humanType,
   humanPause,
+  humanPauseAfterInput,
+  setHumanPauseRange,
   normalizeText,
   formatCourt,
   formatCourtShort,

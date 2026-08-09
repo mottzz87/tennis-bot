@@ -1,0 +1,24 @@
+# ===== 扫描 =====
+INTERVAL: 120          # 定时扫描间隔（秒），可在单个平台 yaml 里覆盖
+JITTER_MAX: 45         # 每次扫描在 INTERVAL 基础上附加的随机抖动上限（秒）
+
+# ===== 人类操作模拟（预约/登录表单操作之间的停顿，毫秒）=====
+# ichikawa.yaml / edogawa.yaml 里可各自覆盖这几个值；觉得太快/太慢改这里即可
+HUMAN_DELAY_MIN: 200      # 操作停顿随机区间下限（毫秒）
+HUMAN_DELAY_MAX: 600      # 操作停顿随机区间上限（毫秒）
+HUMAN_INPUT_EXTRA_MS: 300 # 输入框操作后额外叠加的停顿（毫秒），登录页不叠加，更接近人手手感
+
+# ===== 通知 =====
+NOTIFY_ADDED: true     # 出现新空位时推送
+NOTIFY_REMOVED: true   # 有空位被约掉时推送
+MAX_PUSH: 100          # 单轮扫描最多推送的空位数
+PUSH_ON_INIT: true     # 启动时是否先推送一次当前全部空位
+BOOKED_REMINDER_INTERVAL_HOURS: 5  # 已预约临近的定时提醒间隔（小时）
+
+# ===== 预约 =====
+DOUBLE_CONFIRM_DAYS: 7 # 距开始 N 天内的时段，点预约会先二次确认（默认 7；设 0 关闭；可按平台覆盖）
+RETRY_COUNT: 2         # 预约操作失败后的重试次数
+
+# ===== 其他 =====
+AUTO_BOOK: false       # 是否自动预约（需配合各平台的 AUTO_* 过滤条件）
+STEP_DELAY: 500        # 市川平台选择场地/表示期间时每步的固定停顿（毫秒），可按平台覆盖
