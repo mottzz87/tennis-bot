@@ -5,6 +5,7 @@ enabled: true          # 平台是否启用
 TARGET_PLACE:          # 要扫描的场地
   - 谷河内テニスコート
   - 西葛西テニスコート
+  - 水辺のスポーツガーデン
 TIME_FILTER:           # 只推送时段匹配的时间区间；空 = 全部
   - 6-11
   - 17-22
@@ -82,7 +83,7 @@ BOOK_PEOPLE: 6             # 利用人数
 BOOK_EVENT_NAME: テニス練習      # 催し物名
 
 # ===== 可覆盖的全局字段（取消注释即可覆盖 global.yaml 的默认值）=====
-# HUMAN_DELAY_MIN: 150        # 人类操作停顿下限（毫秒）
-# HUMAN_DELAY_MAX: 450        # 人类操作停顿上限（毫秒）
+HUMAN_DELAY_MIN: 150        # 人类操作停顿下限（毫秒）
+HUMAN_DELAY_MAX: 450        # 人类操作停顿上限（毫秒）
 # HUMAN_INPUT_EXTRA_MS: 400   # 输入框操作后额外叠加的停顿（毫秒）
 # DOUBLE_CONFIRM_DAYS: 7      # 距开始 N 天内时段二次确认（本网站才能约 7 天内时段；设 0 关闭）

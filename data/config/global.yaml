@@ -17,7 +17,7 @@ BOOKED_REMINDER_INTERVAL_HOURS: 5  # 已预约临近的定时提醒间隔（小�
 
 # ===== 预约 =====
 DOUBLE_CONFIRM_DAYS: 7 # 距开始 N 天内的时段，点预约会先二次确认（默认 7；设 0 关闭；可按平台覆盖）
-RETRY_COUNT: 2         # 预约操作失败后的重试次数
+RETRY_COUNT: 1         # 预约操作失败后的重试次数
 
 # ===== 其他 =====
 AUTO_BOOK: false       # 是否自动预约（需配合各平台的 AUTO_* 过滤条件）

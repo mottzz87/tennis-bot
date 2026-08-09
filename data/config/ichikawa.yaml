@@ -59,8 +59,8 @@ BOOK_DURATION_MAP:    # 表示期间选项
 
 # ===== 可覆盖的全局字段 =====
 # 取消注释即可覆盖 global.yaml 的默认值：
-# HUMAN_DELAY_MIN: 150        # 人类操作停顿下限（毫秒）
-# HUMAN_DELAY_MAX: 450        # 人类操作停顿上限（毫秒）
-# HUMAN_INPUT_EXTRA_MS: 400   # 输入框操作后额外叠加的停顿（毫秒）
-# DOUBLE_CONFIRM_DAYS: 0      # 距开始 N 天内时段二次确认（0 = 关闭）
-# STEP_DELAY: 400             # 选场地/期间每步停顿（毫秒）
+HUMAN_DELAY_MIN: 150        # 人类操作停顿下限（毫秒）
+HUMAN_DELAY_MAX: 450        # 人类操作停顿上限（毫秒）
+HUMAN_INPUT_EXTRA_MS: 400   # 输入框操作后额外叠加的停顿（毫秒）
+DOUBLE_CONFIRM_DAYS: 0      # 距开始 N 天内时段二次确认（0 = 关闭）
+STEP_DELAY: 100             # 选场地/期间每步停顿（毫秒）
