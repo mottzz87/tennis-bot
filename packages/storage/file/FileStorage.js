@@ -27,14 +27,14 @@ class FileStorage extends Storage {
   }
 
   // ========================
-  // LastSet
+  // LastSet（按平台分区：{ platformName: [uid,...] }）
   // ========================
-  async getLastSet() {
-    return new Set(this._readJSON('lastSet.json', []))
+  async getLastSets() {
+    return this._readJSON('lastSet.json', {})
   }
 
-  async saveLastSet(set) {
-    this._writeJSON('lastSet.json', [...set])
+  async saveLastSets(map) {
+    this._writeJSON('lastSet.json', map)
   }
 
   // ========================

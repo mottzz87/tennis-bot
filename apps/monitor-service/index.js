@@ -60,16 +60,26 @@ function getDefaultBot() {
 // ========================
 // 状态
 // ========================
-let currentData = []
+let currentData = []           // 各平台 union（供 API/bot 读取）
 let currentVersion = 0
 let currentSlotMap = new Map()
-let isFirstRun = true
-let timer = null
-let autoBooking = false
-let autoBookedDayKeys = new Set()
-let autoBookedUIDs = new Set()
-let lastSet = new Set()
+let autoBookedDayKeys = new Set()   // 跨平台去重，保持全局
+let autoBookedUIDs = new Set()      // 跨平台去重，保持全局
 let logBuffer = []
+
+// 每个平台独立的运行时状态；平台之间彻底隔离，平台内部用 scanning 防重叠
+const runtime = {}
+for (const name of config.getPlatformNames()) {
+  runtime[name] = {
+    timer: null,          // 本平台 scheduler timer（null = 未武装）
+    scanning: false,      // 本平台扫描/auto-book 进行中（防同平台重叠）
+    firstRun: true,       // 本平台是否首次扫描（PUSH_ON_INIT 按平台独立处理）
+    autoBooking: false,   // 本平台 auto-book 进行中 → 只暂停本平台
+    paused: false,        // 本平台暂停
+    nextRunAt: null,
+    lastSet: new Set()    // 只含本平台的 uid（diff 基线）
+  }
+}
 
 // ========================
 // 日志
@@ -115,15 +125,36 @@ setupConsoleLogging()
 // Load saved state
 // ========================
 async function loadState() {
-  lastSet = await storage.getLastSet()
   autoBookedUIDs = await storage.getAutoBooked()
+
+  // lastSet 支持两种格式：新 {platform:[uid,...]}；旧扁平 [uid,...]（一次性迁移为按平台分区）
+  const raw = await storage.getLastSets()
+  let partitioned = raw
+  if (Array.isArray(raw)) {
+    partitioned = {}
+    for (const uid of raw) {
+      const name = getPlatformNameByPlace(String(uid).split('_')[0])
+      if (!name) continue
+      if (!partitioned[name]) partitioned[name] = []
+      partitioned[name].push(uid)
+    }
+    await storage.saveLastSets(partitioned)
+    console.log(`[monitor] lastSet.json 已迁移为按平台格式: ${Object.keys(partitioned).join(', ') || '（空）'}`)
+  }
+  for (const name of config.getPlatformNames()) {
+    runtime[name].lastSet = new Set(Array.isArray(partitioned?.[name]) ? partitioned[name] : [])
+  }
 }
 
 // ========================
 // 持久化 helpers
 // ========================
-function saveLastSet() {
-  storage.saveLastSet(lastSet)
+function saveLastSets() {
+  const map = {}
+  for (const [name, st] of Object.entries(runtime)) {
+    map[name] = [...st.lastSet]
+  }
+  storage.saveLastSets(map)
 }
 
 function saveAutoBooked() {
@@ -177,15 +208,10 @@ function getPlatformNameByPlace(place) {
 }
 
 /**
- * 获取生效的扫描间隔（秒）
- * 优先级：任意平台显式设置的 INTERVAL > global.INTERVAL > 45
+ * 获取生效的扫描间隔（秒）：平台显式设置的 INTERVAL > global.INTERVAL > 45
  */
-function getEffectiveInterval() {
-  for (const name of config.getPlatformNames()) {
-    const pc = config.getPlatform(name)
-    if (pc && 'INTERVAL' in pc) return pc.INTERVAL
-  }
-  return config.global.INTERVAL || 45
+function getPlatformInterval(name) {
+  return config.getEffective('INTERVAL', name) || 45
 }
 
 /**
@@ -195,40 +221,68 @@ function getEffectiveJitter() {
   return config.getEffective('JITTER_MAX') || 45
 }
 
+// 激活平台：enabled && 有 TARGET_PLACE && adapter 可加载
+function activePlatformNames() {
+  return config.getPlatformNames().filter(name => {
+    const pc = config.getPlatform(name)
+    if (pc.enabled === false) return false
+    if (!pc.TARGET_PLACE?.length) return false
+    if (!loadPlatform(name)) return false
+    return true
+  })
+}
+
+function isRunning() {
+  return Object.values(runtime).some(s => s.timer != null)
+}
+
+function isAutoBooking() {
+  return Object.values(runtime).some(s => s.autoBooking)
+}
+
+// 展示用最小生效间隔（/api/status.interval 兼容字段）
+function getEffectiveInterval() {
+  const names = activePlatformNames()
+  if (names.length === 0) return config.global.INTERVAL || 45
+  return Math.min(...names.map(getPlatformInterval))
+}
+
 /**
- * 以递归 setTimeout 替代 setInterval，支持随机抖动
+ * 每平台独立 scheduler：递归 setTimeout（非 setInterval），同平台绝不重叠。
+ * await scanPlatform → finally → schedulePlatform，扫描变慢也不会堆积任务。
  */
-function scheduleNext() {
-  const baseMs = getEffectiveInterval() * 1000
+function schedulePlatform(name) {
+  const st = runtime[name]
+  if (!st || st.timer) return
+  const baseMs = getPlatformInterval(name) * 1000
   const jitterMaxMs = getEffectiveJitter() * 1000
   const jitter = Math.floor(Math.random() * (jitterMaxMs + 1))
   const delay = baseMs + jitter
-  console.log(`[定时] 下次扫描: ${(baseMs/1000)}s + 随机 ${(jitter/1000).toFixed(1)}s = ${(delay/1000).toFixed(1)}s`)
-  timer = setTimeout(() => {
-    timer = null
-    monitor().finally(() => {
-      if (!timer) scheduleNext()
+  st.nextRunAt = Date.now() + delay
+  console.log(`[MONITOR][${name.toUpperCase()}] 下次扫描: ${(baseMs/1000)}s + 随机 ${(jitter/1000).toFixed(1)}s = ${(delay/1000).toFixed(1)}s`)
+  st.timer = setTimeout(() => {
+    st.timer = null
+    scanPlatform(name).finally(() => {
+      // paused 防 /pause 之后又武装；!st.timer 防重复 timer
+      if (!st.paused && !st.timer) schedulePlatform(name)
     })
   }, delay)
 }
 
 /**
- * 向所有已配置的平台发送"暂无可预约"提示
- * 跳过没有 Bot Token 的平台
+ * 向指定平台发送"暂无可预约"提示（跳过没有 Bot Token 的平台）
  */
-async function sendNoSlotsMessage() {
-  for (const name of config.getPlatformNames()) {
-    const pc = config.getPlatform(name)
-    if (pc.enabled === false) continue
-    const b = getBotForPlatform(name)
-    const chatId = getPlatformChatId(name)
-    if (!b || !chatId) continue
-    await b.sendMessage(
-      chatId,
-      `📭 *暂无可预约*\n━━━━━━━━━━━━━━\n可以稍后再试 /run`,
-      { parse_mode: 'Markdown' }
-    )
-  }
+async function sendNoSlotsMessageFor(name) {
+  const pc = config.getPlatform(name)
+  if (pc.enabled === false) return
+  const b = getBotForPlatform(name)
+  const chatId = getPlatformChatId(name)
+  if (!b || !chatId) return
+  await b.sendMessage(
+    chatId,
+    `📭 *暂无可预约*\n━━━━━━━━━━━━━━\n可以稍后再试 /run`,
+    { parse_mode: 'Markdown' }
+  )
 }
 
 function groupSlotsByPlatform(slots) {
@@ -429,13 +483,20 @@ async function callBookingService(slotData, platformName) {
 // ========================
 // 只扫描指定平台并推送到该平台对应的 bot，不更新全局 diff 状态（lastSet/currentData），
 // 避免手动 /run 干扰定时扫描的去重与减少通知。
+// 加 scanning 守卫：手动扫描也不与该平台定时扫描/auto-book 重叠。
 async function runPlatformOnce(platformName) {
+  const st = runtime[platformName]
+  if (!st || st.scanning || st.autoBooking) {
+    console.log(`[手动] ${platformName} 扫描/auto-book 进行中，跳过`)
+    return
+  }
   const platformConfig = config.getPlatform(platformName)
   if (platformConfig.enabled === false) return
   const adapter = loadPlatform(platformName)
   if (!adapter) return
   if (!platformConfig.TARGET_PLACE?.length) return
 
+  st.scanning = true
   try {
     const slots = await adapter.fetchSlots(platformConfig)
     console.log(`[手动] ${platformName} 获取 ${slots.length} 个空位`)
@@ -464,216 +525,229 @@ async function runPlatformOnce(platformName) {
     }
   } catch (e) {
     console.log(`[手动] ${platformName} 扫描失败:`, e.message)
+  } finally {
+    st.scanning = false
   }
 }
 
 // ========================
-// 扫描
+// 扫描（单平台）
 // ========================
-async function monitor(options = {}) {
-  const { forcePush = false } = options
-  const trace = createTrace()
 
-  if (autoBooking) {
-    console.log(`[${trace}] SKIP 正在自动预约，跳过`)
+/**
+ * 自动预约：只针对当前扫描到的平台（st.autoBooking 守卫，只暂停本平台）。
+ * 语义保持原样：需 global.AUTO_BOOK=true，平台显式 false 可关闭。
+ */
+async function autoBookPlatform(name, added, platformConfig, trace) {
+  const st = runtime[name]
+  if (config.global.AUTO_BOOK !== true || st.autoBooking) return
+  if ('AUTO_BOOK' in platformConfig && !platformConfig.AUTO_BOOK) {
+    console.log(`[MONITOR][${name.toUpperCase()}][${trace}] AUTO_BOOK ${name} 已关闭`)
+    return
+  }
+  const autoCandidates = core.filterSlotsAuto(added, platformConfig)
+  if (autoCandidates.length === 0) {
+    console.log(`[MONITOR][${name.toUpperCase()}][${trace}] AUTO_BOOK 无匹配项`)
     return
   }
 
-  // 扫描所有平台
-  let allSlots = []
-  let slotMap = new Map()
-
-  for (const platformName of config.getPlatformNames()) {
-    const platformConfig = config.getPlatform(platformName)
-    if (platformConfig.enabled === false) continue
-    const adapter = loadPlatform(platformName)
-    if (!adapter) continue
-    if (!platformConfig.TARGET_PLACE?.length) continue
-
-    try {
-      const slots = await adapter.fetchSlots(platformConfig)
-      console.log(`[${trace}] ${platformName} 获取 ${slots.length} 个空位`)
-
-      const enriched = slots.map(s => {
-        const time = s.time || `${s.start}-${s.end}`
-        const dateDisplay = s.dateDisplay || formatDateDisplayFromIso(s.date)
-        const ucode = core.buildUcode({ ...s, time, dateDisplay }, platformConfig)
-        const uid = `${s.place}_${s.court}_${s.date}_${time}`
-        const enrichedSlot = { ...s, time, dateDisplay, ucode, uid }
-        slotMap.set(ucode, enrichedSlot)
-        return enrichedSlot
-      })
-
-      const filtered = core.filterSlotsByConfig(enriched, platformConfig)
-      allSlots = allSlots.concat(filtered)
-    } catch (e) {
-      console.log(`[${trace}] ${platformName} 扫描失败:`, e.message)
-    }
-  }
-
-  currentData = allSlots
-  currentVersion = Date.now()
-  currentSlotMap = slotMap
-
-  console.log(`[${trace}] FILTER 过滤后: ${allSlots.length}条`)
-
-  const currentUids = new Set(allSlots.map(d => d.uid))
-
-  if (isFirstRun) {
-    isFirstRun = false
-    console.log(`[${trace}] 首次运行`)
-
-    if (config.global.PUSH_ON_INIT !== false) {
-      if (allSlots.length > 0) {
-        await sendTelegram(allSlots, currentVersion)
-      } else {
-        await sendNoSlotsMessage()
-      }
-    }
-
-    lastSet = currentUids
-    saveLastSet()
-    return
-  }
-
-  const added = allSlots.filter(d => !lastSet.has(d.uid))
-  const removedUids = [...lastSet].filter(k => !currentUids.has(k))
-  const removed = removedUids.map(k => {
-    const [place, court, date, time] = k.split('_')
-    return { platform: getPlatformNameByPlace(place) || undefined, place, court, date, time, uid: k }
+  const now = Date.now()
+  const validCandidates = autoCandidates.filter(d => {
+    const startDate = parseSlotStartDateTimeSafe(d)
+    if (!startDate) return false
+    const diffMin = (startDate.getTime() - now) / 60000
+    if (diffMin < 20) return false
+    const dayKey = parseSlotDayKey(d)
+    if (dayKey && autoBookedDayKeys.has(dayKey)) return false
+    if (autoBookedUIDs.has(d.uid)) return false
+    return true
   })
 
-  core.recordStats('added', added)
-  core.recordStats('removed', removed)
-  console.log(`[${trace}] DIFF 新增:${added.length} 减少:${removed.length}`)
-
-  if (added.length === 0 && removed.length === 0) {
-    if (forcePush) {
-      console.log(`[${trace}] FORCE_PUSH 强制推送 ${allSlots.length}`)
-      if (allSlots.length > 0) {
-        await sendTelegram(allSlots, currentVersion)
-      } else {
-        await sendNoSlotsMessage()
-      }
-    } else {
-      console.log(`[${trace}] 无变化`)
-    }
+  if (validCandidates.length === 0) {
+    console.log(`[MONITOR][${name.toUpperCase()}][${trace}] AUTO_BOOK 筛选后无候选`)
     return
   }
 
-  lastSet = currentUids
-  saveLastSet()
+  const targets = core.autoPickTargets(validCandidates, autoBookedUIDs, autoBookedDayKeys)
+  if (targets.length === 0) return
 
-  if (added.length > 0) {
-    if (config.global.NOTIFY_ADDED !== false) {
-      console.log(`[${trace}] PUSH 发送新增通知 ${added.length}`)
-      await sendTelegram(added, currentVersion, '✨ 有新场地！点击直接预约')
-    }
+  console.log(
+    `[MONITOR][${name.toUpperCase()}][${trace}] AUTO_BOOK 准备预约 ${targets.length} 个：`,
+    targets.map(d => `${d.place} ${d.time}`).join(' · ')
+  )
 
-    // Auto booking
-    if (config.global.AUTO_BOOK && !autoBooking) {
-      const platformGroups = {}
-      for (const d of added) {
-        if (!platformGroups[d.platform]) platformGroups[d.platform] = []
-        platformGroups[d.platform].push(d)
-      }
-
-      for (const [platformName, platformAdded] of Object.entries(platformGroups)) {
-        const platformConfig = config.getPlatform(platformName)
-        // 平台级 AUTO_BOOK 可关闭（即使全局开启）
-        if ('AUTO_BOOK' in platformConfig && !platformConfig.AUTO_BOOK) {
-          console.log(`[${trace}] AUTO_BOOK ${platformName} 已关闭`)
-          continue
-        }
-        const autoCandidates = core.filterSlotsAuto(platformAdded, platformConfig)
-        if (autoCandidates.length === 0) {
-          console.log(`[${trace}] AUTO_BOOK ${platformName} 无匹配项`)
-          continue
-        }
-
-        const now = Date.now()
-        const validCandidates = autoCandidates.filter(d => {
-          const startDate = parseSlotStartDateTimeSafe(d)
-          if (!startDate) return false
-          const diffMin = (startDate.getTime() - now) / 60000
-          if (diffMin < 20) return false
-          const dayKey = parseSlotDayKey(d)
-          if (dayKey && autoBookedDayKeys.has(dayKey)) return false
-          if (autoBookedUIDs.has(d.uid)) return false
-          return true
-        })
-
-        if (validCandidates.length === 0) {
-          console.log(`[${trace}] AUTO_BOOK ${platformName} 筛选后无候选`)
-          continue
-        }
-
-        const targets = core.autoPickTargets(validCandidates, autoBookedUIDs, autoBookedDayKeys)
-        if (targets.length === 0) continue
-
-        console.log(
-          `[${trace}] AUTO_BOOK 准备预约 ${targets.length} 个：`,
-          targets.map(d => `${d.place} ${d.time}`).join(' · ')
-        )
-
-        autoBooking = true
-        try {
-          const bookedFees = new Map()
-          for (const target of targets) {
-            const result = await callBookingService(target, target.platform)
-            if (result.success) {
-              if (result.fee?.total != null) bookedFees.set(target.ucode, result.fee.total)
-              const dayKey = parseSlotDayKey(target)
-              if (dayKey) autoBookedDayKeys.add(dayKey)
-              autoBookedUIDs.add(target.uid)
-              saveAutoBooked()
-            }
-          }
-
-          const abBot = getBotForPlatform(platformName)
-          const abChat = getPlatformChatId(platformName)
-          if (!abBot || !abChat) {
-            console.log(`[AUTO_BOOK] ${platformName} 未配置 Bot Token，跳过通知`)
-          } else {
-            await abBot.sendMessage(
-              abChat,
-              `🎉 *自动预约成功！*\n━━━━━━━━━━━━━━\n` +
-              targets.map(d => formatSlotText(
-                bookedFees.has(d.ucode) ? { ...d, totalFee: bookedFees.get(d.ucode) } : d,
-                getPlatformConfig(d.place),
-                { showBike: true, showFee: true, style: 'detail' }
-              )).join('\n\n'),
-              { parse_mode: 'Markdown' }
-            )
-          }
-
-          setTimeout(() => monitor({ forcePush: true }), 1000)
-        } catch (e) {
-          for (const d of targets) {
-            autoBookedUIDs.add(d.uid)
-          }
-          saveAutoBooked()
-          const abBot = getBotForPlatform(platformName)
-          const abChat = getPlatformChatId(platformName)
-          if (abBot && abChat) {
-            await abBot.sendMessage(
-              abChat,
-              `❌ *自动预约失败*\n━━━━━━━━━━━━━━\n` +
-            targets.map(d => formatSlotText(d, getPlatformConfig(d.place), { style: 'detail' })).join('\n\n') +
-            `\n\n🧨 ${escapeMarkdown(e.message)}`,
-            { parse_mode: 'Markdown' }
-          )
-          }
-        } finally {
-          autoBooking = false
-        }
+  st.autoBooking = true
+  try {
+    const bookedFees = new Map()
+    for (const target of targets) {
+      const result = await callBookingService(target, name)
+      if (result.success) {
+        if (result.fee?.total != null) bookedFees.set(target.ucode, result.fee.total)
+        const dayKey = parseSlotDayKey(target)
+        if (dayKey) autoBookedDayKeys.add(dayKey)
+        autoBookedUIDs.add(target.uid)
+        saveAutoBooked()
       }
     }
+
+    const abBot = getBotForPlatform(name)
+    const abChat = getPlatformChatId(name)
+    if (!abBot || !abChat) {
+      console.log(`[AUTO_BOOK] ${name} 未配置 Bot Token，跳过通知`)
+    } else {
+      await abBot.sendMessage(
+        abChat,
+        `🎉 *自动预约成功！*\n━━━━━━━━━━━━━━\n` +
+        targets.map(d => formatSlotText(
+          bookedFees.has(d.ucode) ? { ...d, totalFee: bookedFees.get(d.ucode) } : d,
+          getPlatformConfig(d.place),
+          { showBike: true, showFee: true, style: 'detail' }
+        )).join('\n\n'),
+        { parse_mode: 'Markdown' }
+      )
+    }
+
+    // 预约成功后只强制重扫本平台
+    setTimeout(() => scanPlatform(name, { forcePush: true }), 1000)
+  } catch (e) {
+    for (const d of targets) {
+      autoBookedUIDs.add(d.uid)
+    }
+    saveAutoBooked()
+    const abBot = getBotForPlatform(name)
+    const abChat = getPlatformChatId(name)
+    if (abBot && abChat) {
+      await abBot.sendMessage(
+        abChat,
+        `❌ *自动预约失败*\n━━━━━━━━━━━━━━\n` +
+        targets.map(d => formatSlotText(d, getPlatformConfig(d.place), { style: 'detail' })).join('\n\n') +
+        `\n\n🧨 ${escapeMarkdown(e.message)}`,
+        { parse_mode: 'Markdown' }
+      )
+    }
+  } finally {
+    st.autoBooking = false
   }
+}
 
-  if (removed.length > 0 && config.global.NOTIFY_REMOVED !== false) {
-    console.log(`[${trace}] PUSH 发送减少通知 ${removed.length}`)
-    await sendRemovedTelegram(removed)
+/**
+ * 扫描单个平台：
+ * - st.scanning/st.autoBooking 守卫防同平台重叠（auto-book 进行中只暂停本平台）
+ * - 只更新本平台在 lastSet / currentData / currentSlotMap 里的切片
+ * - firstRun / PUSH_ON_INIT / diff / auto-book 全部平台内隔离
+ * - 异常只记日志，不影响本平台下个周期与其它平台
+ */
+async function scanPlatform(name, options = {}) {
+  const { forcePush = false } = options
+  const trace = createTrace()
+  const st = runtime[name]
+  if (!st) return
+  if (st.scanning || st.autoBooking) {
+    console.log(`[MONITOR][${name.toUpperCase()}][${trace}] SKIP 扫描/auto-book 进行中，跳过`)
+    return
+  }
+  const platformConfig = config.getPlatform(name)
+  if (platformConfig.enabled === false) return
+  const adapter = loadPlatform(name)
+  if (!adapter) return
+  if (!platformConfig.TARGET_PLACE?.length) return
+
+  st.scanning = true
+  try {
+    console.log(`[MONITOR][${name.toUpperCase()}][${trace}] scan started`)
+    const slots = await adapter.fetchSlots(platformConfig)
+    console.log(`[MONITOR][${name.toUpperCase()}][${trace}] 获取 ${slots.length} 个空位`)
+
+    const enriched = slots.map(s => {
+      const time = s.time || `${s.start}-${s.end}`
+      const dateDisplay = s.dateDisplay || formatDateDisplayFromIso(s.date)
+      const ucode = core.buildUcode({ ...s, time, dateDisplay }, platformConfig)
+      const uid = `${s.place}_${s.court}_${s.date}_${time}`
+      return { ...s, platform: name, time, dateDisplay, ucode, uid }
+    })
+    const filtered = core.filterSlotsByConfig(enriched, platformConfig)
+
+    // 合并全局状态：先删本平台旧切片再并入（同步块，await 之间原子）
+    const newMap = new Map(currentSlotMap)
+    for (const key of [...newMap.keys()]) {
+      if (newMap.get(key).platform === name) newMap.delete(key)
+    }
+    for (const d of filtered) newMap.set(d.ucode, d)
+    currentSlotMap = newMap
+    currentData = currentData.filter(s => s.platform !== name).concat(filtered)
+    currentVersion = Date.now()
+
+    const currentUids = new Set(filtered.map(d => d.uid))
+
+    // 本平台首次运行：PUSH_ON_INIT 独立处理
+    if (st.firstRun) {
+      st.firstRun = false
+      console.log(`[MONITOR][${name.toUpperCase()}][${trace}] 首次运行`)
+      if (config.getEffective('PUSH_ON_INIT', name) !== false) {
+        if (filtered.length > 0) {
+          await sendTelegram(filtered, currentVersion)
+        } else {
+          await sendNoSlotsMessageFor(name)
+        }
+      }
+      st.lastSet = currentUids
+      saveLastSets()
+      return
+    }
+
+    const added = filtered.filter(d => !st.lastSet.has(d.uid))
+    const removedUids = [...st.lastSet].filter(k => !currentUids.has(k))
+    const removed = removedUids.map(k => {
+      const [place, court, date, time] = k.split('_')
+      return { platform: name, place, court, date, time, uid: k }
+    })
+
+    core.recordStats('added', added)
+    core.recordStats('removed', removed)
+    console.log(`[MONITOR][${name.toUpperCase()}][${trace}] DIFF 新增:${added.length} 减少:${removed.length}`)
+
+    if (added.length === 0 && removed.length === 0) {
+      if (forcePush) {
+        console.log(`[MONITOR][${name.toUpperCase()}][${trace}] FORCE_PUSH 强制推送 ${filtered.length}`)
+        if (filtered.length > 0) {
+          await sendTelegram(filtered, currentVersion)
+        } else {
+          await sendNoSlotsMessageFor(name)
+        }
+      } else {
+        console.log(`[MONITOR][${name.toUpperCase()}][${trace}] 无变化`)
+      }
+      return
+    }
+
+    st.lastSet = currentUids
+    saveLastSets()
+
+    if (added.length > 0) {
+      if (config.getEffective('NOTIFY_ADDED', name) !== false) {
+        console.log(`[MONITOR][${name.toUpperCase()}][${trace}] PUSH 发送新增通知 ${added.length}`)
+        await sendTelegram(added, currentVersion, '✨ 有新场地！点击直接预约')
+      }
+      await autoBookPlatform(name, added, platformConfig, trace)
+    }
+
+    if (removed.length > 0 && config.getEffective('NOTIFY_REMOVED', name) !== false) {
+      console.log(`[MONITOR][${name.toUpperCase()}][${trace}] PUSH 发送减少通知 ${removed.length}`)
+      await sendRemovedTelegram(removed)
+    }
+    console.log(`[MONITOR][${name.toUpperCase()}][${trace}] scan completed`)
+  } catch (e) {
+    console.log(`[MONITOR][${name.toUpperCase()}][${trace}] 扫描失败:`, e.message)
+  } finally {
+    st.scanning = false
+  }
+}
+
+// 兼容入口：扫描所有激活平台（/api/run 无 platforms、手动触发用）
+async function monitor(options = {}) {
+  const { forcePush = false } = options
+  for (const name of activePlatformNames()) {
+    await scanPlatform(name, { forcePush })
   }
 }
 
@@ -706,14 +780,25 @@ const server = http.createServer(async (req, res) => {
 
     // GET /api/status
     if (req.method === 'GET' && pathname === '/api/status') {
+      const platforms = {}
+      for (const name of config.getPlatformNames()) {
+        const st = runtime[name]
+        platforms[name] = {
+          interval: getPlatformInterval(name),
+          nextRunAt: st.nextRunAt,
+          scanning: st.scanning,
+          paused: st.paused
+        }
+      }
       return json(res, {
-        running: !!timer,
+        running: isRunning(),
         scanning: false,
-        autoBooking,
+        autoBooking: isAutoBooking(),
         slotCount: currentData.length,
         version: currentVersion,
         interval: getEffectiveInterval(),
         jitterMax: getEffectiveJitter(),
+        platforms,
         config: {
           global: config.global,
           platforms: config.getAllPlatforms()
@@ -735,19 +820,24 @@ const server = http.createServer(async (req, res) => {
       return json(res, { success: true, message: '扫描已触发' })
     }
 
-    // POST /api/pause
+    // POST /api/pause —— 暂停所有平台 scheduler，清理所有 timer
     if (req.method === 'POST' && pathname === '/api/pause') {
-      if (timer) {
-        clearTimeout(timer)
-        timer = null
+      for (const st of Object.values(runtime)) {
+        st.paused = true
+        if (st.timer) {
+          clearTimeout(st.timer)
+          st.timer = null
+        }
       }
       return json(res, { success: true, message: '已暂停' })
     }
 
-    // POST /api/resume
+    // POST /api/resume —— 恢复所有平台 scheduler（不创建重复 timer）
     if (req.method === 'POST' && pathname === '/api/resume') {
-      if (!timer) {
-        scheduleNext()
+      for (const name of activePlatformNames()) {
+        const st = runtime[name]
+        st.paused = false
+        if (!st.timer) schedulePlatform(name)
       }
       return json(res, { success: true, message: '已恢复' })
     }
@@ -887,12 +977,23 @@ const server = http.createServer(async (req, res) => {
 
     // GET /api/schedule-status
     if (req.method === 'GET' && pathname === '/api/schedule-status') {
+      const platforms = {}
+      for (const name of config.getPlatformNames()) {
+        const st = runtime[name]
+        platforms[name] = {
+          interval: getPlatformInterval(name),
+          nextRunAt: st.nextRunAt,
+          scanning: st.scanning,
+          paused: st.paused,
+          firstRun: st.firstRun
+        }
+      }
       return json(res, {
-        running: !!timer,
+        running: isRunning(),
         interval: getEffectiveInterval(),
-        isFirstRun,
-        autoBooking,
-        lastScanVersion: currentVersion
+        autoBooking: isAutoBooking(),
+        lastScanVersion: currentVersion,
+        platforms
       })
     }
 
@@ -914,11 +1015,17 @@ async function start() {
     console.log(`[monitor-service] HTTP API 启动于 http://localhost:${PORT}`)
   })
 
-  // 首次扫描
-  await monitor()
+  // 各平台各自首次扫描（PUSH_ON_INIT 平台内独立处理）
+  const names = activePlatformNames()
+  console.log(`[monitor-service] 激活平台: ${names.join(', ') || '（无）'}`)
+  for (const name of names) {
+    await scanPlatform(name)
+  }
 
-  // 定时扫描（含随机抖动）
-  scheduleNext()
+  // 各平台独立定时器
+  for (const name of names) {
+    schedulePlatform(name)
+  }
 
   // 清理旧日志
   setInterval(() => cleanOldLogs(30), 24 * 60 * 60 * 1000)
