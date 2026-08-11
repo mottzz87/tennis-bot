@@ -51,13 +51,13 @@ PLACE_MAP:
     short: 江户川
     emoji: 🏟️
     courtCode: sportsland
-    bike: 🚴 20分
+    bike: 🚴 18分
     priority: 4
   水辺のスポーツガーデン:
     short: 水辺
     emoji: 🏸
     courtCode: mizube
-    bike: 🚴 20分
+    bike: 🚴 18分
     priority: 2
 
 # ===== 场地分组（跨面拼接/时段合并时按组处理）=====
