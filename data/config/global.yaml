@@ -11,7 +11,7 @@ HUMAN_INPUT_EXTRA_MS: 300 # 输入框操作后额外叠加的停顿（毫秒）�
 # ===== 通知 =====
 NOTIFY_ADDED: true     # 出现新空位时推送
 NOTIFY_REMOVED: true   # 有空位被约掉时推送
-MAX_PUSH: 100          # 单轮扫描最多推送的空位数
+MAX_PUSH: 500          # 单轮扫描最多推送的空位数
 PUSH_ON_INIT: true     # 启动时是否先推送一次当前全部空位
 BOOKED_REMINDER_INTERVAL_HOURS: 5  # 已预约临近的定时提醒间隔（小时）
 
