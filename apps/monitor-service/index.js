@@ -32,7 +32,7 @@ const FileStorage = require('@tennis-bot/storage/file/FileStorage')
 const ConfigManager = require('@tennis-bot/config')
 const core = require('@tennis-bot/core')
 const { formatSlotText, escapeMarkdown } = require('@tennis-bot/notifier')
-const { createTrace, parseSlotStartDateTimeSafe, parseSlotDayKey, formatDateDisplayFromIso } = require('@tennis-bot/utils')
+const { createTrace, parseSlotStartDateTimeSafe, parseSlotDayKey, formatDateDisplayFromIso, slotToken } = require('@tennis-bot/utils')
 
 const DATA_DIR = process.env.MONITOR_DATA_DIR || path.resolve(__dirname, '../../data')
 const PORT = process.env.MONITOR_PORT || 3000
@@ -322,13 +322,26 @@ function placeMeta(place) {
 function placeShort(place) { return placeMeta(place).short || place }
 function placeEmoji(place) { return placeMeta(place).emoji || '🎾' }
 
+// "查看空位"按钮对应的推送快照：点击只显示本次推送的 slot，而不是场地当前全部空位
+const pushSnapshots = new Map()
+const PUSH_SNAPSHOT_TTL = 30 * 60 * 1000
+function storePushSnapshot({ platform, place, slots }) {
+  const token = `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
+  const now = Date.now()
+  pushSnapshots.set(token, { platform, place, slots, ts: now })
+  for (const [k, v] of pushSnapshots) {
+    if (now - v.ts > PUSH_SNAPSHOT_TTL) pushSnapshots.delete(k)
+  }
+  return token
+}
+
 // 分批发送 book 按钮（每批 MAX_INLINE_BUTTONS 个）
 async function sendBookButtons(bot, chatId, slots, header) {
   for (let i = 0; i < slots.length; i += MAX_INLINE_BUTTONS) {
     const part = slots.slice(i, i + MAX_INLINE_BUTTONS)
     const buttons = part.map(d => ({
       text: formatSlotText(d, getPlatformConfig(d.place)),
-      callback_data: `book_${d.ucode}`
+      callback_data: `book_${slotToken(d.ucode)}`
     }))
     const h = i === 0 ? header : `${header}\n（第 ${i / MAX_INLINE_BUTTONS + 1} 页）`
     await bot.sendMessage(chatId, h, { reply_markup: { inline_keyboard: buttons.map(b => [b]) } })
@@ -397,7 +410,7 @@ async function sendTelegram(data, version, title = '🆕 可预约（点击直�
     const platformConfig = config.getPlatform(platform)
     const list = sortSlots(slots).slice(0, maxPush)
 
-    // 按场地分组（一个场地一个"查看空位"按钮；场地内硬地/人工芝在摘要行内联）
+    // 按场地分组（空位多的场地一个"查看空位"按钮；场地内硬地/人工芝在摘要行内联）
     const byPlace = new Map()
     for (const d of list) {
       if (!byPlace.has(d.place)) byPlace.set(d.place, [])
@@ -411,7 +424,8 @@ async function sendTelegram(data, version, title = '🆕 可预约（点击直�
       continue
     }
 
-    // 多场地 → 两级导航：第一个场地直接给 book 按钮（周末在前），其余场地给"查看空位"按钮
+    // 多场地 → 两级导航：第一个场地直接给 book 按钮（周末在前），其余场地：
+    //   空位少（≤ MAX_INLINE_BUTTONS）→ 直接铺 book 按钮；空位多 → "查看空位"按钮（点击只显示本次推送的 slot）
     const firstPlace = places[0]
     const firstSlots = sortWeekendFirst(byPlace.get(firstPlace))
     await sendBookButtons(
@@ -421,12 +435,24 @@ async function sendTelegram(data, version, title = '🆕 可预约（点击直�
       `${title}\n━━━━━━━━━━━━━━\n${placeEmoji(firstPlace)} ${placeShort(firstPlace)}（${byPlace.get(firstPlace).length} 个）`
     )
 
-    const restRows = places.slice(1).map(p => placeSummaryLine(p, byPlace.get(p), platformConfig))
-    const restButtons = places.slice(1).map(p => [{
-      text: `🔍 ${placeShort(p)}（${byPlace.get(p).length}）查看空位`,
-      callback_data: `viewplace_${platform}|${p}`
-    }])
-    if (restButtons.length > 0) {
+    const rest = places.slice(1)
+    for (const p of rest.filter(p => byPlace.get(p).length <= MAX_INLINE_BUTTONS)) {
+      const pSlots = byPlace.get(p)
+      await sendBookButtons(
+        botInstance,
+        chatId,
+        sortWeekendFirst(pSlots),
+        `${title}\n━━━━━━━━━━━━━━\n${placeEmoji(p)} ${placeShort(p)}（${pSlots.length} 个）`
+      )
+    }
+
+    const collapsed = rest.filter(p => byPlace.get(p).length > MAX_INLINE_BUTTONS)
+    if (collapsed.length > 0) {
+      const restRows = collapsed.map(p => placeSummaryLine(p, byPlace.get(p), platformConfig))
+      const restButtons = collapsed.map(p => [{
+        text: `🔍 ${placeShort(p)}（${byPlace.get(p).length}）查看空位`,
+        callback_data: `viewplace_${storePushSnapshot({ platform, place: p, slots: byPlace.get(p) })}`
+      }])
       await botInstance.sendMessage(
         chatId,
         `${title}\n━━━━━━━━━━━━━━\n${restRows.join('\n')}`,
@@ -954,7 +980,7 @@ const server = http.createServer(async (req, res) => {
       return json(res, { lines: logBuffer.slice(-n) })
     }
 
-    // GET /api/place/:platform/:place — 某场地当前空位（推送的"查看空位"按钮，周末在前）
+    // GET /api/place/:platform/:place — 某场地当前空位（兼容旧推送按钮，周末在前）
     if (req.method === 'GET' && pathname.startsWith('/api/place/')) {
       const parts = decodeURIComponent(pathname.replace('/api/place/', '')).split('/')
       const platform = parts[0]
@@ -965,10 +991,23 @@ const server = http.createServer(async (req, res) => {
       return json(res, { success: true, slots })
     }
 
-    // GET /api/slot/:ucode
+    // GET /api/push-snapshot/:token — 推送"查看空位"按钮对应的快照（只含本次推送的 slot，周末在前）
+    if (req.method === 'GET' && pathname.startsWith('/api/push-snapshot/')) {
+      const token = decodeURIComponent(pathname.replace('/api/push-snapshot/', ''))
+      const snap = pushSnapshots.get(token)
+      if (!snap) return json(res, { success: false, message: '该推送已过期，请等待下次推送' }, 404)
+      return json(res, { success: true, platform: snap.platform, place: snap.place, slots: sortWeekendFirst(snap.slots) })
+    }
+
+    // GET /api/slot/:id（id 为完整 ucode 或 slotToken，按钮只传 token 以规避 callback_data 64 字节限制）
     if (req.method === 'GET' && pathname.startsWith('/api/slot/')) {
-      const ucode = decodeURIComponent(pathname.replace('/api/slot/', ''))
-      const slot = currentSlotMap.get(ucode)
+      const id = decodeURIComponent(pathname.replace('/api/slot/', ''))
+      let slot = currentSlotMap.get(id)
+      if (!slot) {
+        for (const s of currentSlotMap.values()) {
+          if (slotToken(s.ucode) === id) { slot = s; break }
+        }
+      }
       if (!slot) {
         return json(res, { success: false, message: 'slot 已过期' }, 404)
       }

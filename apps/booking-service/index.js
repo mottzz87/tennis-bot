@@ -19,7 +19,7 @@ require('@tennis-bot/config/loadEnv')()
 const http = require('http')
 const { loadPlatform } = require('@tennis-bot/platform')
 const FileStorage = require('@tennis-bot/storage/file/FileStorage')
-const { parseSlotDayKey, parseSlotStartDateTimeSafe } = require('@tennis-bot/utils')
+const { parseSlotDayKey, parseSlotStartDateTimeSafe, slotToken } = require('@tennis-bot/utils')
 const ConfigManager = require('@tennis-bot/config')
 const path = require('path')
 
@@ -29,6 +29,11 @@ const MONITOR_HOST = process.env.MONITOR_HOST || ''
 
 const storage = new FileStorage(DATA_DIR)
 const config = new ConfigManager(DATA_DIR)
+
+// uid 参数可能是完整 ucode/uid，也可能是 slotToken（按钮 callback_data 有 64 字节限制）
+function matchBooked(s, id) {
+  return s.uid === id || s.ucode === id || slotToken(s.ucode || s.uid) === id
+}
 
 // 配置加载：跨服模式从 Monitor API 获取，本地模式从文件加载
 async function loadConfig() {
@@ -205,16 +210,18 @@ const server = http.createServer(async (req, res) => {
       if (!uid) return json(res, { success: false, message: '缺少 uid' }, 400)
       const slots = await storage.getBookedSlots()
       let found = false
+      let foundUcode = null
       const updated = slots.map(s => {
-        if (s.uid === uid || s.ucode === uid) {
+        if (matchBooked(s, uid)) {
           found = true
+          foundUcode = s.ucode || s.uid
           return { ...s, reminderEnabled: false }
         }
         return s
       })
       if (!found) return json(res, { success: false, message: '未找到' }, 404)
       await storage.saveBookedSlots(updated)
-      return json(res, { success: true })
+      return json(res, { success: true, ucode: foundUcode })
     }
 
     // POST /api/booked/toggle-reminder
@@ -225,7 +232,7 @@ const server = http.createServer(async (req, res) => {
       let found = false
       let newState = false
       const updated = slots.map(s => {
-        if (s.uid === uid || s.ucode === uid) {
+        if (matchBooked(s, uid)) {
           found = true
           newState = s.reminderEnabled === false
           return { ...s, reminderEnabled: newState }
@@ -242,7 +249,7 @@ const server = http.createServer(async (req, res) => {
       const uid = decodeURIComponent(pathname.replace('/api/booked/', ''))
       if (!uid) return json(res, { success: false, message: '缺少 uid' }, 400)
       const slots = await storage.getBookedSlots()
-      const filtered = slots.filter(s => s.uid !== uid && s.ucode !== uid)
+      const filtered = slots.filter(s => !matchBooked(s, uid))
       if (filtered.length === slots.length) {
         return json(res, { success: false, message: '未找到' }, 404)
       }

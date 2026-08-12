@@ -1,3 +1,12 @@
+const crypto = require('crypto')
+
+// ucode 可能超过 64 字节（含 CJK 场地名），不能直接塞进 Telegram callback_data（上限 64 字节）。
+// 用固定长度 token 代替，服务端再按 token 反查原 ucode。
+function slotToken(id) {
+  return crypto.createHash('sha1').update(String(id || '')).digest('base64')
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '').slice(0, 12)
+}
+
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
@@ -183,6 +192,7 @@ async function clickByText(page, text) {
 }
 
 module.exports = {
+  slotToken,
   sleep,
   randomInt,
   humanType,

@@ -14,7 +14,7 @@ const { spawn } = require('child_process')
 const path = require('path')
 const TelegramBot = require('node-telegram-bot-api')
 const { formatSlotText, formatReminderButtonLabel, displayCourt, escapeMarkdown } = require('@tennis-bot/notifier')
-const { parseSlotStartDateTimeSafe, parseSlotDayKey, formatTimeDisplay, toMinutes } = require('@tennis-bot/utils')
+const { parseSlotStartDateTimeSafe, parseSlotDayKey, formatTimeDisplay, toMinutes, slotToken } = require('@tennis-bot/utils')
 const readline = require('readline')
 
 // 时段总小时数：优先 duration（分钟），缺省时按起止时间推算
@@ -339,7 +339,7 @@ async function pushBookedReminder() {
     const pageSlots = future.slice(i, i + CHUNK)
     const buttons = await Promise.all(pageSlots.map(async d => {
       const pc = await getPlatformConfig(d.platform)
-      return [{ text: formatReminderButtonLabel(d, pc), callback_data: `del_booked_${d.ucode}` }]
+      return [{ text: formatReminderButtonLabel(d, pc), callback_data: `del_booked_${slotToken(d.ucode)}` }]
     }))
     const h = `📅 已预约提醒（${future.length} 条）${i === 0 ? '' : `\n（第 ${i / CHUNK + 1} 页）`}`
     const sent = await reminderBot.sendMessage(ADMIN_ID, h, { reply_markup: { inline_keyboard: buttons } })
@@ -380,7 +380,7 @@ async function pushUpcomingReminder() {
     }))
     const buttons = await Promise.all(pageSlots.map(async d => {
       const pc = await getPlatformConfig(d.platform)
-      return [{ text: formatReminderButtonLabel(d, pc), callback_data: `del_booked_${d.ucode}` }]
+      return [{ text: formatReminderButtonLabel(d, pc), callback_data: `del_booked_${slotToken(d.ucode)}` }]
     }))
     const h = `⏰ *即将开始（1小时内）*\n━━━━━━━━━━━━━━\n${lines.join('\n\n')}${i === 0 ? '' : `\n（第 ${i / CHUNK + 1} 页）`}`
     const sent = await reminderBot.sendMessage(ADMIN_ID, h, {
@@ -470,7 +470,7 @@ async function quickBooked(bot, chatId) {
       const bell = d.reminderEnabled === false ? '🔕' : '🔔'
       const fee = d.totalFee ? ` 💰${d.totalFee}` : ''
       const info = `${bell} ${meta.emoji || '🎾'} ${placeShort} ${court} · ${date} ${t}${fee}`
-      return [{ text: info, callback_data: `try_del_${d.ucode}` }]
+      return [{ text: info, callback_data: `try_del_${slotToken(d.ucode)}` }]
     }))
     await bot.sendMessage(chatId,
       `📚 预约记录（最近 ${list.length}/${slots.length} 条）\n━━━━━━━━━━━━━━`,
@@ -493,7 +493,7 @@ async function quickSchedule(bot, chatId) {
       const pc = await getPlatformConfig(d.platform)
       return [{
         text: formatToggleButtonLabel(d, pc),
-        callback_data: `toggle_remind_${d.ucode}`
+        callback_data: `toggle_remind_${slotToken(d.ucode)}`
       }]
     }))
     await bot.sendMessage(chatId,
@@ -648,7 +648,7 @@ function registerHandlers(bot) {
         const bell = d.reminderEnabled === false ? '🔕' : '🔔'
         const fee = d.totalFee ? ` 💰${d.totalFee}` : ''
         const info = `${bell} ${meta.emoji || '🎾'} ${placeShort} ${court} · ${date} ${t}${fee}`
-        return [{ text: info, callback_data: `try_del_${d.ucode}` }]
+        return [{ text: info, callback_data: `try_del_${slotToken(d.ucode)}` }]
       }))
       await bot.sendMessage(msg.chat.id,
         `📚 预约记录（最近 ${list.length}/${slots.length} 条）\n━━━━━━━━━━━━━━`,
@@ -672,7 +672,7 @@ function registerHandlers(bot) {
         const pc = await getPlatformConfig(d.platform)
         return [{
           text: formatToggleButtonLabel(d, pc),
-          callback_data: `toggle_remind_${d.ucode}`
+          callback_data: `toggle_remind_${slotToken(d.ucode)}`
         }]
       }))
       await bot.sendMessage(msg.chat.id,
@@ -961,16 +961,31 @@ function registerHandlers(bot) {
       return
     }
 
-    // --- View place（推送里的"查看空位"按钮，数据为 platform|place） ---
+    // --- View place（推送里的"查看空位"按钮） ---
+    // 新格式 viewplace_<token>：只显示本次推送的 slot；旧格式 viewplace_<platform>|<place>：显示该场地当前全部空位
     if (data.startsWith('viewplace_')) {
-      const rest = data.replace('viewplace_', '')
-      const parts = rest.split('|')
-      const platform = parts[0]
-      const place = parts.slice(1).join('|')
+      const payload = data.replace('viewplace_', '')
       await bot.answerCallbackQuery(query.id, { text: '🔍 加载中...' })
       try {
-        const res = await monitorApi('GET', `/api/place/${encodeURIComponent(platform)}/${encodeURIComponent(place)}`)
-        const slots = res.data?.slots || []
+        let platform = ''
+        let place = ''
+        let slots = []
+        if (payload.includes('|')) {
+          const parts = payload.split('|')
+          platform = parts[0]
+          place = parts.slice(1).join('|')
+          const res = await monitorApi('GET', `/api/place/${encodeURIComponent(platform)}/${encodeURIComponent(place)}`)
+          slots = res.data?.slots || []
+        } else {
+          const res = await monitorApi('GET', `/api/push-snapshot/${encodeURIComponent(payload)}`)
+          if (res.status === 404) {
+            await bot.sendMessage(chatId, '⚠️ 该推送已过期，请等待下次推送')
+            return
+          }
+          platform = res.data?.platform || ''
+          place = res.data?.place || ''
+          slots = res.data?.slots || []
+        }
         if (slots.length === 0) {
           await bot.sendMessage(chatId, '📍 该场地当前暂无空位')
           return
@@ -981,7 +996,7 @@ function registerHandlers(bot) {
           const part = slots.slice(i, i + CHUNK)
           const buttons = part.map(d => [{
             text: formatSlotText(d, pc),
-            callback_data: `book_${d.ucode}`
+            callback_data: `book_${slotToken(d.ucode)}`
           }])
           const h = `📍 ${place}（${slots.length} 个）${i === 0 ? '' : `\n（第 ${i / CHUNK + 1} 页）`}`
           await bot.sendMessage(chatId, h, { reply_markup: { inline_keyboard: buttons } })
@@ -1119,6 +1134,7 @@ function registerHandlers(bot) {
           await bot.answerCallbackQuery(query.id, { text: '⚠️ 未找到对应预约记录' })
           return
         }
+        const realUcode = res.data?.ucode || key
         const targetCb = `del_booked_${key}`
         const rows = query.message.reply_markup?.inline_keyboard || []
         const newRows = rows.filter(row => !row.some(btn => btn.callback_data === targetCb))
@@ -1137,7 +1153,7 @@ function registerHandlers(bot) {
         } catch (e) {
           console.warn('[del_booked] 更新消息失败:', e.message)
         }
-        pruneReminderIndexForUcode(key)
+        pruneReminderIndexForUcode(realUcode)
         await bot.answerCallbackQuery(query.id, { text: '🔕 已关闭该条提醒' })
       } catch (e) {
         await bot.answerCallbackQuery(query.id, { text: '❌ 操作失败' })
