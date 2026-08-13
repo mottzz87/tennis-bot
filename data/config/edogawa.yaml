@@ -74,7 +74,10 @@ COURT_GROUPS:
 SCAN_DAYS: 30            # 一次扫描的日期窗口（天）
 MIN_CONTINUOUS_HOURS: 2  # 相邻时段合并成连续段的最短小时数
 SEARCH_MODE: hour        # 扫描/合并模式（按小时）
-INTERVAL: 60            # 本平台扫描间隔（秒），覆盖 global.INTERVAL
+INTERVAL: 240           # 本平台扫描间隔（秒），覆盖 global.INTERVAL。
+                        # 语义为「目标启动间隔」（周期起点）：单次全量扫描约 4~5 分钟，
+                        # 60s 实际跑不出 60 秒一轮；240s + 全局 JITTER 45s ≈ 4~5 分钟一轮，
+                        # 扫描耗时超过周期会结束后立即重启。建议区间 180~300。
 
 # ===== 预约 =====
 BOOK_DURATION: 60          # 预约时长（分钟）

@@ -77,6 +77,8 @@ for (const name of config.getPlatformNames()) {
     autoBooking: false,   // 本平台 auto-book 进行中 → 只暂停本平台
     paused: false,        // 本平台暂停
     nextRunAt: null,
+    pendingManual: false, // 手动全量扫描请求在任务进行中时排队，结束后立即执行
+    lastCycleStartAt: null, // 上一轮扫描周期的启动时间（周期起点调度用）
     lastSet: new Set()    // 只含本平台的 uid（diff 基线）
   }
 }
@@ -247,9 +249,19 @@ function getEffectiveInterval() {
   return Math.min(...names.map(getPlatformInterval))
 }
 
+function formatClock(ts) {
+  const d = new Date(ts)
+  const p = n => String(n).padStart(2, '0')
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+}
+
 /**
  * 每平台独立 scheduler：递归 setTimeout（非 setInterval），同平台绝不重叠。
  * await scanPlatform → finally → schedulePlatform，扫描变慢也不会堆积任务。
+ *
+ * INTERVAL 语义 = 目标启动间隔（周期起点），不是扫描结束后额外等待时间：
+ *   下一轮启动时间 = 本轮启动时间 + INTERVAL + 随机抖动；
+ *   若扫描耗时超过周期，则结束即立即重启（不堆积、不排队），实际频率始终有下限。
  */
 function schedulePlatform(name) {
   const st = runtime[name]
@@ -257,16 +269,23 @@ function schedulePlatform(name) {
   const baseMs = getPlatformInterval(name) * 1000
   const jitterMaxMs = getEffectiveJitter() * 1000
   const jitter = Math.floor(Math.random() * (jitterMaxMs + 1))
-  const delay = baseMs + jitter
-  st.nextRunAt = Date.now() + delay
-  console.log(`[MONITOR][${name.toUpperCase()}] 下次扫描: ${(baseMs/1000)}s + 随机 ${(jitter/1000).toFixed(1)}s = ${(delay/1000).toFixed(1)}s`)
+  const periodMs = baseMs + jitter
+  const now = Date.now()
+  const nextStart = Math.max((st.lastCycleStartAt || now) + periodMs, now)
+  const overran = nextStart === now
+  st.nextRunAt = nextStart
+  console.log(
+    `[MONITOR][${name.toUpperCase()}] 周期 ${(periodMs / 1000).toFixed(0)}s` +
+    (overran ? `，扫描耗时超周期 → 结束后立即重启` : `，下次启动 ${formatClock(nextStart)}`)
+  )
   st.timer = setTimeout(() => {
     st.timer = null
+    st.lastCycleStartAt = Date.now()
     scanPlatform(name).finally(() => {
       // paused 防 /pause 之后又武装；!st.timer 防重复 timer
       if (!st.paused && !st.timer) schedulePlatform(name)
     })
-  }, delay)
+  }, nextStart - now)
 }
 
 /**
@@ -505,25 +524,20 @@ async function callBookingService(slotData, platformName) {
 }
 
 // ========================
-// 手动单平台扫描
+// 手动扫描（Telegram /run、POST /api/run）
 // ========================
-// 只扫描指定平台并推送到该平台对应的 bot，不更新全局 diff 状态（lastSet/currentData），
-// 避免手动 /run 干扰定时扫描的去重与减少通知。
-// 加 scanning 守卫：手动扫描也不与该平台定时扫描/auto-book 重叠。
-async function runPlatformOnce(platformName) {
+// 语义：用户主动触发 → 当前配置范围全量扫描并推送（不受 AUTO_BOOK 过滤限制），
+// 不更新全局 diff 状态（lastSet/currentData），避免手动 /run 干扰定时扫描的去重与减少通知。
+//
+// 与定时扫描共用 scanning 守卫：若当前正在扫描/auto-book，不丢弃请求，
+// 而是置 pendingManual，当前任务结束后立即执行一次手动全量扫描。
+async function runManualScan(platformName) {
   const st = runtime[platformName]
-  if (!st || st.scanning || st.autoBooking) {
-    console.log(`[手动] ${platformName} 扫描/auto-book 进行中，跳过`)
-    return
-  }
   const platformConfig = config.getPlatform(platformName)
-  if (platformConfig.enabled === false) return
-  const adapter = loadPlatform(platformName)
-  if (!adapter) return
-  if (!platformConfig.TARGET_PLACE?.length) return
-
   st.scanning = true
   try {
+    const adapter = loadPlatform(platformName)
+    if (!adapter) return
     const slots = await adapter.fetchSlots(platformConfig)
     console.log(`[手动] ${platformName} 获取 ${slots.length} 个空位`)
 
@@ -553,7 +567,35 @@ async function runPlatformOnce(platformName) {
     console.log(`[手动] ${platformName} 扫描失败:`, e.message)
   } finally {
     st.scanning = false
+    await drainPendingManual(platformName)
   }
+}
+
+// 手动请求入口：正在扫描/auto-book 则排队，否则立即执行全量扫描
+async function requestManualScan(platformName) {
+  const st = runtime[platformName]
+  if (!st) return
+  const platformConfig = config.getPlatform(platformName)
+  if (platformConfig.enabled === false) return
+  const adapter = loadPlatform(platformName)
+  if (!adapter) return
+  if (!platformConfig.TARGET_PLACE?.length) return
+
+  if (st.scanning || st.autoBooking) {
+    st.pendingManual = true
+    console.log(`[手动] ${platformName} 当前任务进行中，手动全量扫描已排队（结束后立即执行）`)
+    return
+  }
+  await runManualScan(platformName)
+}
+
+// 当前任务结束后，若期间有手动请求 → 立即执行一次手动全量扫描（不丢弃用户请求）
+async function drainPendingManual(platformName) {
+  const st = runtime[platformName]
+  if (!st || !st.pendingManual) return
+  st.pendingManual = false
+  console.log(`[手动] ${platformName} 执行排队的手动全量扫描`)
+  await runManualScan(platformName)
 }
 
 // ========================
@@ -730,7 +772,6 @@ async function scanPlatform(name, options = {}) {
 
     core.recordStats('added', added)
     core.recordStats('removed', removed)
-    console.log(`[MONITOR][${name.toUpperCase()}][${trace}] DIFF 新增:${added.length} 减少:${removed.length}`)
 
     if (added.length === 0 && removed.length === 0) {
       if (forcePush) {
@@ -745,6 +786,8 @@ async function scanPlatform(name, options = {}) {
       }
       return
     }
+
+    console.log(`[MONITOR][${name.toUpperCase()}][${trace}] DIFF 新增:${added.length} 减少:${removed.length}`)
 
     st.lastSet = currentUids
     saveLastSets()
@@ -766,14 +809,8 @@ async function scanPlatform(name, options = {}) {
     console.log(`[MONITOR][${name.toUpperCase()}][${trace}] 扫描失败:`, e.message)
   } finally {
     st.scanning = false
-  }
-}
-
-// 兼容入口：扫描所有激活平台（/api/run 无 platforms、手动触发用）
-async function monitor(options = {}) {
-  const { forcePush = false } = options
-  for (const name of activePlatformNames()) {
-    await scanPlatform(name, { forcePush })
+    // 期间有手动请求 → 结束后立即执行手动全量扫描（不丢弃）
+    await drainPendingManual(name)
   }
 }
 
@@ -832,17 +869,15 @@ const server = http.createServer(async (req, res) => {
       })
     }
 
-    // POST /api/run   body: { platforms?: string[] }
+    // POST /api/run   body: { platforms?: string[] }（省略则全平台手动扫描）
+    // 手动扫描走 requestManualScan：正在扫描/auto-book 时排队，结束后立即执行，不丢弃请求
     if (req.method === 'POST' && pathname === '/api/run') {
       const body = await parseBody(req).catch(() => null)
       const platforms = Array.isArray(body?.platforms) ? body.platforms : null
-      if (platforms && platforms.length > 0) {
-        ;(async () => {
-          for (const p of platforms) await runPlatformOnce(p)
-        })().catch(e => console.error('[/api/run] error:', e))
-      } else {
-        monitor({ forcePush: true }).catch(e => console.error('[/api/run] error:', e))
-      }
+      const names = platforms && platforms.length > 0 ? platforms : activePlatformNames()
+      ;(async () => {
+        for (const p of names) await requestManualScan(p)
+      })().catch(e => console.error('[/api/run] error:', e))
       return json(res, { success: true, message: '扫描已触发' })
     }
 

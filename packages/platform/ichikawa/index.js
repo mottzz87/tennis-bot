@@ -99,7 +99,8 @@ class IchikawaAdapter {
         }
       })
 
-      console.log(`[ichikawa] 抓取到 ${slots.length} 个空位`)
+      // 只在抓到空位时记一行；0 空位是常态，monitor 已按周期记录「获取 N 个空位」，避免刷屏
+      if (slots.length > 0) console.log(`[ichikawa] 抓取到 ${slots.length} 个空位`)
       return slots
 
     } finally {

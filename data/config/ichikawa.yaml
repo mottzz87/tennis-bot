@@ -61,7 +61,7 @@ BOOK_DURATION_MAP:    # 表示期间选项
   "30": 1ヶ月
 
 # ===== 扫描 =====
-INTERVAL: 60
+INTERVAL: 45            # 本平台扫描间隔（秒），覆盖 global.INTERVAL；单次扫描仅 ~7s，可保持 45~60s
 
 # ===== 可覆盖的全局字段 =====
 # 取消注释即可覆盖 global.yaml 的默认值：
