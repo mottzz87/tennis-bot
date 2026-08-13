@@ -91,11 +91,25 @@ function getLogFile() {
   return path.join(DATA_DIR, '..', 'logs', `runtime-${date}.log`)
 }
 
+// 统一 24 小时制时间戳：YYYY-MM-DD HH:mm:ss
+function formatLogTs(d = new Date()) {
+  const p = n => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+}
+
+// 耗时展示：ms → "6s" / "4m31s"
+function formatDuration(ms) {
+  const s = Math.round(ms / 1000)
+  if (s < 60) return `${s}s`
+  const m = Math.floor(s / 60)
+  return `${m}m${String(s % 60).padStart(2, '0')}s`
+}
+
 function setupConsoleLogging() {
   if (console._log) return
   console._log = console.log
   console.log = (...args) => {
-    const msg = `[${new Date().toLocaleString()}] ` +
+    const msg = `[${formatLogTs()}] ` +
       args.map(a => typeof a === 'object' ? JSON.stringify(a, null, 2) : a).join(' ')
     console._log(...args)
     logBuffer.push(msg)
@@ -249,12 +263,6 @@ function getEffectiveInterval() {
   return Math.min(...names.map(getPlatformInterval))
 }
 
-function formatClock(ts) {
-  const d = new Date(ts)
-  const p = n => String(n).padStart(2, '0')
-  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
-}
-
 /**
  * 每平台独立 scheduler：递归 setTimeout（非 setInterval），同平台绝不重叠。
  * await scanPlatform → finally → schedulePlatform，扫描变慢也不会堆积任务。
@@ -262,6 +270,8 @@ function formatClock(ts) {
  * INTERVAL 语义 = 目标启动间隔（周期起点），不是扫描结束后额外等待时间：
  *   下一轮启动时间 = 本轮启动时间 + INTERVAL + 随机抖动；
  *   若扫描耗时超过周期，则结束即立即重启（不堆积、不排队），实际频率始终有下限。
+ *
+ * 不在这里打印心跳日志（每轮都打会刷屏），下次启动时间通过 /api/status.nextRunAt 查看。
  */
 function schedulePlatform(name) {
   const st = runtime[name]
@@ -271,13 +281,7 @@ function schedulePlatform(name) {
   const jitter = Math.floor(Math.random() * (jitterMaxMs + 1))
   const periodMs = baseMs + jitter
   const now = Date.now()
-  const nextStart = Math.max((st.lastCycleStartAt || now) + periodMs, now)
-  const overran = nextStart === now
-  st.nextRunAt = nextStart
-  console.log(
-    `[MONITOR][${name.toUpperCase()}] 周期 ${(periodMs / 1000).toFixed(0)}s` +
-    (overran ? `，扫描耗时超周期 → 结束后立即重启` : `，下次启动 ${formatClock(nextStart)}`)
-  )
+  st.nextRunAt = Math.max((st.lastCycleStartAt || now) + periodMs, now)
   st.timer = setTimeout(() => {
     st.timer = null
     st.lastCycleStartAt = Date.now()
@@ -285,7 +289,7 @@ function schedulePlatform(name) {
       // paused 防 /pause 之后又武装；!st.timer 防重复 timer
       if (!st.paused && !st.timer) schedulePlatform(name)
     })
-  }, nextStart - now)
+  }, Math.max(st.nextRunAt - now, 0))
 }
 
 /**
@@ -721,10 +725,9 @@ async function scanPlatform(name, options = {}) {
   if (!platformConfig.TARGET_PLACE?.length) return
 
   st.scanning = true
+  const scanStart = Date.now()
   try {
-    console.log(`[MONITOR][${name.toUpperCase()}][${trace}] scan started`)
     const slots = await adapter.fetchSlots(platformConfig)
-    console.log(`[MONITOR][${name.toUpperCase()}][${trace}] 获取 ${slots.length} 个空位`)
 
     const enriched = slots.map(s => {
       const time = s.time || `${s.start}-${s.end}`
@@ -750,7 +753,7 @@ async function scanPlatform(name, options = {}) {
     // 本平台首次运行：PUSH_ON_INIT 独立处理
     if (st.firstRun) {
       st.firstRun = false
-      console.log(`[MONITOR][${name.toUpperCase()}][${trace}] 首次运行`)
+      console.log(`[MONITOR][${name.toUpperCase()}][${trace}] 首次运行 ${filtered.length} 空位 · ${formatDuration(Date.now() - scanStart)}`)
       if (config.getEffective('PUSH_ON_INIT', name) !== false) {
         if (filtered.length > 0) {
           await sendTelegram(filtered, currentVersion)
@@ -782,12 +785,12 @@ async function scanPlatform(name, options = {}) {
           await sendNoSlotsMessageFor(name)
         }
       } else {
-        console.log(`[MONITOR][${name.toUpperCase()}][${trace}] 无变化`)
+        console.log(`[MONITOR][${name.toUpperCase()}][${trace}] ${filtered.length} 空位 无变化 · ${formatDuration(Date.now() - scanStart)}`)
       }
       return
     }
 
-    console.log(`[MONITOR][${name.toUpperCase()}][${trace}] DIFF 新增:${added.length} 减少:${removed.length}`)
+    console.log(`[MONITOR][${name.toUpperCase()}][${trace}] ${filtered.length} 空位 DIFF +${added.length} -${removed.length} · ${formatDuration(Date.now() - scanStart)}`)
 
     st.lastSet = currentUids
     saveLastSets()
@@ -801,10 +804,9 @@ async function scanPlatform(name, options = {}) {
     }
 
     if (removed.length > 0 && config.getEffective('NOTIFY_REMOVED', name) !== false) {
-      console.log(`[MONITOR][${name.toUpperCase()}][${trace}] PUSH 发送减少通知 ${removed.length}`)
+      // console.log(`[MONITOR][${name.toUpperCase()}][${trace}] PUSH 发送减少通知 ${removed.length}`)
       await sendRemovedTelegram(removed)
     }
-    console.log(`[MONITOR][${name.toUpperCase()}][${trace}] scan completed`)
   } catch (e) {
     console.log(`[MONITOR][${name.toUpperCase()}][${trace}] 扫描失败:`, e.message)
   } finally {
@@ -1091,7 +1093,7 @@ async function start() {
 
   // 各平台各自首次扫描（PUSH_ON_INIT 平台内独立处理）
   const names = activePlatformNames()
-  console.log(`[monitor-service] 激活平台: ${names.join(', ') || '（无）'}`)
+  console.log(`[monitor-service] 激活平台: ${names.map(n => `${n}(${getPlatformInterval(n)}s)`).join(', ') || '（无）'}`)
   for (const name of names) {
     await scanPlatform(name)
   }
