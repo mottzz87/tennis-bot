@@ -13,9 +13,13 @@ const core = require('@tennis-bot/core')
 const {
   USER_AGENT,
   navigateToMonth,
+  queryMonth,
   collectSomeCells,
   buildNextPayload,
-  parseTimePage
+  parseTimePage,
+  todayJst,
+  addDaysJst,
+  daysToEndOfNextMonth
 } = require('./flow')
 const { bookSlot } = require('./booking')
 
@@ -61,7 +65,12 @@ class EdogawaAdapter {
     }
     const targets = (platformConfig.TARGET_PLACE || []).filter(Boolean)
     if (targets.length === 0) return []
-    this._scanDays = Number(platformConfig.SCAN_DAYS) > 0 ? Number(platformConfig.SCAN_DAYS) : 7
+    this._startOffset = Number(platformConfig.SCAN_START_OFFSET) > 0 ? Number(platformConfig.SCAN_START_OFFSET) : 2
+    let scanDays = Number(platformConfig.SCAN_DAYS) > 0 ? Number(platformConfig.SCAN_DAYS) : 7
+    if (platformConfig.SCAN_UNTIL_NEXT_MONTH_END) {
+      scanDays = daysToEndOfNextMonth(addDaysJst(todayJst(), this._startOffset))
+    }
+    this._scanDays = scanDays
     this._minMinutes = Number(platformConfig.MIN_CONTINUOUS_HOURS) > 0
       ? Number(platformConfig.MIN_CONTINUOUS_HOURS) * 60
       : 120
@@ -99,57 +108,62 @@ class EdogawaAdapter {
   // ---------- 流程步骤 ----------
 
   async _scan(req, targets, platformConfig) {
-    // 1-6. 导航到月视图
-    const nav = await navigateToMonth(req, targets, this._scanDays)
+    // 1-5. 导航到 SelectDays 页（窗口超 1ヶ月 自动拆多期，但不在导航阶段提前查询）
+    const nav = await navigateToMonth(req, targets, this._scanDays, this._startOffset)
     if (!nav) return []
-    const { selected, month, formFields, token3, startDate, endDate, displayTerm } = nav
+    const { selected, formFields, token3, periods } = nav
 
-    // 7-8. 勾选 some cell（每批 ≤10，服务端 E-203-000018 限制）→ Next → 时间页 → vacant slots
-    const someCells = collectSomeCells(month, startDate, endDate)
-    console.log(`[edogawa] ${selected.length} 设施 ${this._scanDays}天窗口, some cells: ${someCells.length}`)
-    if (someCells.length === 0) {
-      console.log(`[edogawa] ${selected.length} 设施 ${this._scanDays}天窗口内无 some 空位`)
-      return []
-    }
-
+    // 6-8. 每期：SearchCondition → 勾选 some cell（每批 ≤10，服务端 E-203-000018 限制）→ Next → 时间页 → vacant slots。
+    // 站点要求 Next 的模型必须匹配当前 session 的 SearchCondition，因此必须"查一期、接着处理该期 Next"，再进入下一期。
     const calcStart = Date.now()
     const slots = []
     const BATCH = 10
-    for (let i = 0; i < someCells.length; i += BATCH) {
-      const batch = someCells.slice(i, i + BATCH)
-      const fd4 = buildNextPayload(month, batch, formFields, token3, startDate, displayTerm)
-      let res
-      try {
-        res = await req('/user/AvailabilityCheckApplySelectDays/Next', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: fd4.toString()
-        })
-      } catch (e) {
-        console.log(`[edogawa] Next 请求失败 (${i}): ${e.message}`)
-        continue
+    let someTotal = 0
+    for (const p of periods) {
+      const month = await queryMonth(req, formFields, token3, p.startDate, p.displayTerm)
+      const cells = collectSomeCells(month, p.startDate, p.endDate)
+      someTotal += cells.length
+      for (let i = 0; i < cells.length; i += BATCH) {
+        const batch = cells.slice(i, i + BATCH)
+        const fd4 = buildNextPayload(month, batch, formFields, token3, p.startDate, p.displayTerm)
+        let res
+        try {
+          res = await req('/user/AvailabilityCheckApplySelectDays/Next', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: fd4.toString()
+          })
+        } catch (e) {
+          console.log(`[edogawa] Next 请求失败 (${p.startDate}, ${i}): ${e.message}`)
+          continue
+        }
+        const nextBody = await res.text()
+        if (!nextBody.includes('Result')) {
+          console.log(`[edogawa] Next 异常响应 (${p.startDate}): ${nextBody.slice(0, 120)}`)
+          continue
+        }
+        const nextInfo = JSON.parse(JSON.parse(nextBody))
+        if (nextInfo.Result !== 'Ok') {
+          console.log(`[edogawa] Next 批次失败 (${p.startDate}, ${i}): ${JSON.stringify(nextInfo.Information)}`)
+          continue
+        }
+        const timeUrl = nextInfo.Information?.MessageId || ''
+        if (!timeUrl) continue
+        let timeHtml
+        try {
+          res = await req(timeUrl.startsWith('.') ? '/user/' + timeUrl.slice(2) : timeUrl)
+          timeHtml = await res.text()
+        } catch (e) {
+          console.log(`[edogawa] 时间页请求失败: ${e.message}`)
+          continue
+        }
+        slots.push(...parseTimePage(timeHtml))
       }
-      const nextBody = await res.text()
-      if (!nextBody.includes('Result')) {
-        console.log(`[edogawa] Next 异常响应: ${nextBody.slice(0, 120)}`)
-        continue
-      }
-      const nextInfo = JSON.parse(JSON.parse(nextBody))
-      if (nextInfo.Result !== 'Ok') {
-        console.log(`[edogawa] Next 批次失败 (${i}): ${JSON.stringify(nextInfo.Information)}`)
-        continue
-      }
-      const timeUrl = nextInfo.Information?.MessageId || ''
-      if (!timeUrl) continue
-      let timeHtml
-      try {
-        res = await req(timeUrl.startsWith('.') ? '/user/' + timeUrl.slice(2) : timeUrl)
-        timeHtml = await res.text()
-      } catch (e) {
-        console.log(`[edogawa] 时间页请求失败: ${e.message}`)
-        continue
-      }
-      slots.push(...parseTimePage(timeHtml))
+    }
+    console.log(`[edogawa] ${selected.length} 设施 ${this._scanDays}天窗口(${periods.length}期), some cells: ${someTotal}`)
+    if (someTotal === 0) {
+      console.log(`[edogawa] ${selected.length} 设施 ${this._scanDays}天窗口内无 some 空位`)
+      return []
     }
     // 打场地组标签（硬地/人工芝等），拼接时同组才拼，避免混合类型拼成一段
     for (const s of slots) {

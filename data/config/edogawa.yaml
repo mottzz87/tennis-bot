@@ -71,7 +71,10 @@ COURT_GROUPS:
       default: true
 
 # ===== 扫描 =====
-SCAN_DAYS: 30            # 一次扫描的日期窗口（天）
+SCAN_START_OFFSET: 2     # 从今天往后跳几天开始查（当天/次日一定无空位，第3天起才有数据）
+SCAN_UNTIL_NEXT_MONTH_END: true  # 扫描覆盖到下个月月底（true 时忽略 SCAN_DAYS，按日期动态计算窗口）
+SCAN_DAYS: 30            # 固定窗口天数（仅 SCAN_UNTIL_NEXT_MONTH_END 为 false 时生效）。
+                         # 站点单次 SearchCondition 最多查 1ヶ月（约30天），窗口更大时代码自动拆成多个周期查询
 MIN_CONTINUOUS_HOURS: 2  # 相邻时段合并成连续段的最短小时数
 SEARCH_MODE: hour        # 扫描/合并模式（按小时）
 INTERVAL: 240           # 本平台扫描间隔（秒），覆盖 global.INTERVAL。

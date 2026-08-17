@@ -11,9 +11,13 @@ const { humanType, humanPause, humanPauseAfterInput, setHumanPauseRange } = requ
 const {
   USER_AGENT,
   navigateToMonth,
+  queryMonth,
   buildNextPayload,
   isTennisCourt,
-  normalizeName
+  normalizeName,
+  todayJst,
+  addDaysJst,
+  daysToEndOfNextMonth
 } = require('./flow')
 
 // "12:00" / "12:30" → 1200 / 1230
@@ -371,7 +375,11 @@ async function bookSlot(adapter, slotData, platformConfig) {
     return { success: false, message: 'EDOGAWA_USER_ID / EDOGAWA_PASSWORD 未配置' }
   }
   setHumanPauseRange(platformConfig.HUMAN_DELAY_MIN, platformConfig.HUMAN_DELAY_MAX, platformConfig.HUMAN_INPUT_EXTRA_MS)
-  const scanDays = Number(platformConfig.SCAN_DAYS) > 0 ? Number(platformConfig.SCAN_DAYS) : 14
+  const startOffset = Number(platformConfig.SCAN_START_OFFSET) > 0 ? Number(platformConfig.SCAN_START_OFFSET) : 2
+  let scanDays = Number(platformConfig.SCAN_DAYS) > 0 ? Number(platformConfig.SCAN_DAYS) : 14
+  if (platformConfig.SCAN_UNTIL_NEXT_MONTH_END) {
+    scanDays = daysToEndOfNextMonth(addDaysJst(todayJst(), startOffset))
+  }
 
   const browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] })
   try {
@@ -379,17 +387,25 @@ async function bookSlot(adapter, slotData, platformConfig) {
     const req = createReq(context, baseUrl)
     const page = await context.newPage()
 
-    // 1. 导航到月视图
-    const nav = await navigateToMonth(req, [slotData.place], scanDays)
+    // 1. 导航到 SelectDays 页，拿到各期窗口
+    const nav = await navigateToMonth(req, [slotData.place], scanDays, startOffset)
     if (!nav) return { success: false, message: `导航失败，设施 ${slotData.place} 不可用或站点变动` }
-    const { month, formFields, token3, startDate, displayTerm } = nav
+    const { formFields, token3, periods } = nav
 
-    // 2. 定位目标 some cells（跨面拼接时段需要同时勾选多个面，一个 Next 打开合并时间页）
+    // 2. 定位目标日期所在周期，紧接 SearchCondition 拉取该期月视图，再找 some cells
+    //    （跨面拼接时段需要同时勾选多个面，一个 Next 打开合并时间页）
+    const dateKey = String(slotData.date || '').slice(0, 10)
+    const period = periods.find(p => p.startDate <= dateKey && dateKey <= p.endDate)
+    if (!period) {
+      return { success: false, message: `未找到 ${slotData.place} ${dateKey} 的空位（目标日期在扫描窗口外）` }
+    }
+    const { startDate, displayTerm } = period
+    const month = await queryMonth(req, formFields, token3, startDate, displayTerm)
     let someCells = findSomeCells(month, slotData)
     if (someCells.length === 0) {
       const legacy = findSomeCell(month, slotData)
       if (!legacy) {
-        return { success: false, message: `未找到 ${slotData.place} ${String(slotData.date).slice(0, 10)} 的空位（可能已被预约）` }
+        return { success: false, message: `未找到 ${slotData.place} ${dateKey} 的空位（可能已被预约）` }
       }
       someCells = [legacy]
     }

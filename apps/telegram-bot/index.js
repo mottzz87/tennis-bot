@@ -231,6 +231,23 @@ function splitPlatformArg(text) {
   return { platform: null, rest: String(text || '') }
 }
 
+// 按 UTF-8 字节数把长文本切成多段（≤ maxBytes），避免超过 Telegram 4096 字符上限报 "message is too long"
+function chunkText(text, maxBytes = 3500) {
+  const chunks = []
+  let cur = ''
+  for (const ch of Array.from(String(text || ''))) {
+    const next = cur + ch
+    if (cur && Buffer.byteLength(next, 'utf8') > maxBytes) {
+      chunks.push(cur)
+      cur = ch
+    } else {
+      cur = next
+    }
+  }
+  if (cur) chunks.push(cur)
+  return chunks
+}
+
 // ========================
 // Auth
 // ========================
@@ -748,7 +765,13 @@ function registerHandlers(bot) {
     try {
       const res = await monitorApi('GET', '/api/status')
       const { global, platforms } = res.data?.config || { global: {}, platforms: {} }
-      await bot.sendMessage(msg.chat.id, '⚙️ 当前配置：\n\n' + JSON.stringify({ global, platforms }, null, 2))
+      const chunks = chunkText(JSON.stringify({ global, platforms }, null, 2))
+      for (let i = 0; i < chunks.length; i++) {
+        const header = chunks.length === 1
+          ? '⚙️ 当前配置：\n\n'
+          : `⚙️ 当前配置（第 ${i + 1}/${chunks.length} 段）\n━━━━━━━━━━━━━━\n`
+        await bot.sendMessage(msg.chat.id, header + chunks[i])
+      }
     } catch (e) {
       await bot.sendMessage(msg.chat.id, `❌ 获取配置失败: ${e.message}`)
     }

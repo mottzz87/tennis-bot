@@ -12,13 +12,41 @@ const USER_AGENT =
 const TIME_ZONE_ALL = '2147483647'
 
 /**
- * 走完 Home → … → SearchCondition 导航，返回后续状态。
+ * 把扫描窗口拆成多个周期：站点 SearchCondition 的 DisplayTerm 最大只有 1ヶ月（约 30 天），
+ * 窗口超过 30 天必须按周期多次查询（等价于页面点「次の期間」）。
+ * 每周期返回 { startDate, endDate, displayTerm }，日期不重叠、首尾相接覆盖整个窗口。
+ */
+function buildPeriodPlan(startDate, scanDays) {
+  const term = scanDays <= 7 ? '2' : scanDays <= 14 ? '3' : '4'
+  const stepDays = scanDays <= 7 ? 7 : scanDays <= 14 ? 14 : 30
+  const periods = []
+  let cursor = startDate
+  let covered = 0
+  while (covered < scanDays) {
+    const segDays = Math.min(stepDays, scanDays - covered)
+    periods.push({
+      startDate: cursor,
+      endDate: addDaysJst(cursor, segDays - 1),
+      displayTerm: term
+    })
+    cursor = addDaysJst(cursor, stepDays)
+    covered += segDays
+  }
+  return periods
+}
+
+/**
+ * 走完 Home → … → SelectDays 页面导航，返回后续 SearchCondition 所需状态。
+ * 注意：站点要求 Next 的模型必须匹配「当前 session 的 SearchCondition」，
+ * 因此不要在这里提前把多期 SearchCondition 全部查完 —— 应每期调用 queryMonth 后紧跟该期的 Next 批次。
  * @param {Function} req - (path, {method, headers, body}) => Response
  * @param {string[]} targets - TARGET_PLACE 设施名列表
  * @param {number} scanDays - 扫描窗口天数
- * @returns {Promise<Object|null>} { facilities, selected, month, formFields, token3, startDate, endDate, displayTerm }
+ * @param {number} startOffset - 从今天往后跳过几天开始（当天/次日无数据，默认 2）
+ * @returns {Promise<Object|null>} { facilities, selected, formFields, token3, startDate, endDate, periods }
+ *   periods: [{ startDate, endDate, displayTerm }]，各期需用 queryMonth 拉取各自的 month
  */
-async function navigateToMonth(req, targets, scanDays) {
+async function navigateToMonth(req, targets, scanDays, startOffset = 2) {
   // 1. Home → token
   let res = await req('/user/Home')
   let html = await res.text()
@@ -81,10 +109,25 @@ async function navigateToMonth(req, targets, scanDays) {
   const token3 = extractToken(html)
   const formFields = extractInputs(html)
 
-  // 6. SearchCondition → 视图 JSON（窗口由 scanDays 决定）
-  const startDate = todayJst()
+  // 6. 只计算窗口周期，不提前查询（见函数注释：每期 SearchCondition 必须紧跟该期 Next）
+  const startDate = addDaysJst(todayJst(), startOffset)
   const endDate = addDaysJst(startDate, scanDays - 1)
-  const displayTerm = scanDays <= 7 ? '2' : scanDays <= 14 ? '3' : '4'
+  const periods = buildPeriodPlan(startDate, scanDays)
+
+  return { facilities, selected, formFields, token3, startDate, endDate, periods }
+}
+
+/**
+ * 单次 SearchCondition 查询，返回该窗口的月视图模型。
+ * 调用后必须紧接着用同一 req 对该期做 Next，再查询下一期。
+ * @param {Function} req - (path, {method, headers, body}) => Response
+ * @param {Array} formFields - SelectDays 页的表单字段
+ * @param {string} token3 - __RequestVerificationToken
+ * @param {string} startDate - 本期开始日期 YYYY-MM-DD
+ * @param {string} displayTerm - SearchCondition.DisplayTerm
+ * @returns {Promise<Array>} AvailabilitySelectDays 数组；查询失败/为空返回 []
+ */
+async function queryMonth(req, formFields, token3, startDate, displayTerm) {
   const fd3 = new URLSearchParams()
   for (const [k, v] of formFields) fd3.set(k, v)
   fd3.set('SearchCondition.StartDate', startDate)
@@ -93,19 +136,25 @@ async function navigateToMonth(req, targets, scanDays) {
   fd3.set('SearchCondition.TimeZone', TIME_ZONE_ALL)
   fd3.set('token', 'null')
   fd3.set('__RequestVerificationToken', token3)
-  res = await req('/user/AvailabilityCheckApplySelectDays/SearchCondition', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: fd3.toString()
-  })
-  const monthBody = await res.text()
-  const month = JSON.parse(monthBody)[1].AvailabilitySelectDays
-  if (!Array.isArray(month) || month.length === 0) {
-    console.log('[edogawa] SearchCondition 返回空')
-    return null
+  let res
+  try {
+    res = await req('/user/AvailabilityCheckApplySelectDays/SearchCondition', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: fd3.toString()
+    })
+  } catch (e) {
+    console.log(`[edogawa] SearchCondition 请求失败 (${startDate}): ${e.message}`)
+    return []
   }
-
-  return { facilities, selected, month, formFields, token3, startDate, endDate, displayTerm }
+  const body = await res.text()
+  try {
+    const month = JSON.parse(body)[1]?.AvailabilitySelectDays
+    return Array.isArray(month) ? month : []
+  } catch {
+    console.log(`[edogawa] SearchCondition 返回异常 (${startDate}): ${body.slice(0, 120)}`)
+    return []
+  }
 }
 
 // ---------- 解析工具 ----------
@@ -275,6 +324,27 @@ function addDaysJst(dateStr, days) {
   return `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(2, '0')}-${String(dt.getUTCDate()).padStart(2, '0')}`
 }
 
+// 所在月份"下个月"的月底，如 2026-08-19 → 2026-09-30
+function endOfNextMonthStr(dateStr) {
+  const [y, m] = dateStr.split('-').map(Number)
+  const nextYear = y + Math.floor(m / 12)
+  const nextMonthIdx = m % 12
+  const e = new Date(Date.UTC(nextYear, nextMonthIdx + 1, 0))
+  return `${e.getUTCFullYear()}-${String(e.getUTCMonth() + 1).padStart(2, '0')}-${String(e.getUTCDate()).padStart(2, '0')}`
+}
+
+// startDate（含）到 endDate（含）的天数
+function daysBetween(startDate, endDate) {
+  const [y1, m1, d1] = startDate.split('-').map(Number)
+  const [y2, m2, d2] = endDate.split('-').map(Number)
+  return Math.round((Date.UTC(y2, m2 - 1, d2) - Date.UTC(y1, m1 - 1, d1)) / 86400000) + 1
+}
+
+// 从 startDate 起覆盖到下个月月底需要的天数（SCAN_UNTIL_NEXT_MONTH_END）
+function daysToEndOfNextMonth(startDate) {
+  return daysBetween(startDate, endOfNextMonthStr(startDate))
+}
+
 // 全角/半角/空白归一化，用于 court 名称匹配
 function normalizeName(s) {
   return String(s || '')
@@ -288,6 +358,8 @@ module.exports = {
   USER_AGENT,
   TIME_ZONE_ALL,
   navigateToMonth,
+  queryMonth,
+  buildPeriodPlan,
   extractToken,
   extractFacilities,
   extractInputs,
@@ -300,5 +372,8 @@ module.exports = {
   minutesBetween,
   todayJst,
   addDaysJst,
+  endOfNextMonthStr,
+  daysBetween,
+  daysToEndOfNextMonth,
   normalizeName
 }
