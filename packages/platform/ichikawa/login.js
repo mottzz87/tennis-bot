@@ -23,18 +23,43 @@ async function handleLoginIfNeeded(page) {
   ])
 }
 
+const ICHI_ERROR_RE = /エラー|error|既に予約|予約されています|予約済み|申込済み|登録済み|予約できません|申込できません|申し込みできません|失敗しました|空きがありません|空きがない|満席|受付終了|時間切れ|セッション/i
+
+function pickIchiError(bodyText) {
+  const t = String(bodyText || '')
+  const line = t.split('\n').map(s => s.trim()).filter(Boolean).find(s => ICHI_ERROR_RE.test(s))
+  return line ? line.slice(0, 200) : ''
+}
+
+// 提交 申込 后必须验证真实结果：成功会跳转完成页，失败会停留在原页/跳错误页显示错误文案。
+// 只有确认成功才返回 ok:true，避免"假预约成功"。
 async function clickApply(page) {
   const btn = page.locator('#ucPCFooter_btnForward')
   const value = await btn.inputValue()
 
-  if (value.includes('申込')) {
-    console.log('[ichikawa] 提交预约')
-    await humanPause()
-    await Promise.all([
-      page.waitForNavigation(),
-      btn.click()
-    ])
+  if (!value.includes('申込')) {
+    return { ok: false, message: '未找到 申込 按钮' }
   }
+
+  console.log('[ichikawa] 提交预约')
+  await humanPause()
+  await Promise.all([
+    page.waitForNavigation({ waitUntil: 'networkidle' }).catch(() => {}),
+    btn.click()
+  ])
+  await sleep(1500)
+
+  const url = page.url()
+  const bodyText = await page.evaluate(() => document.body ? document.body.innerText : '').catch(() => '')
+
+  if (/login/i.test(url)) {
+    return { ok: false, message: '提交时会话失效，被跳转到登录页' }
+  }
+  const errText = pickIchiError(bodyText)
+  if (errText) {
+    return { ok: false, message: `预约未成功: ${errText}` }
+  }
+  return { ok: true, url }
 }
 
 /**

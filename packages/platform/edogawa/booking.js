@@ -7,7 +7,7 @@
  *    → 按拼接序列逐小时勾选目标时段 → 次へ進む → (登录) → 申请明细 → 申込 → 确认弹窗 はい
  */
 const { chromium } = require('playwright')
-const { humanType, humanPause, humanPauseAfterInput, setHumanPauseRange } = require('@tennis-bot/utils')
+const { humanType, humanPause, humanPauseAfterInput, setHumanPauseRange, captureFailureEvidence } = require('@tennis-bot/utils')
 const {
   USER_AGENT,
   navigateToMonth,
@@ -282,7 +282,46 @@ async function fillApplyDetail(page, platformConfig) {
   await humanPause()
 }
 
-// 申込按钮初始 disabled，填完表单后启用；点击后弹确认框，再点 はい
+// 提交后轮询等待 URL 跳转（成功提交 → 服务端重定向到完成页）；超时返回是否已跳转
+async function waitForUrlChange(page, preUrl, timeoutMs = 20000) {
+  const start = Date.now()
+  while (Date.now() - start < timeoutMs) {
+    if (page.url() !== preUrl) return true
+    await page.waitForTimeout(500)
+  }
+  return page.url() !== preUrl
+}
+
+const ERROR_JA_RE = /既に予約|すでに予約|予約されています|予約済み|申込済み|登録済み|申請済み|申込できません|申し込みできません|登録できません|予約できません|受付できません|空きがありません|空きがない|満席|失敗しました|時間切れ|タイムアウト|セッション|選択できません|不備|無効/
+const ERROR_RE = /エラー|error/i
+
+function isErrorLike(text) {
+  const t = String(text || '')
+  return ERROR_JA_RE.test(t) || ERROR_RE.test(t)
+}
+
+function findErrorText(bodyText) {
+  const t = String(bodyText || '')
+  const lines = t.split('\n').map(s => s.trim()).filter(Boolean)
+  for (const re of [ERROR_JA_RE, ERROR_RE]) {
+    const line = lines.find(s => re.test(s))
+    if (line) return line.slice(0, 200)
+  }
+  return ''
+}
+
+const OK_JA_RE = /予約番号|受付番号|予約受付|予約が完了|申込が完了|申し込みが完了|予約完了|申込完了|完了しました|正常に(予約|申込|登録)/
+
+function findSuccessText(bodyText) {
+  const t = String(bodyText || '')
+  const lines = t.split('\n').map(s => s.trim()).filter(Boolean)
+  const line = lines.find(s => OK_JA_RE.test(s))
+  return line ? line.slice(0, 120) : ''
+}
+
+// 申込按钮初始 disabled，填完表单后启用；点击后弹确认框，再点 はい。
+// 点 はい 后必须验证真实结果：成功会跳转完成页，失败会停留在原页显示错误弹窗/文案。
+// 只有确认成功才返回 ok:true，否则报出实际错误，避免"假预约成功"。
 async function submitApply(page) {
   const enabled = await page.waitForFunction(() => {
     const btn = [...document.querySelectorAll('.fixed-bottom ul.buttons button')]
@@ -304,11 +343,47 @@ async function submitApply(page) {
     return { ok: false, message: `未出现确认弹窗, URL: ${page.url()}` }
   }
 
+  const preUrl = page.url()
   await humanPause()
   await confirmBtn.first().click()
-  await page.waitForTimeout(2500)
+
+  // 提交后等待最终结果（跳转或超时），再读取页面状态
+  const urlChanged = await waitForUrlChange(page, preUrl, 20000)
+  await page.waitForTimeout(1500)
   await page.waitForLoadState('networkidle').catch(() => {})
-  return { ok: true, url: page.url() }
+
+  const finalUrl = page.url()
+  const bodyText = await page.evaluate(() => document.body ? document.body.innerText : '').catch(() => '')
+
+  // 1. 会话失效：提交时被跳转到登录页
+  if (/login/i.test(finalUrl)) {
+    return { ok: false, message: '预约未成功（提交时会话失效，被跳转到登录页）' }
+  }
+
+  // 2. 错误弹窗 / 错误文案
+  let modalText = ''
+  try {
+    if (await page.locator('.modal-dialog').count() > 0) {
+      modalText = await page.locator('.modal-dialog').first().innerText()
+    }
+  } catch { modalText = '' }
+  if (isErrorLike(modalText)) {
+    return { ok: false, message: `预约未成功: ${modalText.trim().slice(0, 200)}` }
+  }
+  const errText = findErrorText(bodyText)
+  if (errText) {
+    return { ok: false, message: `预约未成功: ${errText}` }
+  }
+
+  // 3. 成功：URL 跳转完成页 或 页面出现完成文案
+  const okText = findSuccessText(bodyText)
+  if (urlChanged || okText) {
+    return { ok: true, url: finalUrl, note: okText }
+  }
+
+  // 4. 无法确认 → 保守判失败（附页面片段便于排查），不产生假成功记录
+  console.log(`[edogawa] 预约提交后无法确认结果: ${(bodyText || finalUrl).slice(0, 200)}`)
+  return { ok: false, message: `预约结果无法确认（提交后页面未跳转、也无错误提示）: ${(bodyText || finalUrl).slice(0, 150)}` }
 }
 
 // 从申请明细页抓取费用：
@@ -382,10 +457,12 @@ async function bookSlot(adapter, slotData, platformConfig) {
   }
 
   const browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] })
+  const label = `edogawa-${slotData.place}-${slotData.date}-${slotData.time || ''}`
+  let page = null
   try {
     const context = await browser.newContext({ userAgent: USER_AGENT })
     const req = createReq(context, baseUrl)
-    const page = await context.newPage()
+    page = await context.newPage()
 
     // 1. 导航到 SelectDays 页，拿到各期窗口
     const nav = await navigateToMonth(req, [slotData.place], scanDays, startOffset)
@@ -464,11 +541,15 @@ async function bookSlot(adapter, slotData, platformConfig) {
 
     // 8. 提交（含确认弹窗）
     const result = await submitApply(page)
-    if (!result.ok) return { success: false, message: result.message }
+    if (!result.ok) {
+      await captureFailureEvidence(page, label)
+      return { success: false, message: result.message }
+    }
 
     console.log(`[edogawa] 预约成功: ${slotData.place} ${slotData.date} ${slotData.time}`, fee ? `费用 ${fee.total ?? '-'}円` : '')
     return { success: true, message: `已提交预约: ${slotData.place} ${slotData.date} ${slotData.time}`, fee }
   } catch (e) {
+    await captureFailureEvidence(page, label)
     console.log(`[edogawa] 预约失败:`, e.message)
     return { success: false, message: e.message }
   } finally {

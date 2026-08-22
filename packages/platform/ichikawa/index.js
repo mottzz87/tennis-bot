@@ -9,7 +9,7 @@
  * 每个方法自行管理浏览器生命周期
  */
 const { chromium } = require('playwright')
-const { sleep, createTrace, normalizeTimeRange, formatDateDisplayFromIso, setHumanPauseRange } = require('@tennis-bot/utils')
+const { sleep, createTrace, normalizeTimeRange, formatDateDisplayFromIso, setHumanPauseRange, captureFailureEvidence } = require('@tennis-bot/utils')
 const { parsePage } = require('./parser')
 const { clickSlot } = require('./booking')
 const {
@@ -120,9 +120,11 @@ class IchikawaAdapter {
       headless: true,
       args: ['--no-sandbox']
     })
+    const label = `ichikawa-${slotData.place}-${slotData.date}-${slotData.start || ''}`
+    let page = null
 
     try {
-      const page = await browser.newPage()
+      page = await browser.newPage()
 
       // 导航
       await navigateToSports(page, this._baseUrl)
@@ -154,12 +156,18 @@ class IchikawaAdapter {
       ])
 
       await handleLoginIfNeeded(page)
-      await clickApply(page)
+      const applyResult = await clickApply(page)
+      if (!applyResult.ok) {
+        console.log(`[ichikawa] 预约未成功: ${applyResult.message}`)
+        await captureFailureEvidence(page, label)
+        return { success: false, message: applyResult.message }
+      }
 
       console.log(`[ichikawa] 预约成功: ${slotData.place} ${slotData.date} ${slotData.start}`)
       return { success: true, message: '' }
 
     } catch (e) {
+      await captureFailureEvidence(page, label)
       console.log(`[ichikawa] 预约失败:`, e.message)
       return { success: false, message: e.message }
     } finally {

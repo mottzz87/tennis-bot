@@ -1,4 +1,6 @@
 const crypto = require('crypto')
+const fs = require('fs')
+const path = require('path')
 
 // ucode 可能超过 64 字节（含 CJK 场地名），不能直接塞进 Telegram callback_data（上限 64 字节）。
 // 用固定长度 token 代替，服务端再按 token 反查原 ucode。
@@ -191,6 +193,37 @@ async function clickByText(page, text) {
   await page.getByText(text, { exact: false }).first().click()
 }
 
+// 预约失败现场取证：保存最终页面截图 + HTML + URL 到 logs/，便于排查网站实际拒绝原因
+// page 可为 null（浏览器尚未打开/已关闭），此时只记录基本信息
+const LOGS_DIR = process.env.LOGS_DIR || path.resolve(__dirname, '../../logs')
+
+async function captureFailureEvidence(page, label = 'booking', dir = LOGS_DIR) {
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+  const safe = String(label || 'booking').replace(/[\\/:*?"<>|\s]+/g, '_').slice(0, 80)
+  const base = `${stamp}-${safe}`
+  const out = { ts: Date.now(), base, url: '' }
+  const written = []
+  try {
+    fs.mkdirSync(dir, { recursive: true })
+    if (page && typeof page.url === 'function') {
+      out.url = page.url()
+      await page.screenshot({ path: path.join(dir, `${base}.png`), fullPage: true })
+      written.push(`${base}.png`)
+      const html = await page.content().catch(() => '')
+      if (html) {
+        fs.writeFileSync(path.join(dir, `${base}.html`), html, 'utf8')
+        written.push(`${base}.html`)
+      }
+    }
+    fs.writeFileSync(path.join(dir, `${base}.json`), JSON.stringify(out, null, 2), 'utf8')
+    written.push(`${base}.json`)
+    console.log(`[utils] 预约失败取证已保存: ${path.join(dir, base)} (${written.join(', ')})`)
+  } catch (e) {
+    console.log(`[utils] 预约失败取证失败: ${e.message}`)
+  }
+  return out
+}
+
 module.exports = {
   slotToken,
   sleep,
@@ -212,5 +245,6 @@ module.exports = {
   toMinutes,
   createTrace,
   clickByText,
+  captureFailureEvidence,
   WEEKDAY_JP
 }
