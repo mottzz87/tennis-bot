@@ -185,6 +185,66 @@ function formatDateDisplayFromIso(iso) {
   return `${mo}.${String(d).padStart(2, '0')}（${WEEKDAY_JP[dt.getDay()]}${mark}）`
 }
 
+// JST 墙上时间拆分（服务器无时区设置，统一手动 +9h 后用 UTC 取值）
+function jstParts(now = Date.now()) {
+  const d = new Date(now + 9 * 3600 * 1000)
+  return {
+    y: d.getUTCFullYear(),
+    mo: d.getUTCMonth() + 1,
+    d: d.getUTCDate(),
+    h: d.getUTCHours(),
+    mi: d.getUTCMinutes()
+  }
+}
+
+function jstDateKey(now = Date.now()) {
+  const p = jstParts(now)
+  return `${p.y}-${String(p.mo).padStart(2, '0')}-${String(p.d).padStart(2, '0')}`
+}
+
+function parseHHMM(str) {
+  const m = String(str || '').trim().match(/^(\d{1,2}):(\d{2})$/)
+  if (!m) return null
+  const h = Number(m[1])
+  const mi = Number(m[2])
+  if (h > 23 || mi > 59) return null
+  return [h, mi]
+}
+
+// 平台配置 RELEASE_REMINDER → { day, remindMin, windowMin, openAt }；未配置或格式错误返回 null（= 不提醒）
+function normalizeReleaseReminder(cfg) {
+  if (!cfg || typeof cfg !== 'object') return null
+  const day = Number(cfg.DAY)
+  const remind = parseHHMM(cfg.REMIND_AT)
+  if (!Number.isInteger(day) || day < 1 || day > 31 || !remind) return null
+  const windowMin = Number(cfg.WINDOW_MINUTES)
+  return {
+    day,
+    remindMin: remind[0] * 60 + remind[1],
+    windowMin: Number.isFinite(windowMin) && windowMin > 0 ? windowMin : 40,
+    openAt: String(cfg.OPEN_AT || '')
+  }
+}
+
+// 是否处于放号窗口：JST 当月 DAY 日，[REMIND_AT, REMIND_AT + WINDOW_MINUTES)
+function isReleaseWindow(cfg, now = Date.now()) {
+  const r = normalizeReleaseReminder(cfg)
+  if (!r) return false
+  const p = jstParts(now)
+  if (p.d !== r.day) return false
+  const cur = p.h * 60 + p.mi
+  return cur >= r.remindMin && cur < r.remindMin + r.windowMin
+}
+
+// 是否正好到放号提醒时刻（同一分钟）
+function matchReleaseReminderMoment(cfg, now = Date.now()) {
+  const r = normalizeReleaseReminder(cfg)
+  if (!r) return false
+  const p = jstParts(now)
+  if (p.d !== r.day) return false
+  return p.h * 60 + p.mi === r.remindMin
+}
+
 function formatTimeDisplay(time) {
   const raw = String(time || '').trim()
   const parts = raw.split(/[~\-]/)
@@ -271,6 +331,12 @@ module.exports = {
   isJapaneseHoliday,
   isWeekendOrHoliday,
   formatDateDisplayFromIso,
+  jstParts,
+  jstDateKey,
+  parseHHMM,
+  normalizeReleaseReminder,
+  isReleaseWindow,
+  matchReleaseReminderMoment,
   formatTimeDisplay,
   toMinutes,
   createTrace,

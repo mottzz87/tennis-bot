@@ -19,7 +19,7 @@ require('@tennis-bot/config/loadEnv')()
 const http = require('http')
 const { loadPlatform } = require('@tennis-bot/platform')
 const FileStorage = require('@tennis-bot/storage/file/FileStorage')
-const { parseSlotDayKey, parseSlotStartDateTimeSafe, slotToken } = require('@tennis-bot/utils')
+const { parseSlotDayKey, parseSlotStartDateTimeSafe, slotToken, isReleaseWindow } = require('@tennis-bot/utils')
 const ConfigManager = require('@tennis-bot/config')
 const path = require('path')
 
@@ -120,6 +120,15 @@ async function handleBook(body) {
   const platformConfig = config.getMergedConfig(platformName)
   if (platformConfig.enabled === false) {
     return { success: false, message: `平台 ${platformName} 未启用` }
+  }
+
+  // 放号窗口内临时改用 RELEASE_REMINDER 里的操作停顿（放号瞬间抢场用）；平台 adapter 在 book() 里读这几个值
+  const rr = platformConfig.RELEASE_REMINDER
+  if (isReleaseWindow(rr)) {
+    if (rr.HUMAN_DELAY_MIN != null) platformConfig.HUMAN_DELAY_MIN = Number(rr.HUMAN_DELAY_MIN)
+    if (rr.HUMAN_DELAY_MAX != null) platformConfig.HUMAN_DELAY_MAX = Number(rr.HUMAN_DELAY_MAX)
+    if (rr.HUMAN_INPUT_EXTRA_MS != null) platformConfig.HUMAN_INPUT_EXTRA_MS = Number(rr.HUMAN_INPUT_EXTRA_MS)
+    console.log(`[booking-service] 放号窗口内 ${platformName}，操作停顿临时改为 ${platformConfig.HUMAN_DELAY_MIN}/${platformConfig.HUMAN_DELAY_MAX}ms`)
   }
 
   busy = true

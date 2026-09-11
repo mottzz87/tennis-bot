@@ -32,7 +32,11 @@ const FileStorage = require('@tennis-bot/storage/file/FileStorage')
 const ConfigManager = require('@tennis-bot/config')
 const core = require('@tennis-bot/core')
 const { formatSlotText, escapeMarkdown } = require('@tennis-bot/notifier')
-const { createTrace, parseSlotStartDateTimeSafe, parseSlotDayKey, formatDateDisplayFromIso, isWeekendOrHoliday, slotToken } = require('@tennis-bot/utils')
+const {
+  createTrace, parseSlotStartDateTimeSafe, parseSlotDayKey, formatDateDisplayFromIso,
+  isWeekendOrHoliday, slotToken,
+  jstDateKey, isReleaseWindow, matchReleaseReminderMoment
+} = require('@tennis-bot/utils')
 
 const DATA_DIR = process.env.MONITOR_DATA_DIR || path.resolve(__dirname, '../../data')
 const PORT = process.env.MONITOR_PORT || 3000
@@ -78,6 +82,7 @@ for (const name of config.getPlatformNames()) {
     paused: false,        // 本平台暂停
     nextRunAt: null,
     pendingManual: false, // 手动全量扫描请求在任务进行中时排队，结束后立即执行
+    pendingManualOptions: null, // 排队中的手动扫描参数（如 { releaseReminder: true }）
     lastCycleStartAt: null, // 上一轮扫描周期的启动时间（周期起点调度用）
     rawCells: [],         // 本平台最近一次扫描合并前的原始小时格（按需重合并用）
     lastSet: new Set()    // 只含本平台的 uid（diff 基线）
@@ -429,6 +434,54 @@ function sortWeekendOrHolidayFirst(list) {
   })
 }
 
+// ========================
+// 月度放号提醒（RELEASE_REMINDER，未配置 = 不提醒）
+// ========================
+// 已提醒过的 JST 日期（platform → 'YYYY-MM-DD'），同一分钟内轮询不会重复触发
+const releaseRemindedDay = new Map()
+
+function getReleaseReminderConfig(name) {
+  return config.getMergedConfig(name).RELEASE_REMINDER
+}
+
+function inReleaseWindow(name) {
+  return isReleaseWindow(getReleaseReminderConfig(name))
+}
+
+// 放号时刻：先发一条提醒（说明现在只能看、到点才能提交），再立刻重扫一次只推周末/祝日
+async function triggerReleaseReminder(name, rr) {
+  const b = getBotForPlatform(name)
+  const chatId = getPlatformChatId(name)
+  const openAt = rr?.OPEN_AT ? `${rr.OPEN_AT} 正式开放` : '即将开放'
+  if (b && chatId) {
+    try {
+      await b.sendMessage(
+        chatId,
+        `⏰ *放号提醒*\n━━━━━━━━━━━━━━\n${openAt}：新时段已放出，但按钮/输入框暂时还不能提交。\n` +
+        `下面先推周末/祝日空位，到点再点预约。`,
+        { parse_mode: 'Markdown' }
+      )
+    } catch (e) {
+      console.log(`[放号提醒] ${name} 提醒发送失败:`, e.message)
+    }
+  }
+  await requestManualScan(name, { releaseReminder: true })
+}
+
+// 每 30s 轮询一次：到 REMIND_AT 那一分钟触发（每天最多一次）
+function checkReleaseReminders() {
+  const now = Date.now()
+  const dayKey = jstDateKey(now)
+  for (const name of activePlatformNames()) {
+    const rr = getReleaseReminderConfig(name)
+    if (!matchReleaseReminderMoment(rr, now)) continue
+    if (releaseRemindedDay.get(name) === dayKey) continue
+    releaseRemindedDay.set(name, dayKey)
+    console.log(`[放号提醒] ${name} 触发（${dayKey} ${rr.REMIND_AT}）`)
+    triggerReleaseReminder(name, rr).catch(e => console.log(`[放号提醒] ${name} 失败:`, e.message))
+  }
+}
+
 // 场地摘要一行：场地名出现一次，组计数内联（"🎯 西葛西（硬地 ×3 ・ 人工芝 ×13）"），无组只显示场地
 function placeSummaryLine(place, slots, platformConfig) {
   const counts = new Map()
@@ -445,7 +498,10 @@ function placeSummaryLine(place, slots, platformConfig) {
   return `${base}（${labels.map(g => g ? `${g} ×${counts.get(g)}` : `其他 ×${counts.get(g)}`).join(' ・ ')}）`
 }
 
-async function sendTelegram(data, version, title = '🆕 可预约（点击直接预约）') {
+// 放号窗口内的推送只保留周末/祝日（数据量小）；diff 基线（lastSet）仍用全量，
+// 否则窗口内大量平日 slot 会被当成"减少"，窗口结束后又当成"新增"重复推送。
+async function sendTelegram(data, version, title = '🆕 可预约（点击直接预约）', options = {}) {
+  const { weekendOnly = false } = options
   const grouped = groupSlotsByPlatform(data)
 
   for (const [platform, slots] of grouped) {
@@ -457,7 +513,9 @@ async function sendTelegram(data, version, title = '🆕 可预约（点击直�
       continue
     }
     const platformConfig = config.getPlatform(platform)
-    const list = sortSlots(slots).slice(0, maxPush)
+    const picked = weekendOnly ? slots.filter(d => isWeekendOrHoliday(d)) : slots
+    const list = sortSlots(picked).slice(0, maxPush)
+    if (list.length === 0) continue
 
     // 按场地分组（空位多的场地一个"查看空位"按钮；场地内硬地/人工芝在摘要行内联）
     const byPlace = new Map()
@@ -516,7 +574,8 @@ async function sendTelegram(data, version, title = '🆕 可预约（点击直�
   }
 }
 
-async function sendRemovedTelegram(data) {
+async function sendRemovedTelegram(data, options = {}) {
+  const { weekendOnly = false } = options
   const grouped = groupSlotsByPlatform(data)
 
   for (const [platform, slots] of grouped) {
@@ -526,8 +585,10 @@ async function sendRemovedTelegram(data) {
       console.log(`[通知] ${platform} 未配置 Bot Token 或 Chat ID，跳过`)
       continue
     }
+    const picked = weekendOnly ? slots.filter(d => isWeekendOrHoliday(d)) : slots
+    if (picked.length === 0) continue
     const maxPush = config.getEffective('MAX_PUSH', platform) || 100
-    const msg = sortSlots(slots).slice(0, maxPush)
+    const msg = sortSlots(picked).slice(0, maxPush)
       .map(d => `⚠️ 已被预约\n${formatSlotText(d, getPlatformConfig(d.place))}`)
       .join('\n\n')
     for (const part of core.splitForTelegram(msg)) {
@@ -566,7 +627,8 @@ async function callBookingService(slotData, platformName) {
 //
 // 与定时扫描共用 scanning 守卫：若当前正在扫描/auto-book，不丢弃请求，
 // 而是置 pendingManual，当前任务结束后立即执行一次手动全量扫描。
-async function runManualScan(platformName) {
+async function runManualScan(platformName, options = {}) {
+  const { releaseReminder = false } = options
   const st = runtime[platformName]
   const platformConfig = config.getPlatform(platformName)
   st.scanning = true
@@ -580,18 +642,21 @@ async function runManualScan(platformName) {
     const enriched = enrichSlots(slots, platformName, platformConfig)
     const filtered = core.filterSlotsByConfig(enriched, platformConfig)
 
+    const weekendOnly = releaseReminder || inReleaseWindow(platformName)
+    const title = releaseReminder ? '⏰ 放号 · 周末/祝日空位（到点再点预约）' : undefined
+    const b = getBotForPlatform(platformName)
+    const chatId = getPlatformChatId(platformName)
+
     if (filtered.length > 0) {
-      await sendTelegram(filtered, Date.now())
-    } else {
-      const b = getBotForPlatform(platformName)
-      const chatId = getPlatformChatId(platformName)
-      if (b && chatId) {
-        await b.sendMessage(
-          chatId,
-          `📭 *暂无可预约*\n━━━━━━━━━━━━━━\n可以稍后再试 /run`,
-          { parse_mode: 'Markdown' }
-        )
-      }
+      await sendTelegram(filtered, Date.now(), title, { weekendOnly })
+    } else if (b && chatId) {
+      await b.sendMessage(
+        chatId,
+        releaseReminder
+          ? `📭 *窗口内暂无周末/祝日空位*\n━━━━━━━━━━━━━━\n继续按间隔自动重扫`
+          : `📭 *暂无可预约*\n━━━━━━━━━━━━━━\n可以稍后再试 /run`,
+        { parse_mode: 'Markdown' }
+      )
     }
   } catch (e) {
     console.log(`[手动] ${platformName} 扫描失败:`, e.message)
@@ -602,7 +667,7 @@ async function runManualScan(platformName) {
 }
 
 // 手动请求入口：正在扫描/auto-book 则排队，否则立即执行全量扫描
-async function requestManualScan(platformName) {
+async function requestManualScan(platformName, options = {}) {
   const st = runtime[platformName]
   if (!st) return
   const platformConfig = config.getPlatform(platformName)
@@ -613,10 +678,11 @@ async function requestManualScan(platformName) {
 
   if (st.scanning || st.autoBooking) {
     st.pendingManual = true
+    st.pendingManualOptions = options
     console.log(`[手动] ${platformName} 当前任务进行中，手动全量扫描已排队（结束后立即执行）`)
     return
   }
-  await runManualScan(platformName)
+  await runManualScan(platformName, options)
 }
 
 // 当前任务结束后，若期间有手动请求 → 立即执行一次手动全量扫描（不丢弃用户请求）
@@ -624,8 +690,10 @@ async function drainPendingManual(platformName) {
   const st = runtime[platformName]
   if (!st || !st.pendingManual) return
   st.pendingManual = false
+  const options = st.pendingManualOptions || {}
+  st.pendingManualOptions = null
   console.log(`[手动] ${platformName} 执行排队的手动全量扫描`)
-  await runManualScan(platformName)
+  await runManualScan(platformName, options)
 }
 
 // ========================
@@ -759,6 +827,9 @@ async function scanPlatform(name, options = {}) {
     const enriched = enrichSlots(slots, name, platformConfig)
     const filtered = core.filterSlotsByConfig(enriched, platformConfig)
 
+    // 放号窗口内推送只保留周末/祝日（diff 仍用全量 filtered，避免窗口前后重复推/误报减少）
+    const weekendOnly = inReleaseWindow(name)
+
     // 合并全局状态：先删本平台旧切片再并入（同步块，await 之间原子）
     const newMap = new Map(currentSlotMap)
     for (const key of [...newMap.keys()]) {
@@ -777,7 +848,7 @@ async function scanPlatform(name, options = {}) {
       console.log(`[MONITOR][${name.toUpperCase()}][${trace}] 首次运行 ${filtered.length} 空位 · ${formatDuration(Date.now() - scanStart)}`)
       if (config.getEffective('PUSH_ON_INIT', name) !== false) {
         if (filtered.length > 0) {
-          await sendTelegram(filtered, currentVersion)
+          await sendTelegram(filtered, currentVersion, undefined, { weekendOnly })
         } else {
           await sendNoSlotsMessageFor(name)
         }
@@ -801,7 +872,7 @@ async function scanPlatform(name, options = {}) {
       if (forcePush) {
         console.log(`[MONITOR][${name.toUpperCase()}][${trace}] FORCE_PUSH 强制推送 ${filtered.length}`)
         if (filtered.length > 0) {
-          await sendTelegram(filtered, currentVersion)
+          await sendTelegram(filtered, currentVersion, undefined, { weekendOnly })
         } else {
           await sendNoSlotsMessageFor(name)
         }
@@ -819,14 +890,14 @@ async function scanPlatform(name, options = {}) {
     if (added.length > 0) {
       if (config.getEffective('NOTIFY_ADDED', name) !== false) {
         console.log(`[MONITOR][${name.toUpperCase()}][${trace}] PUSH 发送新增通知 ${added.length}`)
-        await sendTelegram(added, currentVersion, '✨ 有新场地！点击直接预约')
+        await sendTelegram(added, currentVersion, '✨ 有新场地！点击直接预约', { weekendOnly })
       }
       await autoBookPlatform(name, added, platformConfig, trace)
     }
 
     if (removed.length > 0 && config.getEffective('NOTIFY_REMOVED', name) !== false) {
       // console.log(`[MONITOR][${name.toUpperCase()}][${trace}] PUSH 发送减少通知 ${removed.length}`)
-      await sendRemovedTelegram(removed)
+      await sendRemovedTelegram(removed, { weekendOnly })
     }
   } catch (e) {
     console.log(`[MONITOR][${name.toUpperCase()}][${trace}] 扫描失败:`, e.message)
@@ -1149,6 +1220,15 @@ async function start() {
   for (const name of names) {
     schedulePlatform(name)
   }
+
+  // 放号提醒：每 30s 轮询一次（只有配置了 RELEASE_REMINDER 的平台会命中）。
+  // 配置可能之后通过 /set 增删，所以轮询常驻，不在启动时按当时配置裁剪。
+  const reminderNames = names.filter(n => getReleaseReminderConfig(n))
+  console.log(`[monitor-service] 放号提醒: ${reminderNames.length > 0
+    ? reminderNames.map(n => `${n} ${JSON.stringify(getReleaseReminderConfig(n))}`).join(' · ')
+    : '未配置（可在平台配置里加 RELEASE_REMINDER）'}`)
+  checkReleaseReminders()
+  setInterval(checkReleaseReminders, 30 * 1000)
 
   // 清理旧日志
   setInterval(() => cleanOldLogs(30), 24 * 60 * 60 * 1000)

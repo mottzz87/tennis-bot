@@ -530,6 +530,8 @@ function registerHandlers(bot) {
     { command: 'run', description: '🚀 立即扫描' },
     { command: 'listplace', description: '📍 场地开关' },
     { command: 'schedule', description: '📅 预约日程' },
+    { command: 'h3', description: '⏱️ 连续 ≥3h 空位' },
+    { command: 'h4', description: '⏱️ 连续 ≥4h 空位' },
     { command: 'panel', description: '🎛️ 控制面板' },
     { command: 'config', description: '⚙️ 查看配置' },
     { command: 'log', description: '📋 查看日志' },
@@ -550,6 +552,10 @@ function registerHandlers(bot) {
       [
         { text: '⏸️ 暂停监控', callback_data: 'quick_pause' },
         { text: '▶️ 恢复监控', callback_data: 'quick_resume' }
+      ],
+      [
+        { text: '⏱️ 连续≥3h', callback_data: 'quick_min3' },
+        { text: '⏱️ 连续≥4h', callback_data: 'quick_min4' }
       ]
     ]
   })
@@ -559,7 +565,8 @@ function registerHandlers(bot) {
     keyboard: [
       [{ text: '📊 系统状态' }, { text: '📈 抢场统计' }],
       [{ text: '📅 预约日程' }, { text: '📚 预约记录' }],
-      [{ text: '⏸️ 暂停监控' }, { text: '▶️ 恢复监控' }]
+      [{ text: '⏸️ 暂停监控' }, { text: '▶️ 恢复监控' }],
+      [{ text: '⏱️ 连续≥3h' }, { text: '⏱️ 连续≥4h' }]
     ],
     resize_keyboard: true
   })
@@ -588,9 +595,11 @@ function registerHandlers(bot) {
     '📅 预约日程': quickSchedule,
     '📚 预约记录': quickBooked,
     '⏸️ 暂停监控': quickPause,
-    '▶️ 恢复监控': quickResume
+    '▶️ 恢复监控': quickResume,
+    '⏱️ 连续≥3h': (bot, chatId) => showMinPlacePicker(bot, chatId, 3),
+    '⏱️ 连续≥4h': (bot, chatId) => showMinPlacePicker(bot, chatId, 4)
   }
-  bot.onText(/^(📊 系统状态|📈 抢场统计|📅 预约日程|📚 预约记录|⏸️ 暂停监控|▶️ 恢复监控)$/, async (msg) => {
+  bot.onText(/^(📊 系统状态|📈 抢场统计|📅 预约日程|📚 预约记录|⏸️ 暂停监控|▶️ 恢复监控|⏱️ 连续≥3h|⏱️ 连续≥4h)$/, async (msg) => {
     if (!isAdmin(msg)) return
     await trayActions[msg.text]?.(bot, msg.chat.id)
   })
@@ -721,6 +730,16 @@ function registerHandlers(bot) {
     }
   })
   
+  bot.onText(/\/h3\b/, async (msg) => {
+    if (!isAdmin(msg)) return
+    await showMinPlacePicker(bot, msg.chat.id, 3)
+  })
+
+  bot.onText(/\/h4\b/, async (msg) => {
+    if (!isAdmin(msg)) return
+    await showMinPlacePicker(bot, msg.chat.id, 4)
+  })
+
   bot.onText(/\/stats/, async (msg) => {
     if (!isAdmin(msg)) return
     try {
@@ -891,6 +910,7 @@ function registerHandlers(bot) {
       `/listplace  场地开关\n` +
       `/booked  预约记录（可加条数，如 /booked 20）\n` +
       `/schedule  预约日程\n` +
+      `/h3 · /h4  按连续 ≥3h / ≥4h 看某场地空位（临时阈值，不改配置）\n` +
       `/stats  抢场统计\n` +
       `/pause · /resume  暂停/恢复定时扫描\n\n` +
       `【说明】\n` +
@@ -946,6 +966,29 @@ function registerHandlers(bot) {
     }
   }
 
+  // 菜单里的「连续≥Nh」入口：先选场地，再按 min 重合并查看（不改配置，只影响本次查看）
+  async function showMinPlacePicker(bot, chatId, min) {
+    try {
+      const res = await monitorApi('GET', '/api/places')
+      const places = filterPlacesByBot(res.data?.places || [], bot).filter(p => p.enabled)
+      if (places.length === 0) {
+        await bot.sendMessage(chatId, '📍 暂无可查询的场地（先开启监控）')
+        return
+      }
+      const rows = places.map(p => ([{
+        text: `${p.emoji} ${p.short}`,
+        callback_data: `minplace|${min}|${p.platform}|${p.name}`
+      }]))
+      await bot.sendMessage(chatId,
+        `⏱️ *连续 ≥${min}h* · 选择场地\n（临时阈值，不改配置；自动抓取仍按配置的连续时长）`, {
+          parse_mode: 'Markdown',
+          reply_markup: { inline_keyboard: rows }
+        })
+    } catch (e) {
+      await bot.sendMessage(chatId, `❌ 获取场地列表失败: ${e.message}`)
+    }
+  }
+
   bot.on('callback_query', async (query) => {
     const data = query.data
     const chatId = query.message?.chat?.id || ADMIN_ID
@@ -993,6 +1036,13 @@ function registerHandlers(bot) {
       return
     }
   
+    if (data === 'quick_min3' || data === 'quick_min4') {
+      const min = data === 'quick_min3' ? 3 : 4
+      await bot.answerCallbackQuery(query.id, { text: `⏱️ 连续 ≥${min}h` })
+      await showMinPlacePicker(bot, chatId, min)
+      return
+    }
+
     if (data === 'quick_place') {
       await bot.answerCallbackQuery(query.id, { text: '📍 打开面板' })
       try {
@@ -1069,6 +1119,24 @@ function registerHandlers(bot) {
           slots: res.data?.slots || [],
           snapshotToken: token,
           min
+        })
+      } catch (e) {
+        await bot.sendMessage(chatId, `❌ 获取场地数据失败：${e.message}`)
+      }
+      return
+    }
+
+    // --- 菜单「连续≥Nh」选场地后：按 min 重合并该场地空位（必须排在通用 '|' 分支之前） ---
+    if (data.startsWith('minplace|')) {
+      const [, minStr, platform, ...rest] = data.split('|')
+      const place = rest.join('|')
+      const min = Number(minStr) || 0
+      await bot.answerCallbackQuery(query.id, { text: `⏱️ 连续 ≥${min}h` })
+      try {
+        const res = await monitorApi('GET',
+          `/api/place/${encodeURIComponent(platform)}/${encodeURIComponent(place)}?min=${min}`)
+        await sendPlaceView(bot, chatId, {
+          platform, place, slots: res.data?.slots || [], snapshotToken: null, min
         })
       } catch (e) {
         await bot.sendMessage(chatId, `❌ 获取场地数据失败：${e.message}`)
