@@ -32,7 +32,7 @@ const FileStorage = require('@tennis-bot/storage/file/FileStorage')
 const ConfigManager = require('@tennis-bot/config')
 const core = require('@tennis-bot/core')
 const { formatSlotText, escapeMarkdown } = require('@tennis-bot/notifier')
-const { createTrace, parseSlotStartDateTimeSafe, parseSlotDayKey, formatDateDisplayFromIso, slotToken } = require('@tennis-bot/utils')
+const { createTrace, parseSlotStartDateTimeSafe, parseSlotDayKey, formatDateDisplayFromIso, isWeekendOrHoliday, slotToken } = require('@tennis-bot/utils')
 
 const DATA_DIR = process.env.MONITOR_DATA_DIR || path.resolve(__dirname, '../../data')
 const PORT = process.env.MONITOR_PORT || 3000
@@ -79,6 +79,7 @@ for (const name of config.getPlatformNames()) {
     nextRunAt: null,
     pendingManual: false, // 手动全量扫描请求在任务进行中时排队，结束后立即执行
     lastCycleStartAt: null, // 上一轮扫描周期的启动时间（周期起点调度用）
+    rawCells: [],         // 本平台最近一次扫描合并前的原始小时格（按需重合并用）
     lastSet: new Set()    // 只含本平台的 uid（diff 基线）
   }
 }
@@ -348,14 +349,39 @@ function placeEmoji(place) { return placeMeta(place).emoji || '🎾' }
 // "查看空位"按钮对应的推送快照：点击只显示本次推送的 slot，而不是场地当前全部空位
 const pushSnapshots = new Map()
 const PUSH_SNAPSHOT_TTL = 30 * 60 * 1000
-function storePushSnapshot({ platform, place, slots }) {
+function storePushSnapshot({ platform, place, slots, rawCells }) {
   const token = `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
   const now = Date.now()
-  pushSnapshots.set(token, { platform, place, slots, ts: now })
+  pushSnapshots.set(token, { platform, place, slots, rawCells: rawCells || [], ts: now })
   for (const [k, v] of pushSnapshots) {
     if (now - v.ts > PUSH_SNAPSHOT_TTL) pushSnapshots.delete(k)
   }
   return token
+}
+
+// 按临时阈值重合并出的 slot 不在 currentSlotMap 里，单独登记以便 /api/slot 反查到它完成预约
+const ephemeralSlots = new Map()
+const EPHEMERAL_SLOT_TTL = 30 * 60 * 1000
+function registerEphemeralSlots(slots) {
+  const now = Date.now()
+  for (const d of slots) ephemeralSlots.set(d.ucode, { slot: d, ts: now })
+  for (const [k, v] of ephemeralSlots) {
+    if (now - v.ts > EPHEMERAL_SLOT_TTL) ephemeralSlots.delete(k)
+  }
+}
+
+// 用某场地的原始小时格按指定阈值重新合并，等价于「把 MIN_CONTINUOUS_HOURS 临时当成 hours」：
+// merge → enrich → filter → 周末/祝日优先，与定时扫描同一管线，只是阈值来自本次请求。
+// 仅在本次请求内生效，不写配置、不影响自动抓取。
+function rematchPlaceSlots(platform, place, hours, rawCells) {
+  const platformConfig = config.getPlatform(platform)
+  const raw = (rawCells || []).filter(s => s.place === place)
+  if (raw.length === 0) return []
+  const golden = Array.isArray(platformConfig.GOLDEN_TIME_FILTER) ? platformConfig.GOLDEN_TIME_FILTER : []
+  const merged = core.mergeContiguousSlots(raw, Number(hours) * 60, golden)
+  const filtered = core.filterSlotsByConfig(enrichSlots(merged, platform, platformConfig), platformConfig)
+  registerEphemeralSlots(filtered)
+  return sortWeekendOrHolidayFirst(filtered)
 }
 
 // 分批发送 book 按钮（每批 MAX_INLINE_BUTTONS 个）
@@ -379,23 +405,23 @@ function sectionGroupOf(d, platformConfig) {
   return ''
 }
 
-// 是否周末（土/日）
-function isWeekend(d) {
-  const m = String(d.dateDisplay || '').match(/[（(]([月火水木金土日])[）)]/)
-  if (m) return m[1] === '土' || m[1] === '日'
-  if (/^\d{4}-\d{2}-\d{2}$/.test(String(d.date || ''))) {
-    const [y, mo, day] = String(d.date).split('-').map(Number)
-    const w = new Date(y, mo - 1, day).getDay()
-    return w === 0 || w === 6
-  }
-  return false
+// 统一 slot 归一化：补时间串、日期显示（祝日带「祝」）、ucode、uid。
+// 定时扫描、手动扫描、按阈值重合并三处共用，保证同一 slot 在各路径下标识一致。
+function enrichSlots(slots, platformName, platformConfig) {
+  return slots.map(s => {
+    const time = s.time || `${s.start}-${s.end}`
+    const dateDisplay = formatDateDisplayFromIso(s.date) || s.dateDisplay || ''
+    const ucode = core.buildUcode({ ...s, time, dateDisplay }, platformConfig)
+    const uid = `${s.place}_${s.court}_${s.date}_${time}`
+    return { ...s, platform: s.platform || platformName, time, dateDisplay, ucode, uid }
+  })
 }
 
-// 周末在前，周末/平日各自按 日期+时间 先后
-function sortWeekendFirst(list) {
+// 周末/祝日在前，周末/祝日与平日各自按 日期+时间 先后
+function sortWeekendOrHolidayFirst(list) {
   return list.slice().sort((a, b) => {
-    const wa = isWeekend(a) ? 0 : 1
-    const wb = isWeekend(b) ? 0 : 1
+    const wa = isWeekendOrHoliday(a) ? 0 : 1
+    const wb = isWeekendOrHoliday(b) ? 0 : 1
     if (wa !== wb) return wa - wb
     const ta = `${a.date || ''} ${a.start || a.time || ''}`
     const tb = `${b.date || ''} ${b.start || b.time || ''}`
@@ -443,14 +469,14 @@ async function sendTelegram(data, version, title = '🆕 可预约（点击直�
 
     // 单场地且空位少 → 直接全部 book 按钮（周末在前，保持一键预约）
     if (places.length === 1 && list.length <= MAX_INLINE_BUTTONS) {
-      await sendBookButtons(botInstance, chatId, sortWeekendFirst(list), title)
+      await sendBookButtons(botInstance, chatId, sortWeekendOrHolidayFirst(list), title)
       continue
     }
 
     // 多场地 → 两级导航：第一个场地直接给 book 按钮（周末在前），其余场地：
     //   空位少（≤ MAX_INLINE_BUTTONS）→ 直接铺 book 按钮；空位多 → "查看空位"按钮（点击只显示本次推送的 slot）
     const firstPlace = places[0]
-    const firstSlots = sortWeekendFirst(byPlace.get(firstPlace))
+    const firstSlots = sortWeekendOrHolidayFirst(byPlace.get(firstPlace))
     await sendBookButtons(
       botInstance,
       chatId,
@@ -464,7 +490,7 @@ async function sendTelegram(data, version, title = '🆕 可预约（点击直�
       await sendBookButtons(
         botInstance,
         chatId,
-        sortWeekendFirst(pSlots),
+        sortWeekendOrHolidayFirst(pSlots),
         `${title}\n━━━━━━━━━━━━━━\n${placeEmoji(p)} ${placeShort(p)}（${pSlots.length} 个）`
       )
     }
@@ -474,7 +500,12 @@ async function sendTelegram(data, version, title = '🆕 可预约（点击直�
       const restRows = collapsed.map(p => placeSummaryLine(p, byPlace.get(p), platformConfig))
       const restButtons = collapsed.map(p => [{
         text: `🔍 ${placeShort(p)}（${byPlace.get(p).length}）查看空位`,
-        callback_data: `viewplace_${storePushSnapshot({ platform, place: p, slots: byPlace.get(p) })}`
+        callback_data: `viewplace_${storePushSnapshot({
+          platform,
+          place: p,
+          slots: byPlace.get(p),
+          rawCells: (runtime[platform]?.rawCells || []).filter(s => s.place === p)
+        })}`
       }])
       await botInstance.sendMessage(
         chatId,
@@ -543,15 +574,10 @@ async function runManualScan(platformName) {
     const adapter = loadPlatform(platformName)
     if (!adapter) return
     const slots = await adapter.fetchSlots(platformConfig)
+    st.rawCells = Array.isArray(adapter.rawCells) ? adapter.rawCells : []
     console.log(`[手动] ${platformName} 获取 ${slots.length} 个空位`)
 
-    const enriched = slots.map(s => {
-      const time = s.time || `${s.start}-${s.end}`
-      const dateDisplay = s.dateDisplay || formatDateDisplayFromIso(s.date)
-      const ucode = core.buildUcode({ ...s, time, dateDisplay }, platformConfig)
-      const uid = `${s.place}_${s.court}_${s.date}_${time}`
-      return { ...s, time, dateDisplay, ucode, uid }
-    })
+    const enriched = enrichSlots(slots, platformName, platformConfig)
     const filtered = core.filterSlotsByConfig(enriched, platformConfig)
 
     if (filtered.length > 0) {
@@ -728,14 +754,9 @@ async function scanPlatform(name, options = {}) {
   const scanStart = Date.now()
   try {
     const slots = await adapter.fetchSlots(platformConfig)
+    st.rawCells = Array.isArray(adapter.rawCells) ? adapter.rawCells : []
 
-    const enriched = slots.map(s => {
-      const time = s.time || `${s.start}-${s.end}`
-      const dateDisplay = s.dateDisplay || formatDateDisplayFromIso(s.date)
-      const ucode = core.buildUcode({ ...s, time, dateDisplay }, platformConfig)
-      const uid = `${s.place}_${s.court}_${s.date}_${time}`
-      return { ...s, platform: name, time, dateDisplay, ucode, uid }
-    })
+    const enriched = enrichSlots(slots, name, platformConfig)
     const filtered = core.filterSlotsByConfig(enriched, platformConfig)
 
     // 合并全局状态：先删本平台旧切片再并入（同步块，await 之间原子）
@@ -1017,32 +1038,58 @@ const server = http.createServer(async (req, res) => {
       return json(res, { lines: logBuffer.slice(-n) })
     }
 
-    // GET /api/place/:platform/:place — 某场地当前空位（兼容旧推送按钮，周末在前）
+    // GET /api/place/:platform/:place[?min=3] — 某场地当前空位（兼容旧推送按钮，周末/祝日在前）
+    //   min 省略 → 用配置阈值合并的结果；min=3 → 用原始格按 3h 临时重合并（不改配置）
     if (req.method === 'GET' && pathname.startsWith('/api/place/')) {
       const parts = decodeURIComponent(pathname.replace('/api/place/', '')).split('/')
       const platform = parts[0]
       const place = parts.slice(1).join('/')
-      const slots = sortWeekendFirst((currentData || []).filter(s =>
+      const minHours = Number(url.searchParams.get('min')) || 0
+      if (minHours > 0) {
+        return json(res, {
+          success: true,
+          min: minHours,
+          slots: rematchPlaceSlots(platform, place, minHours, runtime[platform]?.rawCells)
+        })
+      }
+      const slots = sortWeekendOrHolidayFirst((currentData || []).filter(s =>
         s.platform === platform && s.place === place
       ))
       return json(res, { success: true, slots })
     }
 
-    // GET /api/push-snapshot/:token — 推送"查看空位"按钮对应的快照（只含本次推送的 slot，周末在前）
+    // GET /api/push-snapshot/:token[?min=3] — 推送"查看空位"按钮对应的快照（只含本次推送的 slot，周末/祝日在前）
+    //   min 省略 → 本次推送的合并结果；min=3 → 用该快照留存的原始格按 3h 临时重合并
     if (req.method === 'GET' && pathname.startsWith('/api/push-snapshot/')) {
       const token = decodeURIComponent(pathname.replace('/api/push-snapshot/', ''))
       const snap = pushSnapshots.get(token)
       if (!snap) return json(res, { success: false, message: '该推送已过期，请等待下次推送' }, 404)
-      return json(res, { success: true, platform: snap.platform, place: snap.place, slots: sortWeekendFirst(snap.slots) })
+      const minHours = Number(url.searchParams.get('min')) || 0
+      if (minHours > 0) {
+        const raw = snap.rawCells?.length ? snap.rawCells : runtime[snap.platform]?.rawCells
+        return json(res, {
+          success: true,
+          platform: snap.platform,
+          place: snap.place,
+          min: minHours,
+          slots: rematchPlaceSlots(snap.platform, snap.place, minHours, raw)
+        })
+      }
+      return json(res, { success: true, platform: snap.platform, place: snap.place, slots: sortWeekendOrHolidayFirst(snap.slots) })
     }
 
     // GET /api/slot/:id（id 为完整 ucode 或 slotToken，按钮只传 token 以规避 callback_data 64 字节限制）
     if (req.method === 'GET' && pathname.startsWith('/api/slot/')) {
       const id = decodeURIComponent(pathname.replace('/api/slot/', ''))
-      let slot = currentSlotMap.get(id)
+      let slot = currentSlotMap.get(id) || ephemeralSlots.get(id)?.slot
       if (!slot) {
         for (const s of currentSlotMap.values()) {
           if (slotToken(s.ucode) === id) { slot = s; break }
+        }
+      }
+      if (!slot) {
+        for (const e of ephemeralSlots.values()) {
+          if (slotToken(e.slot.ucode) === id) { slot = e.slot; break }
         }
       }
       if (!slot) {

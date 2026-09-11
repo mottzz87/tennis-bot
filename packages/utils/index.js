@@ -1,6 +1,7 @@
 const crypto = require('crypto')
 const fs = require('fs')
 const path = require('path')
+const holidayJp = require('@holiday-jp/holiday_jp')
 
 // ucode 可能超过 64 字节（含 CJK 场地名），不能直接塞进 Telegram callback_data（上限 64 字节）。
 // 用固定长度 token 代替，服务端再按 token 反查原 ucode。
@@ -149,12 +150,39 @@ function normalizeTimeRange(timeStr) {
 
 const WEEKDAY_JP = ['日', '月', '火', '水', '木', '金', '土']
 
+// 日本法定祝日（含振替休日/国民の休日）。数据表随包本地打包，不发起网络请求。
+function isJapaneseHoliday(iso) {
+  const s = String(iso || '').trim()
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return false
+  const [y, mo, d] = s.split('-').map(Number)
+  return !!holidayJp.isHoliday(new Date(y, mo - 1, d))
+}
+
+// 是否周末（土/日）或日本祝日：星期取自 dateDisplay 或 ISO 日期，祝日以 ISO 日期查表为准
+// （dateDisplay 可能是不带「祝」的旧数据，所以「祝」标记只作为补充，不能只看它）
+function isWeekendOrHoliday(d) {
+  const display = String(d?.dateDisplay || '')
+  const s = String(d?.date || '').trim()
+  const isoOk = /^\d{4}-\d{2}-\d{2}$/.test(s)
+  const m = display.match(/[（(]([月火水木金土日])(祝?)[）)]/)
+  let weekday = m ? m[1] : null
+  if (!weekday && isoOk) {
+    const [y, mo, day] = s.split('-').map(Number)
+    weekday = WEEKDAY_JP[new Date(y, mo - 1, day).getDay()]
+  }
+  if (weekday === '土' || weekday === '日') return true
+  if (m && m[2] === '祝') return true
+  return isoOk ? isJapaneseHoliday(s) : false
+}
+
+// 祝日在星期后加「祝」标记（如 "9.22（火祝）"），供排序与展示识别
 function formatDateDisplayFromIso(iso) {
   const s = String(iso || '').trim()
   if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return ''
   const [y, mo, d] = s.split('-').map(Number)
   const dt = new Date(y, mo - 1, d)
-  return `${mo}.${String(d).padStart(2, '0')}（${WEEKDAY_JP[dt.getDay()]}）`
+  const mark = holidayJp.isHoliday(dt) ? '祝' : ''
+  return `${mo}.${String(d).padStart(2, '0')}（${WEEKDAY_JP[dt.getDay()]}${mark}）`
 }
 
 function formatTimeDisplay(time) {
@@ -240,6 +268,8 @@ module.exports = {
   parseTimeSafe,
   parseSlotStartDateTimeSafe,
   normalizeTimeRange,
+  isJapaneseHoliday,
+  isWeekendOrHoliday,
   formatDateDisplayFromIso,
   formatTimeDisplay,
   toMinutes,

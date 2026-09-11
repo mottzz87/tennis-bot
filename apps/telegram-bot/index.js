@@ -912,6 +912,40 @@ function registerHandlers(bot) {
   // ========================
   // Callback Query Handler
   // ========================
+  // 连续时长阈值切换行：全部（按配置）/ ≥3h / ≥4h，仅快照视图提供（可拿原始格重合并）
+  function buildMinRow(token, current) {
+    const opt = (label, h) => ({
+      text: `${Number(h) === Number(current) ? '✅ ' : ''}${label}`,
+      callback_data: `viewmin_${h}_${token}`
+    })
+    return [opt('全部', 0), opt('≥3h', 3), opt('≥4h', 4)]
+  }
+
+  // 渲染某场地空位：每 10 条一条消息，最后一页附阈值切换行；snapshotToken 为空时（旧按钮）不提供切换
+  async function sendPlaceView(bot, chatId, { platform, place, slots, snapshotToken, min }) {
+    const pc = await getPlatformConfig(platform)
+    const CHUNK = 10
+    const minRow = snapshotToken ? buildMinRow(snapshotToken, min) : null
+    if (slots.length === 0) {
+      const tag = min > 0 ? `（连续 ≥${min}h）` : ''
+      await bot.sendMessage(chatId, `📍 ${place}${tag}：暂无可约的连续时段`, {
+        reply_markup: { inline_keyboard: minRow ? [minRow] : [] }
+      })
+      return
+    }
+    for (let i = 0; i < slots.length; i += CHUNK) {
+      const part = slots.slice(i, i + CHUNK)
+      const buttons = part.map(d => [{
+        text: formatSlotText(d, pc),
+        callback_data: `book_${slotToken(d.ucode)}`
+      }])
+      if (minRow && i + CHUNK >= slots.length) buttons.push(minRow)
+      const tag = min > 0 ? ` · 连续 ≥${min}h` : ''
+      const h = `📍 ${place}（${slots.length} 个${tag}）${i === 0 ? '' : `\n（第 ${i / CHUNK + 1} 页）`}`
+      await bot.sendMessage(chatId, h, { reply_markup: { inline_keyboard: buttons } })
+    }
+  }
+
   bot.on('callback_query', async (query) => {
     const data = query.data
     const chatId = query.message?.chat?.id || ADMIN_ID
@@ -990,40 +1024,52 @@ function registerHandlers(bot) {
       const payload = data.replace('viewplace_', '')
       await bot.answerCallbackQuery(query.id, { text: '🔍 加载中...' })
       try {
-        let platform = ''
-        let place = ''
-        let slots = []
         if (payload.includes('|')) {
           const parts = payload.split('|')
-          platform = parts[0]
-          place = parts.slice(1).join('|')
+          const platform = parts[0]
+          const place = parts.slice(1).join('|')
           const res = await monitorApi('GET', `/api/place/${encodeURIComponent(platform)}/${encodeURIComponent(place)}`)
-          slots = res.data?.slots || []
+          await sendPlaceView(bot, chatId, { platform, place, slots: res.data?.slots || [], snapshotToken: null, min: 0 })
         } else {
           const res = await monitorApi('GET', `/api/push-snapshot/${encodeURIComponent(payload)}`)
           if (res.status === 404) {
             await bot.sendMessage(chatId, '⚠️ 该推送已过期，请等待下次推送')
             return
           }
-          platform = res.data?.platform || ''
-          place = res.data?.place || ''
-          slots = res.data?.slots || []
+          await sendPlaceView(bot, chatId, {
+            platform: res.data?.platform || '',
+            place: res.data?.place || '',
+            slots: res.data?.slots || [],
+            snapshotToken: payload,
+            min: 0
+          })
         }
-        if (slots.length === 0) {
-          await bot.sendMessage(chatId, '📍 该场地当前暂无空位')
+      } catch (e) {
+        await bot.sendMessage(chatId, `❌ 获取场地数据失败：${e.message}`)
+      }
+      return
+    }
+
+    // --- 切换连续时长阈值（不改配置，仅本次查看用原始格按 min 重合并） ---
+    if (data.startsWith('viewmin_')) {
+      const rest = data.slice('viewmin_'.length)
+      const sep = rest.indexOf('_')
+      const min = Number(rest.slice(0, sep)) || 0
+      const token = rest.slice(sep + 1)
+      await bot.answerCallbackQuery(query.id, { text: min > 0 ? `筛选连续 ≥${min}h` : '显示全部' })
+      try {
+        const res = await monitorApi('GET', `/api/push-snapshot/${encodeURIComponent(token)}${min > 0 ? `?min=${min}` : ''}`)
+        if (res.status === 404) {
+          await bot.sendMessage(chatId, '⚠️ 该推送已过期，请等待下次推送')
           return
         }
-        const pc = await getPlatformConfig(platform)
-        const CHUNK = 10
-        for (let i = 0; i < slots.length; i += CHUNK) {
-          const part = slots.slice(i, i + CHUNK)
-          const buttons = part.map(d => [{
-            text: formatSlotText(d, pc),
-            callback_data: `book_${slotToken(d.ucode)}`
-          }])
-          const h = `📍 ${place}（${slots.length} 个）${i === 0 ? '' : `\n（第 ${i / CHUNK + 1} 页）`}`
-          await bot.sendMessage(chatId, h, { reply_markup: { inline_keyboard: buttons } })
-        }
+        await sendPlaceView(bot, chatId, {
+          platform: res.data?.platform || '',
+          place: res.data?.place || '',
+          slots: res.data?.slots || [],
+          snapshotToken: token,
+          min
+        })
       } catch (e) {
         await bot.sendMessage(chatId, `❌ 获取场地数据失败：${e.message}`)
       }

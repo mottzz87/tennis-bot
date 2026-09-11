@@ -13,6 +13,7 @@ const {
   formatCourt,
   toMinutes,
   normalizeText,
+  isWeekendOrHoliday,
   WEEKDAY_JP
 } = require('@tennis-bot/utils')
 
@@ -38,16 +39,16 @@ function matchTime(dTime, filter) {
   return false
 }
 
-// 从 dateDisplay（如 "8.08（土）"）或 date（ISO）解析星期，解析失败返回 null
+// 从 dateDisplay（如 "8.08（土）" / "9.22（火祝）"）或 date（ISO）解析星期，解析失败返回 null
 function resolveWeekday(d) {
   const display = String(d.dateDisplay || '')
-  const m1 = display.match(/[（(]([月火水木金土日])[）)]/)
+  const m1 = display.match(/[（(]([月火水木金土日])祝?[）)]/)
   if (m1) return m1[1]
   if (/^\d{4}-\d{2}-\d{2}$/.test(String(d.date || '').trim())) {
     const [y, mo, day] = String(d.date).split('-').map(Number)
     return WEEKDAY_JP[new Date(y, mo - 1, day).getDay()]
   }
-  const m2 = String(d.date || '').match(/[（(]([月火水木金土日])[）)]/)
+  const m2 = String(d.date || '').match(/[（(]([月火水木金土日])祝?[）)]/)
   return m2 ? m2[1] : null
 }
 
@@ -61,8 +62,8 @@ function filterSlotsByRules(data, rules) {
   return data.filter(d => {
     const weekday = resolveWeekday(d)
 
-    // 周末（土/日）默认全天可扫，不受 TIME_FILTER 限制
-    if (TIME_FILTER.length > 0 && weekday !== '土' && weekday !== '日') {
+    // 周末（土/日）与祝日默认全天可扫，不受 TIME_FILTER 限制
+    if (TIME_FILTER.length > 0 && !isWeekendOrHoliday(d)) {
       if (!matchTime(d.time || d.start, TIME_FILTER)) return false
     }
 

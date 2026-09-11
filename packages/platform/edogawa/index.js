@@ -52,6 +52,7 @@ class CookieJar {
 class EdogawaAdapter {
   constructor(baseUrl) {
     this._baseUrl = (baseUrl || '').replace(/\/+$/, '')
+    this.rawCells = []   // 最近一次扫描合并前的原始小时格，见 _scan
   }
 
   get name() {
@@ -83,6 +84,7 @@ class EdogawaAdapter {
       return await this._scan(http, targets, platformConfig)
     } catch (e) {
       console.log(`[edogawa] 扫描失败: ${e.message}`)
+      this.rawCells = []
       return []
     }
   }
@@ -169,6 +171,9 @@ class EdogawaAdapter {
     for (const s of slots) {
       s.group = core.resolveCourtGroup(s.court, s.place, platformConfig)
     }
+    // 合并前的原始小时格：monitor 用它在「查看空位」里按其它阈值临时重合并，
+    // 这样按 3h/4h 查看无需改配置、也无需重新抓取。
+    this.rawCells = slots
     const merged = core.mergeContiguousSlots(slots, this._minMinutes, this._goldenFilter)
     if (merged.length !== slots.length) {
       const goldenNote = this._goldenFilter.length ? `, 黄金时段 ${this._goldenFilter.join('/')}` : ''
