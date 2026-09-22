@@ -9,7 +9,7 @@
  * 每个方法自行管理浏览器生命周期
  */
 const { chromium } = require('playwright')
-const { sleep, createTrace, normalizeTimeRange, formatDateDisplayFromIso, setHumanPauseRange, captureFailureEvidence } = require('@tennis-bot/utils')
+const { createTrace, normalizeTimeRange, formatDateDisplayFromIso, setHumanPauseRange, captureFailureEvidence } = require('@tennis-bot/utils')
 const { parsePage } = require('./parser')
 const { clickSlot } = require('./booking')
 const {
@@ -19,6 +19,7 @@ const {
   autoSelectWeekdays,
   handleLoginIfNeeded,
   clickApply,
+  clickForward,
   getSkipCourtContains
 } = require('./login')
 
@@ -70,10 +71,7 @@ class IchikawaAdapter {
       await autoSelectWeekdays(page, platformConfig)
 
       // 下一步
-      await Promise.all([
-        page.waitForNavigation({ waitUntil: 'networkidle' }),
-        page.click('#ucPCFooter_btnForward')
-      ])
+      await clickForward(page)
 
       // 解析数据
       const skipCourtContains = getSkipCourtContains(platformConfig)
@@ -140,20 +138,14 @@ class IchikawaAdapter {
       await autoSelectWeekdays(page, platformConfig)
 
       // 下一步
-      await Promise.all([
-        page.waitForNavigation({ waitUntil: 'networkidle' }),
-        page.click('#ucPCFooter_btnForward')
-      ])
+      await clickForward(page)
 
       // 点击目标 slot
       const raw = slotData._raw || slotData
       await clickSlot(page, raw)
 
       // 提交
-      await Promise.all([
-        page.waitForNavigation({ waitUntil: 'networkidle' }),
-        page.click('#ucPCFooter_btnForward')
-      ])
+      await clickForward(page)
 
       await handleLoginIfNeeded(page)
       const applyResult = await clickApply(page)

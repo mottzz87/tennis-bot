@@ -3,8 +3,42 @@
  */
 const { sleep, clickByText, humanType, humanPause } = require('@tennis-bot/utils')
 
+const FORWARD_SEL = '#ucPCFooter_btnForward'
+const CLICK_TIMEOUT = 15000
+const NAV_TIMEOUT = 30000
+
+// 页面内容签名：URL + 表格数 + 正文前 200 字，用于确认 postback 后页面是否真的换了
+function pageSignature(page) {
+  return page.evaluate(() => {
+    const t = document.body ? document.body.innerText : ''
+    return `${location.href}|${document.querySelectorAll('table').length}|${t.length}|${t.slice(0, 200)}`
+  }).catch(() => '')
+}
+
+/**
+ * 点击「次へ >>」并等待 ASP.NET postback 返回新页面。
+ *
+ * 两个坑：
+ * 1) click() 自身会等待它触发的导航，外面再套 waitForNavigation 等于同一个导航等两遍。
+ * 2) networkidle 要求 500ms 内零网络活动，站点有慢子资源时永远等不到；postback 返回的是
+ *    服务端渲染的完整 HTML，domcontentloaded 已足够解析。
+ * 导航等待超时后用内容签名兜底确认，避免误判失败丢掉整轮扫描。
+ */
+async function clickForward(page) {
+  const before = await pageSignature(page)
+  const navigated = page
+    .waitForNavigation({ waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT })
+    .then(() => true, () => false)
+
+  await page.click(FORWARD_SEL, { noWaitAfter: true, timeout: CLICK_TIMEOUT })
+  if (await navigated) return
+  if (await pageSignature(page) !== before) return
+
+  throw new Error(`点击 ${FORWARD_SEL} 后页面无变化（等待 ${NAV_TIMEOUT}ms）`)
+}
+
 async function handleLoginIfNeeded(page) {
-  const btn = page.locator('#ucPCFooter_btnForward')
+  const btn = page.locator(FORWARD_SEL)
   if (!(await btn.isVisible())) return
 
   const value = await btn.inputValue()
@@ -17,10 +51,7 @@ async function handleLoginIfNeeded(page) {
   await humanType(page.locator('#txtPass'), process.env.PASSWORD)
   await humanPause()
 
-  await Promise.all([
-    page.waitForNavigation(),
-    btn.click()
-  ])
+  await clickForward(page)
 }
 
 const ICHI_ERROR_RE = /エラー|error|既に予約|予約されています|予約済み|申込済み|登録済み|予約できません|申込できません|申し込みできません|失敗しました|空きがありません|空きがない|満席|受付終了|時間切れ|セッション/i
@@ -34,7 +65,7 @@ function pickIchiError(bodyText) {
 // 提交 申込 后必须验证真实结果：成功会跳转完成页，失败会停留在原页/跳错误页显示错误文案。
 // 只有确认成功才返回 ok:true，避免"假预约成功"。
 async function clickApply(page) {
-  const btn = page.locator('#ucPCFooter_btnForward')
+  const btn = page.locator(FORWARD_SEL)
   const value = await btn.inputValue()
 
   if (!value.includes('申込')) {
@@ -43,10 +74,8 @@ async function clickApply(page) {
 
   console.log('[ichikawa] 提交预约')
   await humanPause()
-  await Promise.all([
-    page.waitForNavigation({ waitUntil: 'networkidle' }).catch(() => {}),
-    btn.click()
-  ])
+  // 不把「页面跳转成功」当作预约成功：无论跳转等不等得到，都回到页面核对真实结果
+  await clickForward(page).catch(() => {})
   await sleep(1500)
 
   const url = page.url()
@@ -81,10 +110,7 @@ async function selectPlaces(page, places, stepDelay) {
     await clickByText(page, place)
     await sleep(stepDelay)
   }
-  await Promise.all([
-    page.waitForNavigation({ waitUntil: 'networkidle' }),
-    page.click('#ucPCFooter_btnForward')
-  ])
+  await clickForward(page)
 }
 
 /**
@@ -93,10 +119,7 @@ async function selectPlaces(page, places, stepDelay) {
 async function selectDuration(page, durationText, stepDelay) {
   await clickByText(page, durationText)
   await sleep(stepDelay)
-  await Promise.all([
-    page.waitForNavigation({ waitUntil: 'networkidle' }),
-    page.click('#ucPCFooter_btnForward')
-  ])
+  await clickForward(page)
 }
 
 /**
@@ -182,6 +205,7 @@ function getSkipCourtContains(cfg) {
 module.exports = {
   handleLoginIfNeeded,
   clickApply,
+  clickForward,
   navigateToSports,
   selectPlaces,
   selectDuration,
