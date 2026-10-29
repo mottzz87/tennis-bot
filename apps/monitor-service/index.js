@@ -18,6 +18,8 @@
  *   GET  /api/log?n=50
  *   GET  /api/slot/:ucode
  *   GET  /api/schedule-status
+ *   POST /api/persistent/toggle  { id }（id 为完整 ucode 或 slotToken，开关周末/祝日持续推送）
+ *   GET  /api/persistent         当前持续推送登记
  *
  * 自身不执行任何 Playwright 预约操作
  * 不处理 Telegram 用户交互（由 telegram-bot 处理）
@@ -375,7 +377,120 @@ function registerEphemeralSlots(slots) {
   }
 }
 
-// 用某场地的原始小时格按指定阈值重新合并，等价于「把 MIN_CONTINUOUS_HOURS 临时当成 hours」：
+// ========================
+// 持续推送（周末/祝日空位）
+// 场景：别人取消的周末/祝日空位只推一次的话，用户几小时后才看到时可能已被约走。
+// 机制：周末/祝日新空位出现时自动登记为持续推送，每隔 PERSISTENT_PUSH_INTERVAL_MINUTES
+// （默认 10 分钟，可 /set 修改）重推一次，直到空位消失、被约走、日期已过，或用户点铃铛关闭。
+// 状态只存在内存里：monitor 重启后登记会丢，但旧消息上的铃铛仍可重新登记（toggle 未登记时
+// 会从当前空位反查并新建），不会因此永久丢掉开关。
+// ========================
+const persistentPush = new Map() // ucode -> { slot, platform, nextPushAt, pushCount, enabled }
+
+function getPersistentIntervalMs(platform) {
+  const min = Number(config.getEffective('PERSISTENT_PUSH_INTERVAL_MINUTES', platform))
+  return (Number.isFinite(min) && min > 0 ? min : 10) * 60 * 1000
+}
+
+function armPersistentPush(slot, platform) {
+  if (!slot?.ucode || persistentPush.has(slot.ucode)) return false
+  persistentPush.set(slot.ucode, {
+    slot, platform,
+    nextPushAt: Date.now() + getPersistentIntervalMs(platform),
+    pushCount: 0, enabled: true
+  })
+  console.log(`[持续推送] 登记 ${slot.platform || platform} ${slot.place} ${slot.dateDisplay || slot.date} ${slot.time}`)
+  return true
+}
+
+function removePersistentPushByUid(uid) {
+  for (const [ucode, entry] of persistentPush) {
+    if (entry.slot.uid === uid) persistentPush.delete(ucode)
+  }
+}
+
+function resolvePersistentSlot(id) {
+  let slot = currentSlotMap.get(id) || ephemeralSlots.get(id)?.slot
+  if (slot) return slot
+  for (const s of currentSlotMap.values()) {
+    if (slotToken(s.ucode) === id) return s
+  }
+  for (const e of ephemeralSlots.values()) {
+    if (slotToken(e.slot.ucode) === id) return e.slot
+  }
+  return null
+}
+
+// 铃铛开关：已登记则翻转 enabled；未登记则从当前空位新建为开启（仅周末/祝日）。
+// 返回 null 表示空位已过期；返回 { weekendHoliday: false } 表示非周末/祝日，不支持持续推送。
+function togglePersistentPush(id) {
+  let entry = persistentPush.get(id)
+  if (!entry) {
+    for (const [k, v] of persistentPush) {
+      if (slotToken(v.slot.ucode) === id) { entry = v; break }
+    }
+  }
+  if (entry) {
+    entry.enabled = !entry.enabled
+    if (entry.enabled) entry.nextPushAt = Date.now() + getPersistentIntervalMs(entry.platform)
+    console.log(`[持续推送] ${entry.enabled ? '开启' : '关闭'} ${entry.slot.place} ${entry.slot.dateDisplay || entry.slot.date} ${entry.slot.time}`)
+    return { enabled: entry.enabled, slot: entry.slot }
+  }
+  const slot = resolvePersistentSlot(id)
+  if (!slot) return null
+  if (!isWeekendOrHoliday(slot)) return { enabled: false, slot, weekendHoliday: false }
+  persistentPush.set(slot.ucode, {
+    slot, platform: slot.platform,
+    nextPushAt: Date.now() + getPersistentIntervalMs(slot.platform),
+    pushCount: 0, enabled: true
+  })
+  console.log(`[持续推送] 开启 ${slot.place} ${slot.dateDisplay || slot.date} ${slot.time}`)
+  return { enabled: true, slot }
+}
+
+// 每 60s 由定时器调用：到期的登记重推一次；空位已消失或日期已过则静默注销
+// （被约走的空位仍由 removed 通知报一次，这里不再重复报）。
+async function checkPersistentPush() {
+  const now = Date.now()
+  const dueByPlatform = new Map()
+  for (const [ucode, entry] of persistentPush) {
+    if (!entry.enabled) continue
+    // 暂停或停用的平台不重推（登记保留，恢复后下一轮再推，不会攒一堆补发）
+    if (runtime[entry.platform]?.paused) continue
+    if (config.getPlatform(entry.platform)?.enabled === false) continue
+    const current = currentSlotMap.get(ucode)
+    if (!current) { persistentPush.delete(ucode); continue }
+    const start = parseSlotStartDateTimeSafe(current)
+    if (start && start.getTime() < now) { persistentPush.delete(ucode); continue }
+    if (now < entry.nextPushAt) continue
+    entry.slot = current
+    if (!dueByPlatform.has(entry.platform)) dueByPlatform.set(entry.platform, [])
+    dueByPlatform.get(entry.platform).push(current)
+  }
+  for (const [platform, slots] of dueByPlatform) {
+    const botInstance = getBotForPlatform(platform)
+    const chatId = getPlatformChatId(platform)
+    if (!botInstance || !chatId) continue
+    try {
+      await sendBookButtons(
+        botInstance, chatId, sortWeekendOrHolidayFirst(slots),
+        '🔔 周末/祝日空位还在 · 点击直接预约（持续推送中，点 🔔 可取消）'
+      )
+      for (const d of slots) {
+        const entry = persistentPush.get(d.ucode)
+        if (entry) { entry.pushCount += 1; entry.nextPushAt = Date.now() + getPersistentIntervalMs(platform) }
+      }
+    } catch (e) {
+      console.log(`[持续推送] ${platform} 发送失败:`, e.message)
+      for (const d of slots) {
+        const entry = persistentPush.get(d.ucode)
+        if (entry) entry.nextPushAt = Date.now() + getPersistentIntervalMs(platform)
+      }
+    }
+  }
+}
+
+// // 用某场地的原始小时格按指定阈值重新合并，等价于「把 MIN_CONTINUOUS_HOURS 临时当成 hours」：
 // merge → enrich → filter → 周末/祝日优先，与定时扫描同一管线，只是阈值来自本次请求。
 // 仅在本次请求内生效，不写配置、不影响自动抓取。
 function rematchPlaceSlots(platform, place, hours, rawCells) {
@@ -389,16 +504,24 @@ function rematchPlaceSlots(platform, place, hours, rawCells) {
   return sortWeekendOrHolidayFirst(filtered)
 }
 
-// 分批发送 book 按钮（每批 MAX_INLINE_BUTTONS 个）
+// 分批发送 book 按钮（每批 MAX_INLINE_BUTTONS 个）。
+// 周末/祝日空位同行附一个铃铛按钮（🔔 已开启持续推送 / 🔕 未开启），点一下开关持续推送；
+// 平日空位不带铃铛、不参与持续推送。铃铛状态取自持续推送登记：新增路径会先登记再推送，
+// 因此新增的周末/祝日空位首推即显示 🔔；首推/全量推送里的周末空位尚未登记，显示 🔕，点一下即登记开启。
 async function sendBookButtons(bot, chatId, slots, header) {
   for (let i = 0; i < slots.length; i += MAX_INLINE_BUTTONS) {
     const part = slots.slice(i, i + MAX_INLINE_BUTTONS)
-    const buttons = part.map(d => ({
-      text: formatSlotText(d, getPlatformConfig(d.place)),
-      callback_data: `book_${slotToken(d.ucode)}`
-    }))
+    const rows = part.map(d => {
+      const bookBtn = {
+        text: formatSlotText(d, getPlatformConfig(d.place)),
+        callback_data: `book_${slotToken(d.ucode)}`
+      }
+      if (!isWeekendOrHoliday(d)) return [bookBtn]
+      const enabled = persistentPush.get(d.ucode)?.enabled
+      return [bookBtn, { text: enabled ? '🔔' : '🔕', callback_data: `bell_${slotToken(d.ucode)}` }]
+    })
     const h = i === 0 ? header : `${header}\n（第 ${i / MAX_INLINE_BUTTONS + 1} 页）`
-    await bot.sendMessage(chatId, h, { reply_markup: { inline_keyboard: buttons.map(b => [b]) } })
+    await bot.sendMessage(chatId, h, { reply_markup: { inline_keyboard: rows } })
   }
 }
 
@@ -888,6 +1011,10 @@ async function scanPlatform(name, options = {}) {
     saveLastSets()
 
     if (added.length > 0) {
+      // 先登记周末/祝日新增空位的持续推送，首推消息里的铃铛即显示为开启
+      for (const d of added) {
+        if (isWeekendOrHoliday(d)) armPersistentPush(d, name)
+      }
       if (config.getEffective('NOTIFY_ADDED', name) !== false) {
         console.log(`[MONITOR][${name.toUpperCase()}][${trace}] PUSH 发送新增通知 ${added.length}`)
         await sendTelegram(added, currentVersion, '✨ 有新场地！点击直接预约', { weekendOnly })
@@ -895,6 +1022,8 @@ async function scanPlatform(name, options = {}) {
       await autoBookPlatform(name, added, platformConfig, trace)
     }
 
+    // 空位消失即注销持续推送（被约走的仍由下面的 removed 通知报一次）
+    for (const r of removed) removePersistentPushByUid(r.uid)
     if (removed.length > 0 && config.getEffective('NOTIFY_REMOVED', name) !== false) {
       // console.log(`[MONITOR][${name.toUpperCase()}][${trace}] PUSH 发送减少通知 ${removed.length}`)
       await sendRemovedTelegram(removed, { weekendOnly })
@@ -1092,6 +1221,28 @@ const server = http.createServer(async (req, res) => {
       return json(res, { success: true })
     }
 
+    // POST /api/persistent/toggle body: { id }（id 为完整 ucode 或 slotToken，开关周末/祝日持续推送）
+    if (req.method === 'POST' && pathname === '/api/persistent/toggle') {
+      const body = await parseBody(req).catch(() => null)
+      const id = body?.id || body?.ucode || body?.token
+      if (!id) return json(res, { success: false, message: '缺少 id' }, 400)
+      const result = togglePersistentPush(String(id))
+      if (!result) return json(res, { success: false, message: '空位已过期' }, 404)
+      if (result.weekendHoliday === false) return json(res, { success: false, message: '仅周末/祝日空位支持持续推送' }, 400)
+      return json(res, { success: true, enabled: result.enabled, slot: result.slot })
+    }
+
+    // GET /api/persistent — 当前持续推送登记（排查用）
+    if (req.method === 'GET' && pathname === '/api/persistent') {
+      return json(res, {
+        success: true,
+        items: [...persistentPush.values()].map(e => ({
+          uid: e.slot.uid, platform: e.platform, enabled: e.enabled,
+          pushCount: e.pushCount, nextPushAt: e.nextPushAt
+        }))
+      })
+    }
+
     // GET /api/stats
     if (req.method === 'GET' && pathname === '/api/stats') {
       const allPlaceMaps = {}
@@ -1229,6 +1380,9 @@ async function start() {
     : '未配置（可在平台配置里加 RELEASE_REMINDER）'}`)
   checkReleaseReminders()
   setInterval(checkReleaseReminders, 30 * 1000)
+
+  // 周末/祝日持续推送：每 60s 检查一次到期的登记并重推
+  setInterval(() => { checkPersistentPush().catch(e => console.error('[持续推送] 检查失败:', e.message)) }, 60 * 1000)
 
   // 清理旧日志
   setInterval(() => cleanOldLogs(30), 24 * 60 * 60 * 1000)
