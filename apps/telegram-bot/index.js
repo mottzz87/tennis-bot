@@ -1298,6 +1298,38 @@ function registerHandlers(bot) {
       return
     }
   
+    // --- Toggle persistent push (weekend/holiday slot bell) ---
+    // 铃铛按钮只出现在 monitor 推送的周末/祝日空位行里；monitor 本身不 polling，
+    // 所以回调先到这里，再由这里 POST 给 monitor 开关持续推送，并把本条消息的铃铛改成新状态。
+    if (data.startsWith('bell_')) {
+      const token = data.replace('bell_', '')
+      try {
+        const res = await monitorApi('POST', '/api/persistent/toggle', { id: token })
+        if (!res.data?.success) {
+          await bot.answerCallbackQuery(query.id, { text: res.data?.message === '空位已过期' ? '⚠️ 该空位已过期' : '⚠️ 仅周末/祝日空位支持持续推送' })
+          return
+        }
+        const enabled = res.data.enabled
+        const newBell = enabled ? '🔔' : '🔕'
+        const rows = query.message.reply_markup?.inline_keyboard || []
+        const newRows = rows.map(row => row.map(btn =>
+          btn.callback_data === data ? { ...btn, text: newBell } : btn
+        ))
+        try {
+          await bot.editMessageReplyMarkup({ inline_keyboard: newRows }, {
+            chat_id: query.message.chat.id,
+            message_id: query.message.message_id
+          })
+        } catch (e) {
+          console.warn('[bell] 更新消息失败:', e.message)
+        }
+        await bot.answerCallbackQuery(query.id, { text: enabled ? '🔔 持续推送已开启' : '🔕 持续推送已关闭' })
+      } catch (e) {
+        await bot.answerCallbackQuery(query.id, { text: '❌ 操作失败' })
+      }
+      return
+    }
+
     // --- Book slot ---
     if (data.startsWith('book_')) {
       const ucode = data.replace('book_', '')

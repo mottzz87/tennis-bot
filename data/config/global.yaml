@@ -16,6 +16,7 @@ NOTIFY_REMOVED: true   # 有空位被约掉时推送
 MAX_PUSH: 500          # 单轮扫描最多推送的空位数
 PUSH_ON_INIT: true     # 启动时是否先推送一次当前全部空位
 BOOKED_REMINDER_INTERVAL_HOURS: 5  # 已预约临近的定时提醒间隔（小时）
+PERSISTENT_PUSH_INTERVAL_MINUTES: 10  # 周末/祝日空位持续推送间隔（分钟）；持续推送开启的空位每隔该时长重推一次，可 /set 修改
 
 # ===== 预约 =====
 DOUBLE_CONFIRM_DAYS: 7 # 距开始 N 天内的时段，点预约会先二次确认（默认 7；设 0 关闭；可按平台覆盖）
