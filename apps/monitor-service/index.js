@@ -511,15 +511,19 @@ function rematchPlaceSlots(platform, place, hours, rawCells) {
 async function sendBookButtons(bot, chatId, slots, header) {
   for (let i = 0; i < slots.length; i += MAX_INLINE_BUTTONS) {
     const part = slots.slice(i, i + MAX_INLINE_BUTTONS)
-    const rows = part.map(d => {
+    // 周末/祝日空位占两行：预约按钮独占一行（信息不再被同行铃铛挤截断），
+    // 铃铛单独一行（文字仍是单个 emoji，已是最短；Telegram 里单独一行的按钮会拉满行宽）。
+    const rows = []
+    for (const d of part) {
       const bookBtn = {
         text: formatSlotText(d, getPlatformConfig(d.place)),
         callback_data: `book_${slotToken(d.ucode)}`
       }
-      if (!isWeekendOrHoliday(d)) return [bookBtn]
+      rows.push([bookBtn])
+      if (!isWeekendOrHoliday(d)) continue
       const enabled = persistentPush.get(d.ucode)?.enabled
-      return [bookBtn, { text: enabled ? '🔔' : '🔕', callback_data: `bell_${slotToken(d.ucode)}` }]
-    })
+      rows.push([{ text: enabled ? '🔔' : '🔕', callback_data: `bell_${slotToken(d.ucode)}` }])
+    }
     const h = i === 0 ? header : `${header}\n（第 ${i / MAX_INLINE_BUTTONS + 1} 页）`
     await bot.sendMessage(chatId, h, { reply_markup: { inline_keyboard: rows } })
   }
