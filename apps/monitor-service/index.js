@@ -18,7 +18,7 @@
  *   GET  /api/log?n=50
  *   GET  /api/slot/:ucode
  *   GET  /api/schedule-status
- *   POST /api/persistent/toggle  { id }（id 为完整 ucode 或 slotToken，开关周末/祝日持续推送）
+ *   POST /api/persistent/toggle  { id }（id 为完整 ucode 或 slotToken，开关持续推送：周末/祝日 + 平日 19 点）
  *   GET  /api/persistent         当前持续推送登记
  *
  * 自身不执行任何 Playwright 预约操作
@@ -392,6 +392,17 @@ function getPersistentIntervalMs(platform) {
   return (Number.isFinite(min) && min > 0 ? min : 10) * 60 * 1000
 }
 
+// 持续推送覆盖：周末/祝日全部 + 平日 19 点开始的时段（开始时间 19 点即算，如 19-21）。
+function getSlotStartHour(d) {
+  const raw = String(d.start ?? String(d.time || '').split(/[～~\-]/)[0] ?? '')
+  const m = raw.match(/(\d{1,2})/)
+  return m ? Number(m[1]) : null
+}
+function isPersistentPushEligible(d) {
+  if (isWeekendOrHoliday(d)) return true
+  return getSlotStartHour(d) === 19
+}
+
 function armPersistentPush(slot, platform) {
   if (!slot?.ucode || persistentPush.has(slot.ucode)) return false
   persistentPush.set(slot.ucode, {
@@ -421,8 +432,8 @@ function resolvePersistentSlot(id) {
   return null
 }
 
-// 铃铛开关：已登记则翻转 enabled；未登记则从当前空位新建为开启（仅周末/祝日）。
-// 返回 null 表示空位已过期；返回 { weekendHoliday: false } 表示非周末/祝日，不支持持续推送。
+// 铃铛开关：已登记则翻转 enabled；未登记则从当前空位新建为开启（周末/祝日 + 平日 19 点）。
+// 返回 null 表示空位已过期；返回 { weekendHoliday: false } 表示不在持续推送覆盖内。
 function togglePersistentPush(id) {
   let entry = persistentPush.get(id)
   if (!entry) {
@@ -438,7 +449,7 @@ function togglePersistentPush(id) {
   }
   const slot = resolvePersistentSlot(id)
   if (!slot) return null
-  if (!isWeekendOrHoliday(slot)) return { enabled: false, slot, weekendHoliday: false }
+  if (!isPersistentPushEligible(slot)) return { enabled: false, slot, weekendHoliday: false }
   persistentPush.set(slot.ucode, {
     slot, platform: slot.platform,
     nextPushAt: Date.now() + getPersistentIntervalMs(slot.platform),
@@ -474,7 +485,7 @@ async function checkPersistentPush() {
     try {
       await sendBookButtons(
         botInstance, chatId, sortWeekendOrHolidayFirst(slots),
-        '🔔 周末/祝日空位还在 · 点击直接预约（持续推送中，点 🔔 可取消）'
+        '🔔 空位还在 · 点击直接预约（持续推送中，点 🔔 可取消）'
       )
       for (const d of slots) {
         const entry = persistentPush.get(d.ucode)
@@ -505,9 +516,10 @@ function rematchPlaceSlots(platform, place, hours, rawCells) {
 }
 
 // 分批发送 book 按钮（每批 MAX_INLINE_BUTTONS 个）。
-// 周末/祝日空位同行附一个铃铛按钮（🔔 已开启持续推送 / 🔕 未开启），点一下开关持续推送；
-// 平日空位不带铃铛、不参与持续推送。铃铛状态取自持续推送登记：新增路径会先登记再推送，
-// 因此新增的周末/祝日空位首推即显示 🔔；首推/全量推送里的周末空位尚未登记，显示 🔕，点一下即登记开启。
+// 持续推送覆盖的空位（周末/祝日 + 平日 19 点）另起一行附一个铃铛按钮（🔔 已开启 / 🔕 未开启），
+// 点一下开关持续推送；覆盖外的平日空位不带铃铛、不参与持续推送。铃铛状态取自持续推送登记：
+// 新增路径会先登记再推送，因此新增的覆盖内空位首推即显示 🔔；首推/全量推送里的覆盖内空位尚未登记，
+// 显示 🔕，点一下即登记开启。
 async function sendBookButtons(bot, chatId, slots, header) {
   for (let i = 0; i < slots.length; i += MAX_INLINE_BUTTONS) {
     const part = slots.slice(i, i + MAX_INLINE_BUTTONS)
@@ -520,7 +532,7 @@ async function sendBookButtons(bot, chatId, slots, header) {
         callback_data: `book_${slotToken(d.ucode)}`
       }
       rows.push([bookBtn])
-      if (!isWeekendOrHoliday(d)) continue
+      if (!isPersistentPushEligible(d)) continue
       const enabled = persistentPush.get(d.ucode)?.enabled
       rows.push([{ text: enabled ? '🔔' : '🔕', callback_data: `bell_${slotToken(d.ucode)}` }])
     }
@@ -1015,9 +1027,9 @@ async function scanPlatform(name, options = {}) {
     saveLastSets()
 
     if (added.length > 0) {
-      // 先登记周末/祝日新增空位的持续推送，首推消息里的铃铛即显示为开启
+      // 先登记持续推送覆盖的新增空位（周末/祝日 + 平日 19 点），首推消息里的铃铛即显示为开启
       for (const d of added) {
-        if (isWeekendOrHoliday(d)) armPersistentPush(d, name)
+        if (isPersistentPushEligible(d)) armPersistentPush(d, name)
       }
       if (config.getEffective('NOTIFY_ADDED', name) !== false) {
         console.log(`[MONITOR][${name.toUpperCase()}][${trace}] PUSH 发送新增通知 ${added.length}`)
@@ -1225,14 +1237,14 @@ const server = http.createServer(async (req, res) => {
       return json(res, { success: true })
     }
 
-    // POST /api/persistent/toggle body: { id }（id 为完整 ucode 或 slotToken，开关周末/祝日持续推送）
+    // POST /api/persistent/toggle body: { id }（id 为完整 ucode 或 slotToken，开关持续推送：周末/祝日 + 平日 19 点）
     if (req.method === 'POST' && pathname === '/api/persistent/toggle') {
       const body = await parseBody(req).catch(() => null)
       const id = body?.id || body?.ucode || body?.token
       if (!id) return json(res, { success: false, message: '缺少 id' }, 400)
       const result = togglePersistentPush(String(id))
       if (!result) return json(res, { success: false, message: '空位已过期' }, 404)
-      if (result.weekendHoliday === false) return json(res, { success: false, message: '仅周末/祝日空位支持持续推送' }, 400)
+      if (result.weekendHoliday === false) return json(res, { success: false, message: '仅周末/祝日及平日 19 点空位支持持续推送' }, 400)
       return json(res, { success: true, enabled: result.enabled, slot: result.slot })
     }
 
