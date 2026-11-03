@@ -1299,14 +1299,14 @@ function registerHandlers(bot) {
     }
   
     // --- Toggle persistent push (weekend/holiday slot bell) ---
-    // 铃铛按钮只出现在 monitor 推送的周末/祝日空位行里；monitor 本身不 polling，
+    // 铃铛按钮只出现在 monitor 推送的持续推送覆盖空位行里（周末/祝日 + 平日 19 点）；monitor 本身不 polling，
     // 所以回调先到这里，再由这里 POST 给 monitor 开关持续推送，并把本条消息的铃铛改成新状态。
     if (data.startsWith('bell_')) {
       const token = data.replace('bell_', '')
       try {
         const res = await monitorApi('POST', '/api/persistent/toggle', { id: token })
         if (!res.data?.success) {
-          await bot.answerCallbackQuery(query.id, { text: res.data?.message === '空位已过期' ? '⚠️ 该空位已过期' : '⚠️ 仅周末/祝日空位支持持续推送' })
+          await bot.answerCallbackQuery(query.id, { text: res.data?.message === '空位已过期' ? '⚠️ 该空位已过期' : '⚠️ 仅周末/祝日及平日 19 点空位支持持续推送' })
           return
         }
         const enabled = res.data.enabled
