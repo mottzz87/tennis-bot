@@ -59,7 +59,7 @@ class EdogawaAdapter {
     return PLATFORM_NAME
   }
 
-  async fetchSlots(platformConfig) {
+  async fetchSlots(platformConfig, options = {}) {
     if (!this._baseUrl) {
       console.log('[edogawa] BASE_URL 未配置，跳过')
       return []
@@ -81,7 +81,7 @@ class EdogawaAdapter {
 
     const http = this._createHttp()
     try {
-      return await this._scan(http, targets, platformConfig)
+      return await this._scan(http, targets, platformConfig, options)
     } catch (e) {
       console.log(`[edogawa] 扫描失败: ${e.message}`)
       this.rawCells = []
@@ -109,11 +109,22 @@ class EdogawaAdapter {
 
   // ---------- 流程步骤 ----------
 
-  async _scan(req, targets, platformConfig) {
+  async _scan(req, targets, platformConfig, options = {}) {
     // 1-5. 导航到 SelectDays 页（窗口超 1ヶ月 自动拆多期，但不在导航阶段提前查询）
     const nav = await navigateToMonth(req, targets, this._scanDays, this._startOffset)
     if (!nav) return []
     const { selected, formFields, token3, periods } = nav
+
+    // 定向扫描（放号日）：只查放号月那一期，跳过其它期，省掉当月期的 Next+时间页请求。
+    // 各期的 queryMonth/Next 互相独立（共用导航阶段的 formFields/token3），跳期不影响后续期。
+    let periodsToScan = periods
+    if (options.releaseMonth) {
+      periodsToScan = periods.filter(p =>
+        String(p.startDate || '').slice(0, 7) === options.releaseMonth ||
+        String(p.endDate || '').slice(0, 7) === options.releaseMonth)
+      console.log(`[edogawa] 定向扫描：仅查 ${options.releaseMonth} 期（${periodsToScan.length}/${periods.length} 期）`)
+      if (periodsToScan.length === 0) return []
+    }
 
     // 6-8. 每期：SearchCondition → 勾选 some cell（每批 ≤10，服务端 E-203-000018 限制）→ Next → 时间页 → vacant slots。
     // 站点要求 Next 的模型必须匹配当前 session 的 SearchCondition，因此必须"查一期、接着处理该期 Next"，再进入下一期。
@@ -121,7 +132,7 @@ class EdogawaAdapter {
     const slots = []
     const BATCH = 10
     let someTotal = 0
-    for (const p of periods) {
+    for (const p of periodsToScan) {
       const month = await queryMonth(req, formFields, token3, p.startDate, p.displayTerm)
       const cells = collectSomeCells(month, p.startDate, p.endDate)
       someTotal += cells.length
@@ -162,7 +173,7 @@ class EdogawaAdapter {
         slots.push(...parseTimePage(timeHtml))
       }
     }
-    console.log(`[edogawa] ${selected.length} 设施 ${this._scanDays}天窗口(${periods.length}期), some cells: ${someTotal}`)
+    console.log(`[edogawa] ${selected.length} 设施 ${this._scanDays}天窗口(${periodsToScan.length}期), some cells: ${someTotal}`)
     if (someTotal === 0) {
       console.log(`[edogawa] ${selected.length} 设施 ${this._scanDays}天窗口内无 some 空位`)
       return []
