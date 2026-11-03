@@ -2,7 +2,7 @@
  * Booking Service
  *
  * 独立 HTTP 预约服务
- * - 同一时间只处理一个预约
+ * - 最多 BOOKING_MAX_CONCURRENT 个预约并行（默认 3），同一时段去重，网络类失败重试
  * - 通过 platform adapter 执行实际预约
  * - 预约成功后记录到 storage
  * - 提供预约数据查询 API
@@ -13,7 +13,7 @@
  *   GET  /api/booked/schedule  -> 未开始预约（按时间排序）
  *   POST /api/booked/disable-reminder  { uid }
  *   DELETE /api/booked/:uid
- *   GET  /status               -> { busy, currentTask }
+ *   GET  /status               -> { busy, activeCount, currentTasks }
  */
 require('@tennis-bot/config/loadEnv')()
 const http = require('http')
@@ -70,8 +70,10 @@ function fetchConfigFromMonitor() {
   })
 }
 
-let busy = false
-let currentTask = null
+let activeCount = 0
+const activeTasks = new Map() // key -> { platform, slot, startedAt }
+const MAX_CONCURRENT = Number(process.env.BOOKING_MAX_CONCURRENT) > 0 ? Number(process.env.BOOKING_MAX_CONCURRENT) : 3
+const RETRYABLE_BOOKING_MESSAGE = /timeout|timed out|ECONNRESET|ECONNREFUSED|EAI_AGAIN|ENOTFOUND|socket hang up|net::ERR|navigation failed|50[0-9]/i
 
 // ========================
 // Helpers
@@ -102,13 +104,16 @@ function json(res, data, status = 200) {
 }
 
 async function handleBook(body) {
-  if (busy) {
-    return { success: false, message: 'Busy' }
-  }
-
   const { platform: platformName, slot } = body
   if (!platformName || !slot) {
     return { success: false, message: '缺少参数 platform 或 slot' }
+  }
+  const taskKey = slot.uid || slot.ucode || `${slot.place}_${slot.court}_${slot.date}_${slot.time}`
+  if (activeTasks.has(taskKey)) {
+    return { success: false, message: 'Duplicate' }
+  }
+  if (activeCount >= MAX_CONCURRENT) {
+    return { success: false, message: 'Busy' }
   }
 
   const adapter = loadPlatform(platformName)
@@ -131,11 +136,23 @@ async function handleBook(body) {
     console.log(`[booking-service] 放号窗口内 ${platformName}，操作停顿临时改为 ${platformConfig.HUMAN_DELAY_MIN}/${platformConfig.HUMAN_DELAY_MAX}ms`)
   }
 
-  busy = true
-  currentTask = { platform: platformName, slot }
+  activeCount += 1
+  activeTasks.set(taskKey, { platform: platformName, slot, startedAt: Date.now() })
 
   try {
-    const result = await adapter.book(slot, platformConfig)
+    // 网络类失败（超时/断连/5xx）重试最多 2 次（每次重试都是全新浏览器会话）；
+    // 业务类失败（已被预约、未找到空闲时段等）立即返回，不重试。
+    let result
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      result = await adapter.book(slot, platformConfig)
+      if (result.success) break
+      if (attempt < 3 && RETRYABLE_BOOKING_MESSAGE.test(String(result.message || ''))) {
+        console.log(`[booking-service] 预约重试 ${attempt}/2（${platformName} ${slot.place} ${slot.date} ${slot.time}）：${result.message}`)
+        await new Promise(r => setTimeout(r, 1000))
+        continue
+      }
+      break
+    }
 
     if (result.success) {
       const bookedSlots = await storage.getBookedSlots()
@@ -168,8 +185,8 @@ async function handleBook(body) {
   } catch (e) {
     return { success: false, message: e.message }
   } finally {
-    busy = false
-    currentTask = null
+    activeCount -= 1
+    activeTasks.delete(taskKey)
   }
 }
 
@@ -185,14 +202,17 @@ const server = http.createServer(async (req, res) => {
 
     // GET /status
     if (req.method === 'GET' && pathname === '/status') {
-      return json(res, { busy, currentTask })
+      return json(res, {
+        busy: activeCount > 0, activeCount,
+        currentTasks: [...activeTasks.values()].map(t => ({ platform: t.platform, place: t.slot?.place, date: t.slot?.date, time: t.slot?.time }))
+      })
     }
 
     // POST /api/book
     if (req.method === 'POST' && pathname === '/api/book') {
       const body = await parseBody(req)
       const result = await handleBook(body)
-      const status = result.success ? 200 : (result.message === 'Busy' ? 409 : 500)
+      const status = result.success ? 200 : (result.message === 'Busy' || result.message === 'Duplicate' ? 409 : 500)
       return json(res, result, status)
     }
 
@@ -270,7 +290,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && pathname === '/book') {
       const body = await parseBody(req)
       const result = await handleBook(body)
-      const status = result.success ? 200 : (result.message === 'Busy' ? 409 : 500)
+      const status = result.success ? 200 : (result.message === 'Busy' || result.message === 'Duplicate' ? 409 : 500)
       return json(res, result, status)
     }
 

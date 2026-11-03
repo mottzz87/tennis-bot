@@ -37,7 +37,8 @@ const { formatSlotText, escapeMarkdown } = require('@tennis-bot/notifier')
 const {
   createTrace, parseSlotStartDateTimeSafe, parseSlotDayKey, formatDateDisplayFromIso,
   isWeekendOrHoliday, slotToken,
-  jstDateKey, isReleaseWindow, matchReleaseReminderMoment
+  jstDateKey, jstParts, parseHHMM, normalizeReleaseReminder,
+  isReleaseWindow, matchReleaseReminderMoment
 } = require('@tennis-bot/utils')
 
 const DATA_DIR = process.env.MONITOR_DATA_DIR || path.resolve(__dirname, '../../data')
@@ -621,6 +622,204 @@ function checkReleaseReminders() {
   }
 }
 
+// ========================
+// 放号日定向扫描 + 自动抢（RELEASE_REMINDER，未配置 = 不启用）
+// 时间线（JST）：每月 11 号放出下月时段（仅可见、不可提交）；放号日（DAY）11:00
+// 定向扫描放号月锁定目标；12:00（OPEN_AT）对锁定目标自动开抢。
+// 目标：放号月内周末/祝日优先、其次平日 19 点；每天取最晚一个时段（与 AUTO_BOOK 的
+// autoPickTargets 同规则，避免同一天抢多个）；3 并行、失败重试一轮；结果推送汇总。
+// 开关：平台顶层 RELEASE_AUTO_GRAB === false 时关闭（默认开启；/set edogawa:RELEASE_AUTO_GRAB false）。
+// 扫描时刻：RELEASE_REMINDER 内的 RELEASE_SCAN_AT，缺省 11:00。
+// ========================
+const releaseScannedDay = new Map() // platform -> dayKey（当日已成功定向扫描）
+const releaseGrabbedDay = new Map() // platform -> dayKey（当日已开抢）
+const releaseTargets = new Map() // platform -> { dayKey, targets }
+
+function getReleaseMonthPrefix(now = Date.now()) {
+  const key = jstDateKey(now) // YYYY-MM-DD
+  const [y, m] = key.split('-').map(Number)
+  const nm = m === 12 ? 1 : m + 1
+  const ny = m === 12 ? y + 1 : y
+  return `${ny}-${String(nm).padStart(2, '0')}`
+}
+
+function getReleaseScanAtMin(rr) {
+  const parsed = parseHHMM(rr?.RELEASE_SCAN_AT || '11:00')
+  return parsed ? parsed[0] * 60 + parsed[1] : 11 * 60
+}
+
+function getReleaseOpenAtMin(rr) {
+  const parsed = parseHHMM(rr?.OPEN_AT || '')
+  return parsed ? parsed[0] * 60 + parsed[1] : null
+}
+
+// 放号目标排序：周末/祝日优先、其次平日 19 点；同档按日期+时间先后
+function sortReleaseTargets(list) {
+  const tier = d => (isWeekendOrHoliday(d) ? 0 : (getSlotStartHour(d) === 19 ? 1 : 2))
+  return list.slice().sort((a, b) => {
+    const ta = tier(a); const tb = tier(b)
+    if (ta !== tb) return ta - tb
+    const ka = `${a.date || ''} ${a.start || a.time || ''}`
+    const kb = `${b.date || ''} ${b.start || b.time || ''}`
+    return ka < kb ? -1 : ka > kb ? 1 : 0
+  })
+}
+
+// 从已 enriched+filtered 的空位里选放号目标：放号月 +（周末/祝日 或 平日 19 点），
+// 每天一个（autoPickTargets：取当天最晚时段，并跳过已自动预约过的 uid/日期）
+function selectReleaseTargets(slots, releaseMonth) {
+  const cands = slots.filter(d => String(d.date || '').startsWith(releaseMonth))
+  const picked = core.autoPickTargets(cands, autoBookedUIDs, autoBookedDayKeys)
+  return sortReleaseTargets(picked).filter(d => isWeekendOrHoliday(d) || getSlotStartHour(d) === 19)
+}
+
+async function runReleaseTargetScan(name) {
+  const st = runtime[name]
+  const platformConfig = config.getPlatform(name)
+  if (!st || platformConfig.enabled === false || st.paused) return false
+  if (st.scanning || st.releaseScanning) return false
+  const adapter = loadPlatform(name)
+  if (!adapter) return false
+  const releaseMonth = getReleaseMonthPrefix()
+  st.releaseScanning = true
+  try {
+    const slots = await adapter.fetchSlots(platformConfig, { releaseMonth })
+    const enriched = enrichSlots(slots, name, platformConfig)
+    const filtered = core.filterSlotsByConfig(enriched, platformConfig)
+    const targets = selectReleaseTargets(filtered, releaseMonth)
+    // 注意：不碰 lastSet/currentSlotMap，不干扰定时扫描的 diff/推送状态
+    releaseTargets.set(name, { dayKey: jstDateKey(Date.now()), targets })
+    releaseScannedDay.set(name, jstDateKey(Date.now()))
+    const weCount = targets.filter(d => isWeekendOrHoliday(d)).length
+    const b = getBotForPlatform(name)
+    const chatId = getPlatformChatId(name)
+    if (b && chatId) {
+      try {
+        await b.sendMessage(
+          chatId,
+          `🎯 *放号目标已锁定*\n━━━━━━━━━━━━━━\n${releaseMonth} 共 ${targets.length} 个（周末/祝日 ${weCount} 个，平日 19 点 ${targets.length - weCount} 个），12:00 到点自动开抢。`,
+          { parse_mode: 'Markdown' }
+        )
+      } catch (e) { console.log(`[放号抢] ${name} 锁定消息发送失败:`, e.message) }
+    }
+    console.log(`[放号抢] ${name} 定向扫描锁定 ${targets.length} 个目标（${releaseMonth}）`)
+    return true
+  } catch (e) {
+    console.log(`[放号抢] ${name} 定向扫描失败:`, e.message)
+    return false
+  } finally {
+    st.releaseScanning = false
+  }
+}
+
+async function runWithConcurrency(items, limit, fn) {
+  const results = new Array(items.length)
+  let idx = 0
+  const workers = Array.from({ length: Math.max(1, limit) }, async () => {
+    while (idx < items.length) {
+      const i = idx++
+      try { results[i] = await fn(items[i]) } catch (e) { results[i] = { success: false, message: e.message } }
+    }
+  })
+  await Promise.all(workers)
+  return results
+}
+
+async function runReleaseGrab(name) {
+  const st = runtime[name]
+  const platformConfig = config.getPlatform(name)
+  if (!st || platformConfig.enabled === false || st.paused) return
+  if (platformConfig.RELEASE_AUTO_GRAB === false) return
+  if (st.releaseGrabbing) return
+  const dayKey = jstDateKey(Date.now())
+  if (releaseGrabbedDay.get(name) === dayKey) return
+  st.releaseGrabbing = true
+  try {
+    const releaseMonth = getReleaseMonthPrefix()
+    const stored = releaseTargets.get(name)
+    let targets = stored && stored.dayKey === dayKey ? stored.targets : null
+    if (!targets) {
+      const slots = [...currentSlotMap.values()].filter(s => s.platform === name)
+      targets = selectReleaseTargets(slots, releaseMonth)
+      console.log(`[放号抢] ${name} 无当日定向扫描结果，用当前空位回退，共 ${targets.length} 个`)
+    }
+    // 跳过已自动预约成功的（重入/重启后防重复下单）
+    targets = targets.filter(d => !autoBookedUIDs.has(d.uid))
+    const b = getBotForPlatform(name)
+    const chatId = getPlatformChatId(name)
+    if (targets.length === 0) {
+      releaseGrabbedDay.set(name, dayKey)
+      if (b && chatId) {
+        try { await b.sendMessage(chatId, `🎯 *放号开抢*\n━━━━━━━━━━━━━━\n今日放号无可抢目标。`, { parse_mode: 'Markdown' }) } catch (e) { console.log(`[放号抢] ${name} 消息发送失败:`, e.message) }
+      }
+      return
+    }
+    console.log(`[放号抢] ${name} 开抢 ${targets.length} 个目标`)
+    const attempt = async (t) => {
+      const r = await callBookingService(t, name)
+      if (r.success) {
+        autoBookedUIDs.add(t.uid)
+        const dk = parseSlotDayKey(t)
+        if (dk) autoBookedDayKeys.add(dk)
+        saveAutoBooked()
+      }
+      return r
+    }
+    let results = await runWithConcurrency(targets, 3, attempt)
+    const retryable = /timeout|timed out|ECONN|EAI_AGAIN|socket hang up|Busy|50[0-9]/i
+    const failed = targets.map((t, i) => ({ t, r: results[i] })).filter(({ r }) => !r.success && retryable.test(String(r.message || '')))
+    if (failed.length > 0) {
+      console.log(`[放号抢] ${name} ${failed.length} 个失败可重试，5s 后重试一轮`)
+      await new Promise(r => setTimeout(r, 5000))
+      const retryResults = await runWithConcurrency(failed.map(f => f.t), 3, attempt)
+      retryResults.forEach((r, i) => { results[targets.indexOf(failed[i].t)] = r })
+    }
+    releaseGrabbedDay.set(name, dayKey)
+    const ok = targets.map((t, i) => ({ t, r: results[i] })).filter(({ r }) => r.success)
+    const ng = targets.map((t, i) => ({ t, r: results[i] })).filter(({ r }) => !r.success)
+    if (b && chatId) {
+      const okText = ok.map(({ t, r }) => formatSlotText(r.fee?.total != null ? { ...t, totalFee: r.fee.total } : t, getPlatformConfig(t.place), { style: 'detail' })).join('\n\n')
+      const ngText = ng.map(({ t, r }) => `${formatSlotText(t, getPlatformConfig(t.place), { style: 'detail' })}\n理由：${escapeMarkdown(String(r.message || '未知'))}`).join('\n\n')
+      const msg = `🎯 *放号开抢结果*\n━━━━━━━━━━━━━━\n✅ 成功 ${ok.length} 个\n${okText || '无'}${ng.length ? `\n\n❌ 失败 ${ng.length} 个\n${ngText}` : ''}`
+      try {
+        for (const part of core.splitForTelegram(msg)) await b.sendMessage(chatId, part, { parse_mode: 'Markdown' })
+      } catch (e) { console.log(`[放号抢] ${name} 结果消息发送失败:`, e.message) }
+    }
+    console.log(`[放号抢] ${name} 结果：成功 ${ok.length}，失败 ${ng.length}`)
+    setTimeout(() => scanPlatform(name, { forcePush: true }), 1000)
+  } catch (e) {
+    console.log(`[放号抢] ${name} 开抢异常:`, e.message)
+  } finally {
+    st.releaseGrabbing = false
+  }
+}
+
+// 每 30s 轮询：放号日 11:00（RELEASE_SCAN_AT）定向扫描锁定目标，12:00（OPEN_AT）自动开抢。
+// 扫描未成功时在 12:00 前每轮都可补扫；开抢当天只执行一次。
+function checkReleaseFlow() {
+  const now = Date.now()
+  const dayKey = jstDateKey(now)
+  const p = jstParts(now)
+  const curMin = p.h * 60 + p.mi
+  for (const name of activePlatformNames()) {
+    const rr = getReleaseReminderConfig(name)
+    const norm = normalizeReleaseReminder(rr)
+    if (!norm) continue
+    if (p.d !== norm.day) continue
+    const platformConfig = config.getPlatform(name)
+    if (platformConfig.RELEASE_AUTO_GRAB === false) continue
+    const scanMin = getReleaseScanAtMin(rr)
+    const openMin = getReleaseOpenAtMin(rr)
+    if (openMin != null && curMin >= openMin) {
+      if (releaseGrabbedDay.get(name) !== dayKey && !runtime[name]?.releaseGrabbing) {
+        runReleaseGrab(name).catch(e => console.log(`[放号抢] ${name} 开抢失败:`, e.message))
+      }
+    } else if (curMin >= scanMin && releaseScannedDay.get(name) !== dayKey) {
+      runReleaseTargetScan(name).catch(e => console.log(`[放号抢] ${name} 定向扫描失败:`, e.message))
+    }
+  }
+}
+
 // 场地摘要一行：场地名出现一次，组计数内联（"🎯 西葛西（硬地 ×3 ・ 人工芝 ×13）"），无组只显示场地
 function placeSummaryLine(place, slots, platformConfig) {
   const counts = new Map()
@@ -947,8 +1146,8 @@ async function scanPlatform(name, options = {}) {
   const trace = createTrace()
   const st = runtime[name]
   if (!st) return
-  if (st.scanning || st.autoBooking) {
-    console.log(`[MONITOR][${name.toUpperCase()}][${trace}] SKIP 扫描/auto-book 进行中，跳过`)
+  if (st.scanning || st.autoBooking || st.releaseScanning) {
+    console.log(`[MONITOR][${name.toUpperCase()}][${trace}] SKIP 扫描/auto-book/放号扫描进行中，跳过`)
     return
   }
   const platformConfig = config.getPlatform(name)
@@ -1396,6 +1595,10 @@ async function start() {
     : '未配置（可在平台配置里加 RELEASE_REMINDER）'}`)
   checkReleaseReminders()
   setInterval(checkReleaseReminders, 30 * 1000)
+
+  // 放号日定向扫描 + 自动抢：每 30s 轮询一次（只有配置了 RELEASE_REMINDER 的平台会命中）
+  checkReleaseFlow()
+  setInterval(checkReleaseFlow, 30 * 1000)
 
   // 周末/祝日持续推送：每 60s 检查一次到期的登记并重推
   setInterval(() => { checkPersistentPush().catch(e => console.error('[持续推送] 检查失败:', e.message)) }, 60 * 1000)
