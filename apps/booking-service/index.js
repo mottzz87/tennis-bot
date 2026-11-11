@@ -8,13 +8,14 @@
  * - 提供预约数据查询 API
  *
  * API:
- *   POST /api/book            { platform, slot }
- *   POST /api/book/prepare    { platform, slot }  放号窗口预热：先登录+常驻时间选择页
+ *   POST /api/book            { platform, slot }       单时段（常规路径）
+ *   POST /api/book            { platform, slots }      批量（放号窗口：单会话顺序抢）
+ *   POST /api/book/prepare    { platform }             放号窗口预热：先登录+常驻 Home（单会话）
  *   GET  /api/booked           -> 全部预约记录
  *   GET  /api/booked/schedule  -> 未开始预约（按时间排序）
  *   POST /api/booked/disable-reminder  { uid }
  *   DELETE /api/booked/:uid
- *   GET  /status               -> { busy, activeCount, currentTasks, parkedCount, parkedTasks }
+ *   GET  /status               -> { busy, activeCount, currentTasks, parkedCount, parkedSession, batchRunning }
  */
 require('@tennis-bot/config/loadEnv')()
 const http = require('http')
@@ -76,40 +77,42 @@ const activeTasks = new Map() // key -> { platform, slot, startedAt }
 const MAX_CONCURRENT = Number(process.env.BOOKING_MAX_CONCURRENT) > 0 ? Number(process.env.BOOKING_MAX_CONCURRENT) : 3
 const RETRYABLE_BOOKING_MESSAGE = /timeout|timed out|ECONNRESET|ECONNREFUSED|EAI_AGAIN|ENOTFOUND|socket hang up|net::ERR|navigation failed|50[0-9]/i
 
-// 放号窗口预热会话（仅放号日 11:45 由 monitor 创建，抢场后或 30 分钟后销毁；
+// 放号窗口预热会话（单会话：仅放号日 11:45 由 monitor 创建，抢场后或 30 分钟后销毁；
 // 日常不保留登录会话，扫描仍走游客流程）
-const parkedSessions = new Map() // key -> { browser, context, page, timeUrl, deadlineMs, loginVerified, preparedAt, slot, keepAliveTimer, expireTimer }
-const preparingTasks = new Set() // 正在 prepare 的 key（防重复并发）
+// 单点登录限制：同一账号只能有一个会话，多浏览器会互相顶掉，所以只常驻一个。
+let parkedSession = null // { browser, context, page, homeUrl, deadlineMs, loginVerified, preparedAt, keepAliveTimer, expireTimer }
+let preparing = false // 正在 prepare（防重复并发）
 const PREPARED_TTL_MS = 30 * 60 * 1000 // 11:45 创建 → 约 12:15 过期
-const PREPARED_KEEPALIVE_MS = 3 * 60 * 1000 // 每 3 分钟刷新一次时间页，保持会话新鲜
+const PREPARED_KEEPALIVE_MS = 3 * 60 * 1000 // 每 3 分钟刷新一次 Home，保持会话新鲜
+let batchRunning = false // 批量顺序抢进行中（防重复调用）
 
-function parkSession(key, session, slot) {
-  const entry = { ...session, slot }
+function parkSession(session) {
+  const entry = { ...session }
   entry.keepAliveTimer = setInterval(() => {
-    entry.page?.goto(entry.timeUrl, { waitUntil: 'domcontentloaded' })
-      .then(() => console.log(`[booking-service] 预热会话保活：刷新时间页 ${key}`))
-      .catch(e => console.log(`[booking-service] 预热会话保活失败 ${key}:`, e.message))
+    entry.page?.goto(entry.homeUrl, { waitUntil: 'domcontentloaded' })
+      .then(() => console.log('[booking-service] 预热会话保活：刷新 Home'))
+      .catch(e => console.log('[booking-service] 预热会话保活失败:', e.message))
   }, PREPARED_KEEPALIVE_MS)
   entry.expireTimer = setTimeout(() => {
-    console.log(`[booking-service] 预热会话过期，关闭 ${key}`)
-    closeParkedSession(key)
+    console.log('[booking-service] 预热会话过期，关闭')
+    closeParkedSession()
   }, PREPARED_TTL_MS)
-  parkedSessions.set(key, entry)
-  console.log(`[booking-service] 预热会话已常驻 ${key}（保活 3 分钟，30 分钟后过期）`)
+  parkedSession = entry
+  console.log('[booking-service] 预热单会话已常驻 Home（保活 3 分钟，30 分钟后过期）')
 }
 
 // 取走预热会话（抢场时调用；取走后不再保活/过期，浏览器由抢场路径负责关闭）
-function takeParkedSession(key) {
-  const s = parkedSessions.get(key)
+function takeParkedSession() {
+  const s = parkedSession
   if (!s) return null
   clearInterval(s.keepAliveTimer)
   clearTimeout(s.expireTimer)
-  parkedSessions.delete(key)
+  parkedSession = null
   return s
 }
 
-function closeParkedSession(key) {
-  const s = takeParkedSession(key)
+function closeParkedSession() {
+  const s = takeParkedSession()
   if (s) s.browser?.close().catch(() => {})
 }
 
@@ -141,20 +144,18 @@ function json(res, data, status = 200) {
   res.end(JSON.stringify(data))
 }
 
-// 放号窗口预热（ADDITIVE）：先登录 + 导航到时间选择页，常驻会话。
-// 幂等：同一时段已有预热会话时直接返回；正在 prepare 时返回 Duplicate。
-// 仅放号日 11:45 由 monitor 调用；日常不调用。
+// 放号窗口预热（ADDITIVE）：单会话先登录 + 常驻 Home。
+// 幂等：已有预热会话时直接返回；正在 prepare 时返回 Duplicate。
+// 仅放号日 11:45 由 monitor 调用一次；日常不调用。
 async function handlePrepare(body) {
-  const { platform: platformName, slot } = body
-  if (!platformName || !slot) {
-    return { success: false, message: '缺少参数 platform 或 slot' }
+  const { platform: platformName } = body
+  if (!platformName) {
+    return { success: false, message: '缺少参数 platform' }
   }
-  const taskKey = slot.uid || slot.ucode || `${slot.place}_${slot.court}_${slot.date}_${slot.time}`
-  if (parkedSessions.has(taskKey)) {
-    const s = parkedSessions.get(taskKey)
-    return { success: true, message: '预热会话已存在', loginVerified: s.loginVerified ?? null, preparedAt: s.preparedAt }
+  if (parkedSession) {
+    return { success: true, message: '预热会话已存在', loginVerified: parkedSession.loginVerified ?? null, preparedAt: parkedSession.preparedAt }
   }
-  if (activeTasks.has(taskKey) || preparingTasks.has(taskKey)) {
+  if (preparing) {
     return { success: false, message: 'Duplicate' }
   }
   const adapter = loadPlatform(platformName)
@@ -165,16 +166,16 @@ async function handlePrepare(body) {
   if (platformConfig.enabled === false) {
     return { success: false, message: `平台 ${platformName} 未启用` }
   }
-  preparingTasks.add(taskKey)
+  preparing = true
   try {
-    const result = await adapter.prepare(slot, platformConfig)
+    const result = await adapter.prepare(platformConfig)
     if (!result.success) return result
-    parkSession(taskKey, result, slot)
-    return { success: true, message: '预热完成，已常驻时间选择页', loginVerified: result.loginVerified ?? null, preparedAt: result.preparedAt }
+    parkSession(result)
+    return { success: true, message: '预热完成，单会话已常驻 Home', loginVerified: result.loginVerified ?? null, preparedAt: result.preparedAt }
   } catch (e) {
     return { success: false, message: e.message }
   } finally {
-    preparingTasks.delete(taskKey)
+    preparing = false
   }
 }
 
@@ -193,22 +194,13 @@ async function handleBook(body) {
     return { success: false, message: `平台 ${platformName} 未找到` }
   }
 
-  // 预热会话（放号窗口专用）：存在时走预热抢场，浏览器已启动，不占并行池；
-  // 否则走下方常规路径。适配器不支持预热时关闭会话，走常规路径。
-  let parked = takeParkedSession(taskKey)
-  if (parked && typeof adapter.bookPrepared !== 'function') {
-    console.log(`[booking-service] 适配器 ${platformName} 不支持预热路径，关闭预热会话，走常规路径`)
-    await parked.browser?.close().catch(() => {})
-    parked = null
-  }
-  if (!parked && activeCount >= MAX_CONCURRENT) {
+  if (activeCount >= MAX_CONCURRENT) {
     return { success: false, message: 'Busy' }
   }
 
   // 合并 global + 平台配置（平台优先），让 global 里的默认值（如 HUMAN_DELAY_MIN/MAX）对预约生效
   const platformConfig = config.getMergedConfig(platformName)
   if (platformConfig.enabled === false) {
-    if (parked) await parked.browser?.close().catch(() => {})
     return { success: false, message: `平台 ${platformName} 未启用` }
   }
 
@@ -226,23 +218,17 @@ async function handleBook(body) {
 
   try {
     let result
-    if (parked) {
-      // 预热抢场（放号窗口专用）：用常驻会话 2 秒循环抢，内部处理重试与截止
-      console.log(`[booking-service] 使用预热会话抢场 ${taskKey}`)
-      result = await adapter.bookPrepared(parked, slot, platformConfig)
-    } else {
-      // 网络类失败（超时/断连/5xx）重试最多 2 次（每次重试都是全新浏览器会话）；
-      // 业务类失败（已被预约、未找到空闲时段等）立即返回，不重试。
-      for (let attempt = 1; attempt <= 3; attempt++) {
-        result = await adapter.book(slot, platformConfig)
-        if (result.success) break
-        if (attempt < 3 && RETRYABLE_BOOKING_MESSAGE.test(String(result.message || ''))) {
-          console.log(`[booking-service] 预约重试 ${attempt}/2（${platformName} ${slot.place} ${slot.date} ${slot.time}）：${result.message}`)
-          await new Promise(r => setTimeout(r, 1000))
-          continue
-        }
-        break
+    // 网络类失败（超时/断连/5xx）重试最多 2 次（每次重试都是全新浏览器会话）；
+    // 业务类失败（已被预约、未找到空闲时段等）立即返回，不重试。
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      result = await adapter.book(slot, platformConfig)
+      if (result.success) break
+      if (attempt < 3 && RETRYABLE_BOOKING_MESSAGE.test(String(result.message || ''))) {
+        console.log(`[booking-service] 预约重试 ${attempt}/2（${platformName} ${slot.place} ${slot.date} ${slot.time}）：${result.message}`)
+        await new Promise(r => setTimeout(r, 1000))
+        continue
       }
+      break
     }
 
     if (result.success) {
@@ -281,6 +267,83 @@ async function handleBook(body) {
   }
 }
 
+// 放号窗口批量抢场（ADDITIVE）：monitor 一次发来全部锁定目标，单会话内按优先级
+// 逐个抢（每批 1 个时段，一次申请只约一个；二合一申请全有全无，一个被抢整单作废）。仅在预热单会话存在时走本路径；
+// 不存在时返回 noParkedSession，由 monitor 回退到常规并行路径。
+// 不占并行池（单会话顺序抢）；同一时间只允许一个批量任务。
+// 注意：批量调用可能耗时数分钟（逐批抢），HTTP 服务端超时已在 start() 里放宽。
+async function handleBookBatch(body) {
+  const { platform: platformName, slots } = body
+  if (!platformName || !Array.isArray(slots) || slots.length === 0) {
+    return { success: false, message: '缺少参数 platform 或 slots' }
+  }
+  if (batchRunning) {
+    return { success: false, message: 'Duplicate' }
+  }
+  const adapter = loadPlatform(platformName)
+  if (!adapter || typeof adapter.bookPrepared !== 'function') {
+    return { success: false, message: `平台 ${platformName} 不支持批量预热抢场` }
+  }
+  const parked = takeParkedSession()
+  if (!parked) {
+    return { success: false, message: '预热会话不存在', noParkedSession: true }
+  }
+  const platformConfig = config.getMergedConfig(platformName)
+  if (platformConfig.enabled === false) {
+    await parked.browser?.close().catch(() => {})
+    return { success: false, message: `平台 ${platformName} 未启用` }
+  }
+
+  // 放号窗口内临时改用 RELEASE_REMINDER 里的操作停顿（与单时段路径相同）
+  const rr = platformConfig.RELEASE_REMINDER
+  if (isReleaseWindow(rr)) {
+    if (rr.HUMAN_DELAY_MIN != null) platformConfig.HUMAN_DELAY_MIN = Number(rr.HUMAN_DELAY_MIN)
+    if (rr.HUMAN_DELAY_MAX != null) platformConfig.HUMAN_DELAY_MAX = Number(rr.HUMAN_DELAY_MAX)
+    if (rr.HUMAN_INPUT_EXTRA_MS != null) platformConfig.HUMAN_INPUT_EXTRA_MS = Number(rr.HUMAN_INPUT_EXTRA_MS)
+    console.log(`[booking-service] 放号窗口内 ${platformName}，操作停顿临时改为 ${platformConfig.HUMAN_DELAY_MIN}/${platformConfig.HUMAN_DELAY_MAX}ms`)
+  }
+
+  batchRunning = true
+  try {
+    const result = await adapter.bookPrepared(parked, slots, platformConfig)
+    // 逐个记录成功的预约（与单时段路径相同的存储格式）
+    const bookedSlots = await storage.getBookedSlots()
+    let changed = false
+    for (const r of result.results || []) {
+      if (!r.success) continue
+      const slot = r.slot
+      const ucode = slot.ucode || `${slot.place}_${slot.court}_${slot.date}_${slot.time}`
+      const exists = bookedSlots.some(s => s.uid === slot.uid || s.ucode === ucode)
+      if (exists) continue
+      const fee = r.fee || null
+      bookedSlots.push({
+        uid: slot.uid || ucode,
+        ucode,
+        platform: platformName,
+        place: slot.place,
+        court: slot.court,
+        courts: slot.courts || null,
+        date: slot.date,
+        time: slot.time,
+        dateDisplay: slot.dateDisplay || '',
+        reminderEnabled: true,
+        facilityFee: fee?.facility ?? null,
+        lightingFee: fee?.lighting ?? null,
+        totalFee: fee?.total ?? null,
+        bookedAt: Date.now(),
+        create: new Date().toLocaleString()
+      })
+      changed = true
+    }
+    if (changed) await storage.saveBookedSlots(bookedSlots)
+    return result
+  } catch (e) {
+    return { success: false, message: e.message, results: slots.map(slot => ({ slot, success: false, message: e.message })) }
+  } finally {
+    batchRunning = false
+  }
+}
+
 // ========================
 // Router
 // ========================
@@ -294,16 +357,23 @@ const server = http.createServer(async (req, res) => {
     // GET /status
     if (req.method === 'GET' && pathname === '/status') {
       return json(res, {
-        busy: activeCount > 0, activeCount,
+        busy: activeCount > 0 || batchRunning, activeCount,
         currentTasks: [...activeTasks.values()].map(t => ({ platform: t.platform, place: t.slot?.place, date: t.slot?.date, time: t.slot?.time })),
-        parkedCount: parkedSessions.size,
-        parkedTasks: [...parkedSessions.values()].map(s => ({ place: s.slot?.place, date: s.slot?.date, time: s.slot?.time, loginVerified: s.loginVerified ?? null, preparedAt: s.preparedAt }))
+        parkedCount: parkedSession ? 1 : 0,
+        parkedSession: parkedSession ? { loginVerified: parkedSession.loginVerified ?? null, preparedAt: parkedSession.preparedAt } : null,
+        batchRunning
       })
     }
 
     // POST /api/book
     if (req.method === 'POST' && pathname === '/api/book') {
       const body = await parseBody(req)
+      // 批量调用（放号窗口：单会话顺序抢）：slots 数组；否则单时段常规路径
+      if (Array.isArray(body.slots)) {
+        const result = await handleBookBatch(body)
+        const status = result.success ? 200 : (result.message === 'Duplicate' ? 409 : 500)
+        return json(res, result, status)
+      }
       const result = await handleBook(body)
       const status = result.success ? 200 : (result.message === 'Busy' || result.message === 'Duplicate' ? 409 : 500)
       return json(res, result, status)
@@ -403,6 +473,10 @@ const server = http.createServer(async (req, res) => {
 
 async function start() {
   await loadConfig()
+  // 批量顺序抢一次调用可能耗时数分钟（逐批抢）：放宽 HTTP 服务端超时
+  // （Node 默认 requestTimeout 300s，12:10 截止的整轮最长约 11 分钟）。
+  server.requestTimeout = 15 * 60 * 1000
+  server.headersTimeout = 120 * 1000
   server.listen(PORT, () => {
     console.log(`[booking-service] 启动于 http://localhost:${PORT}`)
   })
