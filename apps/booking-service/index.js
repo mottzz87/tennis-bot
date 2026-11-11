@@ -9,11 +9,12 @@
  *
  * API:
  *   POST /api/book            { platform, slot }
+ *   POST /api/book/prepare    { platform, slot }  放号窗口预热：先登录+常驻时间选择页
  *   GET  /api/booked           -> 全部预约记录
  *   GET  /api/booked/schedule  -> 未开始预约（按时间排序）
  *   POST /api/booked/disable-reminder  { uid }
  *   DELETE /api/booked/:uid
- *   GET  /status               -> { busy, activeCount, currentTasks }
+ *   GET  /status               -> { busy, activeCount, currentTasks, parkedCount, parkedTasks }
  */
 require('@tennis-bot/config/loadEnv')()
 const http = require('http')
@@ -75,6 +76,43 @@ const activeTasks = new Map() // key -> { platform, slot, startedAt }
 const MAX_CONCURRENT = Number(process.env.BOOKING_MAX_CONCURRENT) > 0 ? Number(process.env.BOOKING_MAX_CONCURRENT) : 3
 const RETRYABLE_BOOKING_MESSAGE = /timeout|timed out|ECONNRESET|ECONNREFUSED|EAI_AGAIN|ENOTFOUND|socket hang up|net::ERR|navigation failed|50[0-9]/i
 
+// 放号窗口预热会话（仅放号日 11:45 由 monitor 创建，抢场后或 30 分钟后销毁；
+// 日常不保留登录会话，扫描仍走游客流程）
+const parkedSessions = new Map() // key -> { browser, context, page, timeUrl, deadlineMs, loginVerified, preparedAt, slot, keepAliveTimer, expireTimer }
+const preparingTasks = new Set() // 正在 prepare 的 key（防重复并发）
+const PREPARED_TTL_MS = 30 * 60 * 1000 // 11:45 创建 → 约 12:15 过期
+const PREPARED_KEEPALIVE_MS = 3 * 60 * 1000 // 每 3 分钟刷新一次时间页，保持会话新鲜
+
+function parkSession(key, session, slot) {
+  const entry = { ...session, slot }
+  entry.keepAliveTimer = setInterval(() => {
+    entry.page?.goto(entry.timeUrl, { waitUntil: 'domcontentloaded' })
+      .then(() => console.log(`[booking-service] 预热会话保活：刷新时间页 ${key}`))
+      .catch(e => console.log(`[booking-service] 预热会话保活失败 ${key}:`, e.message))
+  }, PREPARED_KEEPALIVE_MS)
+  entry.expireTimer = setTimeout(() => {
+    console.log(`[booking-service] 预热会话过期，关闭 ${key}`)
+    closeParkedSession(key)
+  }, PREPARED_TTL_MS)
+  parkedSessions.set(key, entry)
+  console.log(`[booking-service] 预热会话已常驻 ${key}（保活 3 分钟，30 分钟后过期）`)
+}
+
+// 取走预热会话（抢场时调用；取走后不再保活/过期，浏览器由抢场路径负责关闭）
+function takeParkedSession(key) {
+  const s = parkedSessions.get(key)
+  if (!s) return null
+  clearInterval(s.keepAliveTimer)
+  clearTimeout(s.expireTimer)
+  parkedSessions.delete(key)
+  return s
+}
+
+function closeParkedSession(key) {
+  const s = takeParkedSession(key)
+  if (s) s.browser?.close().catch(() => {})
+}
+
 // ========================
 // Helpers
 // ========================
@@ -103,6 +141,43 @@ function json(res, data, status = 200) {
   res.end(JSON.stringify(data))
 }
 
+// 放号窗口预热（ADDITIVE）：先登录 + 导航到时间选择页，常驻会话。
+// 幂等：同一时段已有预热会话时直接返回；正在 prepare 时返回 Duplicate。
+// 仅放号日 11:45 由 monitor 调用；日常不调用。
+async function handlePrepare(body) {
+  const { platform: platformName, slot } = body
+  if (!platformName || !slot) {
+    return { success: false, message: '缺少参数 platform 或 slot' }
+  }
+  const taskKey = slot.uid || slot.ucode || `${slot.place}_${slot.court}_${slot.date}_${slot.time}`
+  if (parkedSessions.has(taskKey)) {
+    const s = parkedSessions.get(taskKey)
+    return { success: true, message: '预热会话已存在', loginVerified: s.loginVerified ?? null, preparedAt: s.preparedAt }
+  }
+  if (activeTasks.has(taskKey) || preparingTasks.has(taskKey)) {
+    return { success: false, message: 'Duplicate' }
+  }
+  const adapter = loadPlatform(platformName)
+  if (!adapter || typeof adapter.prepare !== 'function') {
+    return { success: false, message: `平台 ${platformName} 不支持预热` }
+  }
+  const platformConfig = config.getMergedConfig(platformName)
+  if (platformConfig.enabled === false) {
+    return { success: false, message: `平台 ${platformName} 未启用` }
+  }
+  preparingTasks.add(taskKey)
+  try {
+    const result = await adapter.prepare(slot, platformConfig)
+    if (!result.success) return result
+    parkSession(taskKey, result, slot)
+    return { success: true, message: '预热完成，已常驻时间选择页', loginVerified: result.loginVerified ?? null, preparedAt: result.preparedAt }
+  } catch (e) {
+    return { success: false, message: e.message }
+  } finally {
+    preparingTasks.delete(taskKey)
+  }
+}
+
 async function handleBook(body) {
   const { platform: platformName, slot } = body
   if (!platformName || !slot) {
@@ -112,18 +187,28 @@ async function handleBook(body) {
   if (activeTasks.has(taskKey)) {
     return { success: false, message: 'Duplicate' }
   }
-  if (activeCount >= MAX_CONCURRENT) {
-    return { success: false, message: 'Busy' }
-  }
 
   const adapter = loadPlatform(platformName)
   if (!adapter) {
     return { success: false, message: `平台 ${platformName} 未找到` }
   }
 
+  // 预热会话（放号窗口专用）：存在时走预热抢场，浏览器已启动，不占并行池；
+  // 否则走下方常规路径。适配器不支持预热时关闭会话，走常规路径。
+  let parked = takeParkedSession(taskKey)
+  if (parked && typeof adapter.bookPrepared !== 'function') {
+    console.log(`[booking-service] 适配器 ${platformName} 不支持预热路径，关闭预热会话，走常规路径`)
+    await parked.browser?.close().catch(() => {})
+    parked = null
+  }
+  if (!parked && activeCount >= MAX_CONCURRENT) {
+    return { success: false, message: 'Busy' }
+  }
+
   // 合并 global + 平台配置（平台优先），让 global 里的默认值（如 HUMAN_DELAY_MIN/MAX）对预约生效
   const platformConfig = config.getMergedConfig(platformName)
   if (platformConfig.enabled === false) {
+    if (parked) await parked.browser?.close().catch(() => {})
     return { success: false, message: `平台 ${platformName} 未启用` }
   }
 
@@ -140,18 +225,24 @@ async function handleBook(body) {
   activeTasks.set(taskKey, { platform: platformName, slot, startedAt: Date.now() })
 
   try {
-    // 网络类失败（超时/断连/5xx）重试最多 2 次（每次重试都是全新浏览器会话）；
-    // 业务类失败（已被预约、未找到空闲时段等）立即返回，不重试。
     let result
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      result = await adapter.book(slot, platformConfig)
-      if (result.success) break
-      if (attempt < 3 && RETRYABLE_BOOKING_MESSAGE.test(String(result.message || ''))) {
-        console.log(`[booking-service] 预约重试 ${attempt}/2（${platformName} ${slot.place} ${slot.date} ${slot.time}）：${result.message}`)
-        await new Promise(r => setTimeout(r, 1000))
-        continue
+    if (parked) {
+      // 预热抢场（放号窗口专用）：用常驻会话 2 秒循环抢，内部处理重试与截止
+      console.log(`[booking-service] 使用预热会话抢场 ${taskKey}`)
+      result = await adapter.bookPrepared(parked, slot, platformConfig)
+    } else {
+      // 网络类失败（超时/断连/5xx）重试最多 2 次（每次重试都是全新浏览器会话）；
+      // 业务类失败（已被预约、未找到空闲时段等）立即返回，不重试。
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        result = await adapter.book(slot, platformConfig)
+        if (result.success) break
+        if (attempt < 3 && RETRYABLE_BOOKING_MESSAGE.test(String(result.message || ''))) {
+          console.log(`[booking-service] 预约重试 ${attempt}/2（${platformName} ${slot.place} ${slot.date} ${slot.time}）：${result.message}`)
+          await new Promise(r => setTimeout(r, 1000))
+          continue
+        }
+        break
       }
-      break
     }
 
     if (result.success) {
@@ -204,7 +295,9 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && pathname === '/status') {
       return json(res, {
         busy: activeCount > 0, activeCount,
-        currentTasks: [...activeTasks.values()].map(t => ({ platform: t.platform, place: t.slot?.place, date: t.slot?.date, time: t.slot?.time }))
+        currentTasks: [...activeTasks.values()].map(t => ({ platform: t.platform, place: t.slot?.place, date: t.slot?.date, time: t.slot?.time })),
+        parkedCount: parkedSessions.size,
+        parkedTasks: [...parkedSessions.values()].map(s => ({ place: s.slot?.place, date: s.slot?.date, time: s.slot?.time, loginVerified: s.loginVerified ?? null, preparedAt: s.preparedAt }))
       })
     }
 
@@ -213,6 +306,14 @@ const server = http.createServer(async (req, res) => {
       const body = await parseBody(req)
       const result = await handleBook(body)
       const status = result.success ? 200 : (result.message === 'Busy' || result.message === 'Duplicate' ? 409 : 500)
+      return json(res, result, status)
+    }
+
+    // POST /api/book/prepare（放号窗口预热：先登录+常驻时间选择页）
+    if (req.method === 'POST' && pathname === '/api/book/prepare') {
+      const body = await parseBody(req)
+      const result = await handlePrepare(body)
+      const status = result.success ? 200 : (result.message === 'Duplicate' ? 409 : 500)
       return json(res, result, status)
     }
 

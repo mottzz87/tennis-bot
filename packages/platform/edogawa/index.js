@@ -21,7 +21,7 @@ const {
   addDaysJst,
   daysToEndOfNextMonth
 } = require('./flow')
-const { bookSlot } = require('./booking')
+const { bookSlot, prepareSlot, bookWithPreparedSession } = require('./booking')
 
 const PLATFORM_NAME = 'edogawa'
 
@@ -196,6 +196,16 @@ class EdogawaAdapter {
 
   async book(slotData, platformConfig) {
     return bookSlot(this, slotData, platformConfig)
+  }
+
+  // 放号窗口预热（ADDITIVE）：仅在放号日由 booking-service /api/book/prepare 调用。
+  // 常规 book() 不变。
+  async prepare(slotData, platformConfig) {
+    return prepareSlot(this, slotData, platformConfig)
+  }
+
+  async bookPrepared(prepared, slotData, platformConfig) {
+    return bookWithPreparedSession(prepared, slotData, platformConfig)
   }
 }
 

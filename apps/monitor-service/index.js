@@ -294,6 +294,11 @@ function schedulePlatform(name) {
   st.timer = setTimeout(() => {
     st.timer = null
     st.lastCycleStartAt = Date.now()
+    // 放号日静默窗口（11:45–12:10）：不启动新的常规扫描，只重新排期（不打断已在跑的扫描）
+    if (isReleaseQuietWindow()) {
+      if (!st.paused && !st.timer) schedulePlatform(name)
+      return
+    }
     scanPlatform(name).finally(() => {
       // paused 防 /pause 之后又武装；!st.timer 防重复 timer
       if (!st.paused && !st.timer) schedulePlatform(name)
@@ -463,6 +468,8 @@ function togglePersistentPush(id) {
 // 每 60s 由定时器调用：到期的登记重推一次；空位已消失或日期已过则静默注销
 // （被约走的空位仍由 removed 通知报一次，这里不再重复报）。
 async function checkPersistentPush() {
+  // 放号日静默窗口（11:45–12:10）：暂停持续推送（登记保留，窗口后下一轮继续）
+  if (isReleaseQuietWindow()) return
   const now = Date.now()
   const dueByPlatform = new Map()
   for (const [ucode, entry] of persistentPush) {
@@ -634,6 +641,7 @@ function checkReleaseReminders() {
 const releaseScannedDay = new Map() // platform -> dayKey（当日已成功定向扫描）
 const releaseGrabbedDay = new Map() // platform -> dayKey（当日已开抢）
 const releaseTargets = new Map() // platform -> { dayKey, targets }
+const releasePrepared = new Map() // platform -> { dayKey, count }（当日预热完成数；count>0 才提前开抢）
 
 function getReleaseMonthPrefix(now = Date.now()) {
   const key = jstDateKey(now) // YYYY-MM-DD
@@ -651,6 +659,36 @@ function getReleaseScanAtMin(rr) {
 function getReleaseOpenAtMin(rr) {
   const parsed = parseHHMM(rr?.OPEN_AT || '')
   return parsed ? parsed[0] * 60 + parsed[1] : null
+}
+
+// 开抢时刻（分钟）：有预热会话时 OPEN_AT 前 1 分钟（11:59，30 秒轮询粒度下
+// 约提前 30–60 秒）；无预热会话时 OPEN_AT 准点。OPEN_AT 未配置返回 null。
+function getReleaseGrabMin(openMin, hasPrepared) {
+  if (openMin == null) return null
+  return hasPrepared ? openMin - 1 : openMin
+}
+
+// 放号日（任一平台 RELEASE_REMINDER 的 DAY；仅 edogawa 配置了它）
+function getReleaseDay() {
+  for (const name of activePlatformNames()) {
+    const norm = normalizeReleaseReminder(getReleaseReminderConfig(name))
+    if (norm) return norm.day
+  }
+  return null
+}
+
+// 放号日静默窗口（全局，JST）：11:45–12:10，期间不启动新的常规扫描、不执行
+// 持续推送。豁免：11:00 定向扫描、11:40 提醒、11:45 预热触发、开抢本身。
+// now 是毫秒时间戳（默认 Date.now()）；jstParts 只认数字，Date 对象会被
+// 字符串拼接丢掉 +9h，所以这里先归一化。
+function isReleaseQuietWindow(now = Date.now()) {
+  const t = now instanceof Date ? now.getTime() : now
+  const day = getReleaseDay()
+  if (day == null) return false
+  const p = jstParts(t)
+  if (p.d !== day) return false
+  const curMin = p.h * 60 + p.mi
+  return curMin >= 11 * 60 + 45 && curMin < 12 * 60 + 10
 }
 
 // 放号目标排序：周末/祝日优先、其次平日 19 点；同档按日期+时间先后
@@ -794,6 +832,48 @@ async function runReleaseGrab(name) {
   }
 }
 
+// 放号窗口预热触发：11:45，对当日锁定的每个目标调 /api/book/prepare，
+// 先登录并常驻时间选择页（放号窗口专用）。3 并行（与开抢池一致）。
+// 单个目标预热失败只记日志，不影响开抢（无预热会话的目标在 12:00 走常规路径）。
+// 注意：放号月目标约 25–31 个（每天一个），预热会同时常驻同样数量的浏览器，
+// 服务器内存需留有余量；若吃紧，可改为只预热周末/祝日目标。
+async function prepareReleaseTargets(name) {
+  const st = runtime[name]
+  const platformConfig = config.getPlatform(name)
+  if (!st || platformConfig.enabled === false || st.paused) return
+  if (st.releasePreparing) return
+  const dayKey = jstDateKey(Date.now())
+  const stored = releaseTargets.get(name)
+  let targets = stored && stored.dayKey === dayKey ? stored.targets : null
+  if (!targets) {
+    const slots = [...currentSlotMap.values()].filter(s => s.platform === name)
+    targets = selectReleaseTargets(slots, getReleaseMonthPrefix())
+    console.log(`[放号预热] ${name} 无当日定向扫描结果，用当前空位回退，共 ${targets.length} 个`)
+  }
+  targets = targets.filter(d => !autoBookedUIDs.has(d.uid))
+  if (targets.length === 0) {
+    releasePrepared.set(name, { dayKey, count: 0 })
+    console.log(`[放号预热] ${name} 无可预热目标`)
+    return
+  }
+  st.releasePreparing = true
+  releasePrepared.set(name, { dayKey, count: 0 })
+  try {
+    console.log(`[放号预热] ${name} 开始预热 ${targets.length} 个目标（3 并行）`)
+    const results = await runWithConcurrency(targets, 3, t => callBookingPrepare(t, name))
+    const ok = results.filter(r => r && r.success).length
+    releasePrepared.set(name, { dayKey, count: ok })
+    console.log(`[放号预热] ${name} 完成：成功 ${ok}/${targets.length} 个`)
+    results.forEach((r, i) => {
+      if (!r || !r.success) console.log(`[放号预热] ${name} 目标失败 ${targets[i].place} ${targets[i].date} ${targets[i].time}：${r?.message || '未知'}`)
+    })
+  } catch (e) {
+    console.log(`[放号预热] ${name} 预热异常:`, e.message)
+  } finally {
+    st.releasePreparing = false
+  }
+}
+
 // 每 30s 轮询：放号日 11:00（RELEASE_SCAN_AT）定向扫描锁定目标，12:00（OPEN_AT）自动开抢。
 // 扫描未成功时在 12:00 前每轮都可补扫；开抢当天只执行一次。
 function checkReleaseFlow() {
@@ -810,10 +890,18 @@ function checkReleaseFlow() {
     if (platformConfig.RELEASE_AUTO_GRAB === false) continue
     const scanMin = getReleaseScanAtMin(rr)
     const openMin = getReleaseOpenAtMin(rr)
-    if (openMin != null && curMin >= openMin) {
+    const prep = releasePrepared.get(name)
+    const hasPrepared = prep && prep.dayKey === dayKey && prep.count > 0
+    // 提前开抢：有预热会话时 OPEN_AT 前 1 分钟（11:59，30 秒轮询粒度下约提前 30–60 秒）
+    // 起 2 秒循环；无预热会话时按原计划 OPEN_AT 准点开抢（避免常规路径提前跑空）。
+    const grabMin = getReleaseGrabMin(openMin, hasPrepared)
+    if (grabMin != null && curMin >= grabMin) {
       if (releaseGrabbedDay.get(name) !== dayKey && !runtime[name]?.releaseGrabbing) {
         runReleaseGrab(name).catch(e => console.log(`[放号抢] ${name} 开抢失败:`, e.message))
       }
+    } else if (openMin != null && curMin >= 11 * 60 + 45 && curMin < openMin - 1 && (!prep || prep.dayKey !== dayKey) && !runtime[name]?.releasePreparing) {
+      // 11:45 预热：对锁定目标先登录+常驻时间选择页（放号窗口专用，每天一次）
+      prepareReleaseTargets(name).catch(e => console.log(`[放号预热] ${name} 预热失败:`, e.message))
     } else if (curMin >= scanMin && releaseScannedDay.get(name) !== dayKey) {
       runReleaseTargetScan(name).catch(e => console.log(`[放号抢] ${name} 定向扫描失败:`, e.message))
     }
@@ -951,6 +1039,29 @@ async function callBookingService(slotData, platformName) {
         try { resolve(JSON.parse(data)) } catch { resolve({ success: false, message: data }) }
       })
     })
+    req.on('error', reject)
+    req.write(body)
+    req.end()
+  })
+}
+
+// 调用 booking-service 预热：先登录+常驻时间选择页（放号窗口专用）。
+// prepare 含登录与导航，耗时较长，超时 120s。
+async function callBookingPrepare(slotData, platformName) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({ platform: platformName, slot: slotData })
+    const req = http.request(`${BOOKING_HOST}/api/book/prepare`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 120000
+    }, res => {
+      let data = ''
+      res.on('data', chunk => { data += chunk })
+      res.on('end', () => {
+        try { resolve(JSON.parse(data)) } catch { resolve({ success: false, message: data }) }
+      })
+    })
+    req.on('timeout', () => { req.destroy(new Error('prepare 超时（120s）')) })
     req.on('error', reject)
     req.write(body)
     req.end()
