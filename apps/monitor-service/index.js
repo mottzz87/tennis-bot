@@ -633,10 +633,11 @@ function checkReleaseReminders() {
 // 放号日定向扫描 + 自动抢（RELEASE_REMINDER，未配置 = 不启用）
 // 时间线（JST）：每月 11 号放出下月时段（仅可见、不可提交）；放号日（DAY）11:00
 // 定向扫描放号月锁定目标；12:00（OPEN_AT）对锁定目标自动开抢。
-// 目标：放号月内周末/祝日优先、其次平日 19 点；每天一个时段（autoPickTargets：
-// 连续 3–4 小时档优先（如 17–21、8–12），否则 2 小时段按 19:00 开始、最早上午、
+// 目标：放号月内周末/祝日优先、其次平日 19 点；每天最多两个时段（autoPickTargets：
+// 连续 3–4 小时档优先（如 17–21、8–12），否则两个 2 小时段按 19:00 开始、最早上午、
 // 最晚依次取）；单会话顺序抢（每批 1 个，一次申请只约一个）、失败记日志继续下一批；
-// 每批成功后回 Home 重跑完整导航链；放号时刻后失败即换下一目标，不空转；结果推送汇总。
+// 每批成功后回 Home，下一批先试直接单日查询（被拒时重跑完整导航链）；放号时刻后
+// 失败即换下一目标，不空转；结果推送汇总。
 // 开关：平台顶层 RELEASE_AUTO_GRAB === false 时关闭（默认开启；/set edogawa:RELEASE_AUTO_GRAB false）。
 // 扫描时刻：RELEASE_REMINDER 内的 RELEASE_SCAN_AT，缺省 11:00。
 // ========================
@@ -706,7 +707,7 @@ function sortReleaseTargets(list) {
 }
 
 // 从已 enriched+filtered 的空位里选放号目标：放号月 +（周末/祝日 或 平日 19 点），
-// 每天一个（autoPickTargets：连续 3–4 小时档优先，否则 2 小时段，
+// 每天最多两个（autoPickTargets { maxPerDay: 2 }：一个连续 3–4 小时档，或两个 2 小时段，
 // 并跳过已自动预约过的 uid/日期）。
 // 注意：某天选中的目标未必本身就是 19 点档（例：上午 8–12 连续档），
 // 但它属于 19:00 日——必须按“天”过滤，不能按“时段”过滤，否则会被筛掉。
@@ -714,7 +715,7 @@ function sortReleaseTargets(list) {
 // 如 19–21 或 17–21），再保留这些天里的已选目标。
 function selectReleaseTargets(slots, releaseMonth) {
   const cands = slots.filter(d => String(d.date || '').startsWith(releaseMonth))
-  const picked = core.autoPickTargets(cands, autoBookedUIDs, autoBookedDayKeys)
+  const picked = core.autoPickTargets(cands, autoBookedUIDs, autoBookedDayKeys, { maxPerDay: 2 })
   const goodDays = new Set()
   for (const d of cands) {
     if (isWeekendOrHoliday(d) || core.slotCoversHour(d, 19 * 60)) {
@@ -751,7 +752,7 @@ async function runReleaseTargetScan(name) {
       try {
         await b.sendMessage(
           chatId,
-          `🎯 *放号目标已锁定*\n━━━━━━━━━━━━━━\n${releaseMonth} 共 ${dayCount} 天 ${targets.length} 个目标（周末/祝日 ${weCount} 个，平日 19 点档 ${targets.length - weCount} 个；每天 1 个），12:00 到点自动开抢。`,
+          `🎯 *放号目标已锁定*\n━━━━━━━━━━━━━━\n${releaseMonth} 共 ${dayCount} 天 ${targets.length} 个目标（周末/祝日 ${weCount} 个，平日 19 点档 ${targets.length - weCount} 个；每天最多 2 个），12:00 到点自动开抢。`,
           { parse_mode: 'Markdown' }
         )
       } catch (e) { console.log(`[放号抢] ${name} 锁定消息发送失败:`, e.message) }
@@ -889,7 +890,7 @@ async function runReleaseGrab(name) {
   }
 }
 
-// 放号窗口预热触发：11:45，调一次 /api/book/prepare，单会话先登录并常驻 Home
+// 放号窗口预热触发：11:45，调一次 /api/book/prepare，单会话先登录并常驻首个目标的时间选择页
 // （放号窗口专用；单点登录限制，同一账号只留一个会话）。
 // 预热失败只记日志，开抢时无预热会话则走常规并行路径（12:00 准点）。
 async function prepareReleaseTargets(name) {
@@ -900,12 +901,16 @@ async function prepareReleaseTargets(name) {
   const dayKey = jstDateKey(Date.now())
   st.releasePreparing = true
   try {
-    console.log(`[放号预热] ${name} 开始预热单会话（先登录，常驻 Home）`)
-    const r = await callBookingPrepare(name)
+    // 首个锁定目标（优先级最高）传给预热：常驻会话停在它的时间选择页上；
+    // 无锁定目标时预热只登录并常驻 Home。
+    const locked = releaseTargets.get(name)
+    const firstSlot = locked && locked.dayKey === dayKey && Array.isArray(locked.targets) && locked.targets.length > 0 ? locked.targets[0] : null
+    console.log(`[放号预热] ${name} 开始预热单会话（先登录，常驻${firstSlot ? `首个目标的时间选择页（${firstSlot.place} ${firstSlot.date}）` : ' Home'}）`)
+    const r = await callBookingPrepare(name, firstSlot)
     const ok = r && r.success ? 1 : 0
     releasePrepared.set(name, { dayKey, count: ok })
     if (ok) {
-      console.log(`[放号预热] ${name} 完成：单会话已常驻`)
+      console.log(`[放号预热] ${name} 完成：单会话已常驻${r.timeUrl ? '时间选择页' : ' Home'}`)
     } else {
       console.log(`[放号预热] ${name} 预热失败：${r?.message || '未知'}，开抢时走常规路径`)
     }
@@ -943,7 +948,7 @@ function checkReleaseFlow() {
         runReleaseGrab(name).catch(e => console.log(`[放号抢] ${name} 开抢失败:`, e.message))
       }
     } else if (openMin != null && curMin >= 11 * 60 + 45 && curMin < openMin - 1 && (!prep || prep.dayKey !== dayKey) && !runtime[name]?.releasePreparing) {
-      // 11:45 预热：单会话先登录+常驻 Home（放号窗口专用，每天一次）
+      // 11:45 预热：单会话先登录+常驻首个目标的时间选择页（放号窗口专用，每天一次）
       prepareReleaseTargets(name).catch(e => console.log(`[放号预热] ${name} 预热失败:`, e.message))
     } else if (curMin >= scanMin && releaseScannedDay.get(name) !== dayKey) {
       runReleaseTargetScan(name).catch(e => console.log(`[放号抢] ${name} 定向扫描失败:`, e.message))
@@ -1088,11 +1093,12 @@ async function callBookingService(slotData, platformName) {
   })
 }
 
-// 调用 booking-service 预热：单会话先登录+常驻 Home（放号窗口专用）。
+// 调用 booking-service 预热：单会话先登录+常驻首个目标的时间选择页
+// （传 slot；无 slot 时常驻 Home）。放号窗口专用。
 // prepare 含登录，耗时较长，超时 120s。
-async function callBookingPrepare(platformName) {
+async function callBookingPrepare(platformName, slot) {
   return new Promise((resolve, reject) => {
-    const body = JSON.stringify({ platform: platformName })
+    const body = JSON.stringify(slot ? { platform: platformName, slot } : { platform: platformName })
     const req = http.request(`${BOOKING_HOST}/api/book/prepare`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
