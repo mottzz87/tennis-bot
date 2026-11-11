@@ -633,8 +633,10 @@ function checkReleaseReminders() {
 // 放号日定向扫描 + 自动抢（RELEASE_REMINDER，未配置 = 不启用）
 // 时间线（JST）：每月 11 号放出下月时段（仅可见、不可提交）；放号日（DAY）11:00
 // 定向扫描放号月锁定目标；12:00（OPEN_AT）对锁定目标自动开抢。
-// 目标：放号月内周末/祝日优先、其次平日 19 点；每天取最晚一个时段（与 AUTO_BOOK 的
-// autoPickTargets 同规则，避免同一天抢多个）；3 并行、失败重试一轮；结果推送汇总。
+// 目标：放号月内周末/祝日优先、其次平日 19 点；每天一个时段（autoPickTargets：
+// 连续 3–4 小时档优先（如 17–21、8–12），否则 2 小时段按 19:00 开始、最早上午、
+// 最晚依次取）；单会话顺序抢（每批 1 个，一次申请只约一个）、失败记日志继续下一批；
+// 每批成功后回 Home 重跑完整导航链；放号时刻后失败即换下一目标，不空转；结果推送汇总。
 // 开关：平台顶层 RELEASE_AUTO_GRAB === false 时关闭（默认开启；/set edogawa:RELEASE_AUTO_GRAB false）。
 // 扫描时刻：RELEASE_REMINDER 内的 RELEASE_SCAN_AT，缺省 11:00。
 // ========================
@@ -704,11 +706,24 @@ function sortReleaseTargets(list) {
 }
 
 // 从已 enriched+filtered 的空位里选放号目标：放号月 +（周末/祝日 或 平日 19 点），
-// 每天一个（autoPickTargets：取当天最晚时段，并跳过已自动预约过的 uid/日期）
+// 每天一个（autoPickTargets：连续 3–4 小时档优先，否则 2 小时段，
+// 并跳过已自动预约过的 uid/日期）。
+// 注意：某天选中的目标未必本身就是 19 点档（例：上午 8–12 连续档），
+// 但它属于 19:00 日——必须按“天”过滤，不能按“时段”过滤，否则会被筛掉。
+// 先从全部候选里算出合格的天（周末/祝日，或当天有覆盖 19:00 的时段，
+// 如 19–21 或 17–21），再保留这些天里的已选目标。
 function selectReleaseTargets(slots, releaseMonth) {
   const cands = slots.filter(d => String(d.date || '').startsWith(releaseMonth))
   const picked = core.autoPickTargets(cands, autoBookedUIDs, autoBookedDayKeys)
-  return sortReleaseTargets(picked).filter(d => isWeekendOrHoliday(d) || getSlotStartHour(d) === 19)
+  const goodDays = new Set()
+  for (const d of cands) {
+    if (isWeekendOrHoliday(d) || core.slotCoversHour(d, 19 * 60)) {
+      const dk = parseSlotDayKey(d)
+      if (dk) goodDays.add(dk)
+    }
+  }
+  const kept = picked.filter(d => goodDays.has(parseSlotDayKey(d)))
+  return sortReleaseTargets(kept)
 }
 
 async function runReleaseTargetScan(name) {
@@ -729,13 +744,14 @@ async function runReleaseTargetScan(name) {
     releaseTargets.set(name, { dayKey: jstDateKey(Date.now()), targets })
     releaseScannedDay.set(name, jstDateKey(Date.now()))
     const weCount = targets.filter(d => isWeekendOrHoliday(d)).length
+    const dayCount = new Set(targets.map(d => parseSlotDayKey(d))).size
     const b = getBotForPlatform(name)
     const chatId = getPlatformChatId(name)
     if (b && chatId) {
       try {
         await b.sendMessage(
           chatId,
-          `🎯 *放号目标已锁定*\n━━━━━━━━━━━━━━\n${releaseMonth} 共 ${targets.length} 个（周末/祝日 ${weCount} 个，平日 19 点 ${targets.length - weCount} 个），12:00 到点自动开抢。`,
+          `🎯 *放号目标已锁定*\n━━━━━━━━━━━━━━\n${releaseMonth} 共 ${dayCount} 天 ${targets.length} 个目标（周末/祝日 ${weCount} 个，平日 19 点档 ${targets.length - weCount} 个；每天 1 个），12:00 到点自动开抢。`,
           { parse_mode: 'Markdown' }
         )
       } catch (e) { console.log(`[放号抢] ${name} 锁定消息发送失败:`, e.message) }
@@ -760,6 +776,31 @@ async function runWithConcurrency(items, limit, fn) {
     }
   })
   await Promise.all(workers)
+  return results
+}
+
+// 常规并行抢场（无预热会话时；与今天完全一致）：3 并行、失败重试一轮。
+// 返回与 targets 一一对应的结果数组。
+async function runParallelReleaseGrab(targets, name) {
+  const attempt = async (t) => {
+    const r = await callBookingService(t, name)
+    if (r.success) {
+      autoBookedUIDs.add(t.uid)
+      const dk = parseSlotDayKey(t)
+      if (dk) autoBookedDayKeys.add(dk)
+      saveAutoBooked()
+    }
+    return r
+  }
+  const results = await runWithConcurrency(targets, 3, attempt)
+  const retryable = /timeout|timed out|ECONN|EAI_AGAIN|socket hang up|Busy|50[0-9]/i
+  const failed = targets.map((t, i) => ({ t, r: results[i] })).filter(({ r }) => !r.success && retryable.test(String(r.message || '')))
+  if (failed.length > 0) {
+    console.log(`[放号抢] ${name} ${failed.length} 个失败可重试，5s 后重试一轮`)
+    await new Promise(r => setTimeout(r, 5000))
+    const retryResults = await runWithConcurrency(failed.map(f => f.t), 3, attempt)
+    retryResults.forEach((r, i) => { results[targets.indexOf(failed[i].t)] = r })
+  }
   return results
 }
 
@@ -793,24 +834,40 @@ async function runReleaseGrab(name) {
       return
     }
     console.log(`[放号抢] ${name} 开抢 ${targets.length} 个目标`)
-    const attempt = async (t) => {
-      const r = await callBookingService(t, name)
-      if (r.success) {
-        autoBookedUIDs.add(t.uid)
-        const dk = parseSlotDayKey(t)
-        if (dk) autoBookedDayKeys.add(dk)
+    const prep = releasePrepared.get(name)
+    const hasPrepared = prep && prep.dayKey === dayKey && prep.count > 0
+    let results
+    if (hasPrepared) {
+      // 单会话顺序抢：一次调用，booking-service 内按优先级逐个抢（每批 1 个，一次申请只约一个）
+      console.log(`[放号抢] ${name} 使用预热单会话顺序抢 ${targets.length} 个目标`)
+      const batchRes = await callBookingServiceBatch(targets, name).catch(e => ({ success: false, message: e.message }))
+      if (batchRes && batchRes.noParkedSession) {
+        console.log(`[放号抢] ${name} 预热会话不存在，回退到常规并行抢场`)
+        results = await runParallelReleaseGrab(targets, name)
+      } else if (batchRes && Array.isArray(batchRes.results)) {
+        const byUid = new Map()
+        for (const r of batchRes.results) {
+          const s = r.slot || {}
+          if (s.uid) byUid.set(s.uid, r)
+          if (s.ucode) byUid.set(s.ucode, r)
+        }
+        results = targets.map(t => byUid.get(t.uid) || byUid.get(t.ucode) || { success: false, message: '批量结果中未找到该目标' })
+        for (let i = 0; i < targets.length; i++) {
+          if (results[i].success) {
+            autoBookedUIDs.add(targets[i].uid)
+            const dk = parseSlotDayKey(targets[i])
+            if (dk) autoBookedDayKeys.add(dk)
+          }
+        }
         saveAutoBooked()
+      } else {
+        // 批量调用本身失败（网络/超时等）：不再并行重跑，避免重复下单的不确定性
+        // （booking-service 内循环可能仍在跑；结果记为失败，日志为准）
+        console.log(`[放号抢] ${name} 批量调用失败：${batchRes?.message || '未知'}（不再并行重跑）`)
+        results = targets.map(() => ({ success: false, message: batchRes?.message || '批量调用失败' }))
       }
-      return r
-    }
-    let results = await runWithConcurrency(targets, 3, attempt)
-    const retryable = /timeout|timed out|ECONN|EAI_AGAIN|socket hang up|Busy|50[0-9]/i
-    const failed = targets.map((t, i) => ({ t, r: results[i] })).filter(({ r }) => !r.success && retryable.test(String(r.message || '')))
-    if (failed.length > 0) {
-      console.log(`[放号抢] ${name} ${failed.length} 个失败可重试，5s 后重试一轮`)
-      await new Promise(r => setTimeout(r, 5000))
-      const retryResults = await runWithConcurrency(failed.map(f => f.t), 3, attempt)
-      retryResults.forEach((r, i) => { results[targets.indexOf(failed[i].t)] = r })
+    } else {
+      results = await runParallelReleaseGrab(targets, name)
     }
     releaseGrabbedDay.set(name, dayKey)
     const ok = targets.map((t, i) => ({ t, r: results[i] })).filter(({ r }) => r.success)
@@ -832,42 +889,28 @@ async function runReleaseGrab(name) {
   }
 }
 
-// 放号窗口预热触发：11:45，对当日锁定的每个目标调 /api/book/prepare，
-// 先登录并常驻时间选择页（放号窗口专用）。3 并行（与开抢池一致）。
-// 单个目标预热失败只记日志，不影响开抢（无预热会话的目标在 12:00 走常规路径）。
-// 注意：放号月目标约 25–31 个（每天一个），预热会同时常驻同样数量的浏览器，
-// 服务器内存需留有余量；若吃紧，可改为只预热周末/祝日目标。
+// 放号窗口预热触发：11:45，调一次 /api/book/prepare，单会话先登录并常驻 Home
+// （放号窗口专用；单点登录限制，同一账号只留一个会话）。
+// 预热失败只记日志，开抢时无预热会话则走常规并行路径（12:00 准点）。
 async function prepareReleaseTargets(name) {
   const st = runtime[name]
   const platformConfig = config.getPlatform(name)
   if (!st || platformConfig.enabled === false || st.paused) return
   if (st.releasePreparing) return
   const dayKey = jstDateKey(Date.now())
-  const stored = releaseTargets.get(name)
-  let targets = stored && stored.dayKey === dayKey ? stored.targets : null
-  if (!targets) {
-    const slots = [...currentSlotMap.values()].filter(s => s.platform === name)
-    targets = selectReleaseTargets(slots, getReleaseMonthPrefix())
-    console.log(`[放号预热] ${name} 无当日定向扫描结果，用当前空位回退，共 ${targets.length} 个`)
-  }
-  targets = targets.filter(d => !autoBookedUIDs.has(d.uid))
-  if (targets.length === 0) {
-    releasePrepared.set(name, { dayKey, count: 0 })
-    console.log(`[放号预热] ${name} 无可预热目标`)
-    return
-  }
   st.releasePreparing = true
-  releasePrepared.set(name, { dayKey, count: 0 })
   try {
-    console.log(`[放号预热] ${name} 开始预热 ${targets.length} 个目标（3 并行）`)
-    const results = await runWithConcurrency(targets, 3, t => callBookingPrepare(t, name))
-    const ok = results.filter(r => r && r.success).length
+    console.log(`[放号预热] ${name} 开始预热单会话（先登录，常驻 Home）`)
+    const r = await callBookingPrepare(name)
+    const ok = r && r.success ? 1 : 0
     releasePrepared.set(name, { dayKey, count: ok })
-    console.log(`[放号预热] ${name} 完成：成功 ${ok}/${targets.length} 个`)
-    results.forEach((r, i) => {
-      if (!r || !r.success) console.log(`[放号预热] ${name} 目标失败 ${targets[i].place} ${targets[i].date} ${targets[i].time}：${r?.message || '未知'}`)
-    })
+    if (ok) {
+      console.log(`[放号预热] ${name} 完成：单会话已常驻`)
+    } else {
+      console.log(`[放号预热] ${name} 预热失败：${r?.message || '未知'}，开抢时走常规路径`)
+    }
   } catch (e) {
+    releasePrepared.set(name, { dayKey, count: 0 })
     console.log(`[放号预热] ${name} 预热异常:`, e.message)
   } finally {
     st.releasePreparing = false
@@ -900,7 +943,7 @@ function checkReleaseFlow() {
         runReleaseGrab(name).catch(e => console.log(`[放号抢] ${name} 开抢失败:`, e.message))
       }
     } else if (openMin != null && curMin >= 11 * 60 + 45 && curMin < openMin - 1 && (!prep || prep.dayKey !== dayKey) && !runtime[name]?.releasePreparing) {
-      // 11:45 预热：对锁定目标先登录+常驻时间选择页（放号窗口专用，每天一次）
+      // 11:45 预热：单会话先登录+常驻 Home（放号窗口专用，每天一次）
       prepareReleaseTargets(name).catch(e => console.log(`[放号预热] ${name} 预热失败:`, e.message))
     } else if (curMin >= scanMin && releaseScannedDay.get(name) !== dayKey) {
       runReleaseTargetScan(name).catch(e => console.log(`[放号抢] ${name} 定向扫描失败:`, e.message))
@@ -1045,11 +1088,11 @@ async function callBookingService(slotData, platformName) {
   })
 }
 
-// 调用 booking-service 预热：先登录+常驻时间选择页（放号窗口专用）。
-// prepare 含登录与导航，耗时较长，超时 120s。
-async function callBookingPrepare(slotData, platformName) {
+// 调用 booking-service 预热：单会话先登录+常驻 Home（放号窗口专用）。
+// prepare 含登录，耗时较长，超时 120s。
+async function callBookingPrepare(platformName) {
   return new Promise((resolve, reject) => {
-    const body = JSON.stringify({ platform: platformName, slot: slotData })
+    const body = JSON.stringify({ platform: platformName })
     const req = http.request(`${BOOKING_HOST}/api/book/prepare`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1062,6 +1105,29 @@ async function callBookingPrepare(slotData, platformName) {
       })
     })
     req.on('timeout', () => { req.destroy(new Error('prepare 超时（120s）')) })
+    req.on('error', reject)
+    req.write(body)
+    req.end()
+  })
+}
+
+// 调用 booking-service 批量抢场（放号窗口：单会话顺序抢）：一次发去全部锁定目标，
+// booking-service 内逐批抢。整轮最长约 11 分钟（11:59 起，12:10 截止），超时 15 分钟。
+async function callBookingServiceBatch(slots, platformName) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({ platform: platformName, slots })
+    const req = http.request(`${BOOKING_HOST}/api/book`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      timeout: 15 * 60 * 1000
+    }, res => {
+      let data = ''
+      res.on('data', chunk => { data += chunk })
+      res.on('end', () => {
+        try { resolve(JSON.parse(data)) } catch { resolve({ success: false, message: data }) }
+      })
+    })
+    req.on('timeout', () => { req.destroy(new Error('批量抢场超时（15 分钟）')) })
     req.on('error', reject)
     req.write(body)
     req.end()
