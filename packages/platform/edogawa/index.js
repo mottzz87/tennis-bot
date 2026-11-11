@@ -21,7 +21,7 @@ const {
   addDaysJst,
   daysToEndOfNextMonth
 } = require('./flow')
-const { bookSlot } = require('./booking')
+const { bookSlot, prepareSession, bookBatchesWithPreparedSession } = require('./booking')
 
 const PLATFORM_NAME = 'edogawa'
 
@@ -196,6 +196,18 @@ class EdogawaAdapter {
 
   async book(slotData, platformConfig) {
     return bookSlot(this, slotData, platformConfig)
+  }
+
+  // 放号窗口预热（ADDITIVE）：仅在放号日由 booking-service /api/book/prepare 调用。
+  // 单会话：先登录，常驻首个目标的时间选择页（无目标或时间页不可达时退回 Home）。
+  // 常规 book() 不变。
+  async prepare(platformConfig, slot) {
+    return prepareSession(this, platformConfig, slot)
+  }
+
+  // 放号窗口批量抢场（ADDITIVE）：单会话内按优先级逐批抢（每批 1 个时段，一次申请）。
+  async bookPrepared(prepared, slots, platformConfig) {
+    return bookBatchesWithPreparedSession(this, prepared, slots, platformConfig)
   }
 }
 

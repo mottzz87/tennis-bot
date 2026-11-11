@@ -360,11 +360,35 @@ function diffSlots(currentData, lastSet) {
 }
 
 // ========================
-// 自动抢目标选择
+// 自动抢目标选择（放号窗口专用规则）
 // ========================
+// 每天最多选 opts.maxPerDay 个时段（默认 1；放号路径传 2，上限 2）。
+// 每个时段单独一次申请（一次申请只约一个时段；二合一申请全有全无，
+// 一个被抢整单作废，所以不再把两个时段拼进一次申请）。
+// 每日优先级（确定性，无随机）：
+//   1) 连续 3–4 小时空闲段（一次申请，例：17–21、8–12），晚段优先、
+//      其次时长更长、其次开始更早；有连续档时只取这一个（长档优先于两个 2 小时段）；
+//   2) 否则 2 小时段：19:00 开始优先，其次最早的上午段，其次最晚的段，
+//      取前 maxPerDay 个；2 小时段不足时用其余日间段时段（任意时长，最晚优先）
+//      补足到上限；
+//   3) 兜底：当天最晚的日间段时段（避免空手）。
+// 2) / 3) 只取开始时间落在日间段内的时段（中午段不在 TIME_FILTER 内，不抢）。
+// 连续段可能由一段合并时段直接构成（如上午 8–12），也可能由同场地
+// 相邻的两段拼成（如 17–19 + 19–21，黄金时段 19–21 会把合并链断开）。
+// autoBookedDayKeys 仍按天跳过（当天已自动预约过则整天跳过），与今天一致。
+// 连续 3–4 小时档的日间段（默认与 edogawa TIME_FILTER 的早/晚段一致：
+// 上午 6:00–12:00，下午/晚上 17:00–22:00）。连续档必须完整落在其内
+// （例：8–12、17–21）。调用方可通过 opts.windows 覆盖。
+const DEFAULT_RANGE_WINDOWS = [[360, 720], [1020, 1320]]
+const EVENING_START_MIN = 19 * 60 // 19:00（黄金档锚点）
 
-function autoPickTargets(candidates, autoBookedUIDs, autoBookedDayKeys) {
+// 目标选择：每天最多 maxPerDay 个（默认 1；放号路径传 2）。
+// opts.windows：日间段 [[开始分钟, 结束分钟], ...]，默认上午/晚上两段。
+function autoPickTargets(candidates, autoBookedUIDs, autoBookedDayKeys, opts = {}) {
   const now = Date.now()
+  const windows = Array.isArray(opts.windows) && opts.windows.length > 0
+    ? opts.windows
+    : DEFAULT_RANGE_WINDOWS
 
   const valid = candidates.filter(d => {
     const startDate = parseSlotStartDateTimeSafe(d)
@@ -381,7 +405,7 @@ function autoPickTargets(candidates, autoBookedUIDs, autoBookedDayKeys) {
 
   if (valid.length === 0) return []
 
-  // 按天分组，每天选最晚一个
+  // 按天分组，每天选一个
   const grouped = new Map()
   for (const d of valid) {
     const dayKey = parseSlotDayKey(d)
@@ -390,17 +414,183 @@ function autoPickTargets(candidates, autoBookedUIDs, autoBookedDayKeys) {
     grouped.get(dayKey).push(d)
   }
 
+  // 每天最多 maxPerDay 个（默认 1；放号路径传 2，上限 2）
+  const maxPerDay = Math.max(1, Math.min(2, Number(opts.maxPerDay) || 1))
   const targets = []
   for (const [dayKey, list] of grouped.entries()) {
-    list.sort((a, b) => {
-      const ta = parseSlotStartDateTimeSafe(a)?.getTime() ?? -Infinity
-      const tb = parseSlotStartDateTimeSafe(b)?.getTime() ?? -Infinity
-      return tb - ta
+    const range = pickBestRange(list, windows)
+    if (range) {
+      // 连续 3–4 小时档（一次申请）优先于两个 2 小时段：只取这一个。
+      targets.push(range)
+      continue
+    }
+    const inWindow = d => {
+      const s = slotStartMin(d)
+      return windows.some(w => s >= w[0] && s <= w[1])
+    }
+    const twoHour = list.filter(d => slotDurationMin(d) === 120 && inWindow(d))
+    const morningEnd = windows[0][1]
+    const sorted2h = twoHour.slice().sort((a, b) => {
+      const sa = slotStartMin(a)
+      const sb = slotStartMin(b)
+      const a19 = sa === EVENING_START_MIN
+      const b19 = sb === EVENING_START_MIN
+      if (a19 !== b19) return a19 ? -1 : 1
+      const aM = sa < morningEnd
+      const bM = sb < morningEnd
+      if (aM && bM) return sa - sb // 都是上午：最早优先
+      if (aM !== bM) return aM ? -1 : 1 // 上午优先于非上午
+      if (sb !== sa) return sb - sa // 都不是上午：最晚优先
+      return slotTiebreak(a, b)
     })
-    targets.push(list[0])
+    const picked = sorted2h.slice(0, maxPerDay)
+    if (picked.length < maxPerDay) {
+      // 2 小时段不够时，用其余日间段时段（任意时长，最晚优先）补足到上限
+      const pickedUids = new Set(picked.map(d => d.uid))
+      const rest = list.filter(d => inWindow(d) && !pickedUids.has(d.uid)).sort((a, b) => {
+        const diff = slotStartMin(b) - slotStartMin(a)
+        return diff !== 0 ? diff : slotTiebreak(a, b)
+      })
+      for (const d of rest) {
+        if (picked.length >= maxPerDay) break
+        picked.push(d)
+      }
+    }
+    targets.push(...picked)
   }
 
   return targets
+}
+
+// 确定性平局：设施、场地、uid 字典序
+function slotTiebreak(a, b) {
+  const pa = `${a.place || ''}|${a.court || ''}|${a.uid || ''}`
+  const pb = `${b.place || ''}|${b.court || ''}|${b.uid || ''}`
+  return pa < pb ? -1 : pa > pb ? 1 : 0
+}
+
+// 时段是否覆盖某分钟（起 ≤ 该分钟 < 止；例：17–21 覆盖 19:00，17–19 不覆盖）
+function slotCoversHour(d, hourMin) {
+  return slotStartMin(d) <= hourMin && slotEndMin(d) > hourMin
+}
+
+// 单面时段：courts 拼接序列里只有一个场地字母（或无序列，默认单面）。
+// 跨面拼段（如 "AB面"）不参与连续档组装——跨面就不是同一张场地的连续时间。
+function isSingleCourtSlot(d) {
+  const seq = String(d.courts || '')
+  if (!seq) return true
+  const letters = seq.replace(/[\d.]/g, '')
+  return new Set(letters).size <= 1
+}
+
+// 从一段连续空闲里取最佳 3–4 小时窗口（无则返回 null）。
+// 同场地（place+court）相邻段拼成连续链；链总长 180–240 分钟取整条，
+// 超过 240 分钟取链尾 240 分钟（如上午 6–12 空满取 8–12）；
+// 窗口必须完整落在某个日间段内。返回合成的时段对象（可直接用于预约：
+// start/end/duration/time/courts/uid/ucode 均按窗口重算）。
+function pickBestRange(list, windows) {
+  // 同场地分组
+  const groups = new Map()
+  for (const d of list) {
+    if (!isSingleCourtSlot(d)) continue
+    const key = `${d.place || ''}|${d.court || ''}`
+    if (!groups.has(key)) groups.set(key, [])
+    groups.get(key).push(d)
+  }
+  const wins = []
+  for (const segs of groups.values()) {
+    const sorted = segs.slice().sort((a, b) => slotStartMin(a) - slotStartMin(b) || slotTiebreak(a, b))
+    // 连续链：上一段结束 = 下一段开始
+    let run = [sorted[0]]
+    const runs = []
+    for (let i = 1; i < sorted.length; i++) {
+      if (slotEndMin(run[run.length - 1]) === slotStartMin(sorted[i])) run.push(sorted[i])
+      else { runs.push(run); run = [sorted[i]] }
+    }
+    runs.push(run)
+    for (const r of runs) {
+      const total = slotEndMin(r[r.length - 1]) - slotStartMin(r[0])
+      if (total < 180) continue
+      // 窗口：整条（180–240）或链尾 240 分钟
+      const winEnd = slotEndMin(r[r.length - 1])
+      const winStart = total <= 240 ? slotStartMin(r[0]) : winEnd - 240
+      const wi = windows.findIndex(w => winStart >= w[0] && winEnd <= w[1])
+      if (wi < 0) continue
+      wins.push({ segments: r, startMin: winStart, endMin: winEnd, windowIndex: wi, duration: winEnd - winStart })
+    }
+  }
+  if (wins.length === 0) return null
+  // 晚段优先、时长更长、开始更早、设施/场地字典序
+  wins.sort((a, b) => {
+    if (b.windowIndex !== a.windowIndex) return b.windowIndex - a.windowIndex
+    if (b.duration !== a.duration) return b.duration - a.duration
+    if (a.startMin !== b.startMin) return a.startMin - b.startMin
+    return slotTiebreak(a.segments[0], b.segments[0])
+  })
+  const best = wins[0]
+  return buildRangeSlot(best.segments, best.startMin, best.endMin)
+}
+
+// 把一段连续空闲（一段或多段同场地）合成一个可预约的时段对象。
+// courts 按窗口逐小时展开（如 17–21 同面 A → "4A"），selectTimeCells 靠它逐小时选面。
+function buildRangeSlot(segments, startMin, endMin) {
+  const first = segments[0]
+  const hours = Math.round((endMin - startMin) / 60)
+  const letter = courtLetter(first.court)
+  const start = fmtMin(startMin)
+  const end = fmtMin(endMin)
+  const time = `${start}-${end}`
+  return {
+    ...first,
+    start,
+    end,
+    duration: endMin - startMin,
+    time,
+    courts: hours > 0 && letter ? `${hours}${letter}` : first.courts,
+    uid: `${first.place || ''}_${first.court || ''}_${first.date || ''}_${time}`,
+    ucode: `${first.place || ''}_${first.court || ''}_${first.date || ''}_${time}`
+  }
+}
+
+// 分钟数 → "HH:MM"
+function fmtMin(min) {
+  const h = Math.floor(min / 60)
+  const m = min % 60
+  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`
+}
+
+// 时段开始分钟数（start 为 "HH:MM"；无 start 时从 time 取首段）
+function slotStartMin(d) {
+  const raw = String(d.start ?? String(d.time || '').split(/[～~\-]/)[0] ?? '')
+  return toMinutes(raw)
+}
+
+// 时段结束分钟数（end 为 "HH:MM"；无 end 时从 time 取末段）
+function slotEndMin(d) {
+  const raw = String(d.end ?? '')
+  if (raw) return toMinutes(raw)
+  const parts = String(d.time || '').split(/[～~\-]/)
+  return parts.length > 1 ? toMinutes(parts[1]) : 0
+}
+
+// 时段开始小时
+function slotStartHour(d) {
+  return Math.floor(slotStartMin(d) / 60)
+}
+
+// 时段结束小时
+function slotEndHour(d) {
+  return Math.floor(slotEndMin(d) / 60)
+}
+
+// 时段时长（分钟）：优先用 duration 字段，否则 start/end 相减
+function slotDurationMin(d) {
+  const dur = Number(d.duration)
+  if (Number.isFinite(dur) && dur > 0) return dur
+  const s = slotStartMin(d)
+  const e = slotEndMin(d)
+  if (e > s) return e - s
+  return 0
 }
 
 // ========================
@@ -593,6 +783,7 @@ module.exports = {
   buildUcode,
   diffSlots,
   autoPickTargets,
+  slotCoversHour,
   cleanExpiredBooked,
   getFutureBookedSlots,
   eligibleForBookedSummary,
