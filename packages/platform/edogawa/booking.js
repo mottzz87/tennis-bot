@@ -697,6 +697,44 @@ async function prepareSlot(adapter, slotData, platformConfig) {
   }
 }
 
+// 预热专属：关闭站点弹出的错误弹窗（放号窗口专用）。
+// 站点在放号时刻前用弹窗拒绝 Next（实测：エラー「予約申込期間外のため、申込できません。」），
+// 弹窗不关闭会一直盖在时间页上，挡住后续的选时段/点击，循环原地打转。
+// 每次重试前先关掉它；没有弹窗时直接返回 false，不报错、不等待。
+// 选择器沿用 submitApply 的 .modal-dialog 约定；按钮限定在弹窗内，避免误点
+// 时间页上的「施設一覧を閉じる」。只认错误类弹窗（isErrorLike），确认类
+// 弹窗（如 はい）不动。弹窗文案记入日志，用于区分「尚未开放」和其他失败。
+async function dismissErrorModal(page, attempt) {
+  try {
+    const modal = page.locator('.modal-dialog')
+    if (await modal.count() === 0) return false
+    const first = modal.first()
+    if (!(await first.isVisible().catch(() => false))) return false
+    const text = (await first.innerText().catch(() => '')).trim()
+    if (!text || !isErrorLike(text)) return false
+    const closeBtn = first.locator('button:has-text("閉じる")')
+    if (await closeBtn.count() === 0) {
+      console.log(`[edogawa] 预热循环 #${attempt}：发现错误弹窗但无 閉じる 按钮（${text.slice(0, 120)}），无法关闭，继续重试`)
+      return false
+    }
+    let clicked = false
+    try {
+      await closeBtn.first().click({ timeout: 5000 })
+      clicked = true
+    } catch { clicked = false }
+    if (!clicked) {
+      console.log(`[edogawa] 预热循环 #${attempt}：点击 閉じる 失败（${text.slice(0, 120)}），继续重试`)
+      return false
+    }
+    await page.waitForTimeout(1000)
+    console.log(`[edogawa] 预热循环 #${attempt}：已关闭错误弹窗（${text.slice(0, 120)}），2 秒后重试`)
+    return true
+  } catch (e) {
+    console.log(`[edogawa] 预热循环 #${attempt}：关闭错误弹窗失败（${e.message}），继续重试`)
+    return false
+  }
+}
+
 /**
  * 预热抢场：用常驻会话 2 秒循环抢（放号窗口专用）。
  * selectTimeCells → clickNext → fillApplyDetail → submitApply；若明细表单
@@ -718,6 +756,9 @@ async function bookWithPreparedSession(prepared, slotData, platformConfig) {
         return { success: false, message: `放号循环已到截止时间（${attempt - 1} 次尝试，未抢到${lastError ? '；最后一次：' + lastError : ''}）` }
       }
       try {
+        // 放号前站点会用错误弹窗拒绝 Next（例：予約申込期間外のため、申込できません。）。
+        // 弹窗不关闭会盖住时间页、挡住后续点击：每次重试前先关掉它（无弹窗时直接跳过）。
+        await dismissErrorModal(page, attempt)
         // 若不在时间选择页，回到时间选择页
         if (!page.url().includes('AvailabilityCheckApplySelectTime')) {
           console.log(`[edogawa] 预热循环 #${attempt}：不在时间页，回到时间选择页`)
@@ -776,6 +817,9 @@ async function bookWithPreparedSession(prepared, slotData, platformConfig) {
           if (attempt === 1 || attempt % 30 === 0) {
             console.log(`[edogawa] 预热循环 #${attempt}：尚未开放（${e.message}），2 秒后重试`)
           }
+          // Next 被拒 / 明细表单未出现后，站点常留一个错误弹窗在时间页上：
+          // 不关掉它，下一次选时段/点击会被遮挡。关掉后再等 2 秒重试。
+          await dismissErrorModal(page, attempt)
           await page.waitForTimeout(2000)
           continue
         }
