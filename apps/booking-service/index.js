@@ -10,7 +10,7 @@
  * API:
  *   POST /api/book            { platform, slot }       单时段（常规路径）
  *   POST /api/book            { platform, slots }      批量（放号窗口：单会话顺序抢）
- *   POST /api/book/prepare    { platform }             放号窗口预热：先登录+常驻 Home（单会话）
+ *   POST /api/book/prepare    { platform, slot? }      放号窗口预热：先登录+常驻首个目标的时间选择页（单会话；无目标时常驻 Home）
  *   GET  /api/booked           -> 全部预约记录
  *   GET  /api/booked/schedule  -> 未开始预约（按时间排序）
  *   POST /api/booked/disable-reminder  { uid }
@@ -88,9 +88,10 @@ let batchRunning = false // 批量顺序抢进行中（防重复调用）
 
 function parkSession(session) {
   const entry = { ...session }
+  // 保活：刷新当前停放页（时间选择页优先，无时间页时为 Home），保持会话新鲜
   entry.keepAliveTimer = setInterval(() => {
-    entry.page?.goto(entry.homeUrl, { waitUntil: 'domcontentloaded' })
-      .then(() => console.log('[booking-service] 预热会话保活：刷新 Home'))
+    entry.page?.reload({ waitUntil: 'domcontentloaded' })
+      .then(() => console.log(`[booking-service] 预热会话保活：刷新 ${entry.timeUrl ? '时间选择页' : 'Home'}`))
       .catch(e => console.log('[booking-service] 预热会话保活失败:', e.message))
   }, PREPARED_KEEPALIVE_MS)
   entry.expireTimer = setTimeout(() => {
@@ -98,7 +99,7 @@ function parkSession(session) {
     closeParkedSession()
   }, PREPARED_TTL_MS)
   parkedSession = entry
-  console.log('[booking-service] 预热单会话已常驻 Home（保活 3 分钟，30 分钟后过期）')
+  console.log(`[booking-service] 预热单会话已常驻 ${entry.timeUrl ? `时间选择页（${entry.parkedTarget?.place} ${entry.parkedTarget?.date}）` : 'Home'}（保活 3 分钟，30 分钟后过期）`)
 }
 
 // 取走预热会话（抢场时调用；取走后不再保活/过期，浏览器由抢场路径负责关闭）
@@ -144,16 +145,17 @@ function json(res, data, status = 200) {
   res.end(JSON.stringify(data))
 }
 
-// 放号窗口预热（ADDITIVE）：单会话先登录 + 常驻 Home。
+// 放号窗口预热（ADDITIVE）：单会话先登录 + 常驻首个目标的时间选择页
+// （无目标或时间页不可达时退回常驻 Home）。
 // 幂等：已有预热会话时直接返回；正在 prepare 时返回 Duplicate。
 // 仅放号日 11:45 由 monitor 调用一次；日常不调用。
 async function handlePrepare(body) {
-  const { platform: platformName } = body
+  const { platform: platformName, slot } = body
   if (!platformName) {
     return { success: false, message: '缺少参数 platform' }
   }
   if (parkedSession) {
-    return { success: true, message: '预热会话已存在', loginVerified: parkedSession.loginVerified ?? null, preparedAt: parkedSession.preparedAt }
+    return { success: true, message: '预热会话已存在', loginVerified: parkedSession.loginVerified ?? null, preparedAt: parkedSession.preparedAt, timeUrl: parkedSession.timeUrl || null, parkedTarget: parkedSession.parkedTarget || null }
   }
   if (preparing) {
     return { success: false, message: 'Duplicate' }
@@ -168,10 +170,10 @@ async function handlePrepare(body) {
   }
   preparing = true
   try {
-    const result = await adapter.prepare(platformConfig)
+    const result = await adapter.prepare(platformConfig, slot)
     if (!result.success) return result
     parkSession(result)
-    return { success: true, message: '预热完成，单会话已常驻 Home', loginVerified: result.loginVerified ?? null, preparedAt: result.preparedAt }
+    return { success: true, message: result.timeUrl ? '预热完成，单会话已常驻时间选择页' : '预热完成，单会话已常驻 Home', loginVerified: result.loginVerified ?? null, preparedAt: result.preparedAt, timeUrl: result.timeUrl || null, parkedTarget: result.parkedTarget || null }
   } catch (e) {
     return { success: false, message: e.message }
   } finally {
@@ -360,7 +362,7 @@ const server = http.createServer(async (req, res) => {
         busy: activeCount > 0 || batchRunning, activeCount,
         currentTasks: [...activeTasks.values()].map(t => ({ platform: t.platform, place: t.slot?.place, date: t.slot?.date, time: t.slot?.time })),
         parkedCount: parkedSession ? 1 : 0,
-        parkedSession: parkedSession ? { loginVerified: parkedSession.loginVerified ?? null, preparedAt: parkedSession.preparedAt } : null,
+        parkedSession: parkedSession ? { loginVerified: parkedSession.loginVerified ?? null, preparedAt: parkedSession.preparedAt, timeUrl: parkedSession.timeUrl || null, parkedTarget: parkedSession.parkedTarget || null } : null,
         batchRunning
       })
     }
