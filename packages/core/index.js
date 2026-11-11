@@ -360,15 +360,21 @@ function diffSlots(currentData, lastSet) {
 }
 
 // ========================
-// 自动抢目标选择（放号窗口专用规则，每天最多两个）
+// 自动抢目标选择（放号窗口专用规则）
 // ========================
-// 每天最多选两个时段（确定性规则，无随机）：
-//   1. 有 19:00 开始的时段 → 选它，再加一个在它之前、19:00 结束的 2 小时段
-//      （配成连续晚场，如 17–19 + 19–21；优先同设施、同场地）；
-//      没有 19:00 前的 2 小时段时，只选 19:00 档一个。
-//   2. 没有 19:00 开始的时段 → 取当天最晚的两个 2 小时段；2 小时段不足两个时，
-//      用其余时段（任意时长，最晚优先）补足到两个；当天只有一个时段时只选它一个。
-// 注意：19:00 档本身不限时长（19–21 / 19–22 均可）；“之前”的时段严格要求 2 小时。
+// 每天最多选 opts.maxPerDay 个时段（默认 1；放号路径传 2，上限 2）。
+// 每个时段单独一次申请（一次申请只约一个时段；二合一申请全有全无，
+// 一个被抢整单作废，所以不再把两个时段拼进一次申请）。
+// 每日优先级（确定性，无随机）：
+//   1) 连续 3–4 小时空闲段（一次申请，例：17–21、8–12），晚段优先、
+//      其次时长更长、其次开始更早；有连续档时只取这一个（长档优先于两个 2 小时段）；
+//   2) 否则 2 小时段：19:00 开始优先，其次最早的上午段，其次最晚的段，
+//      取前 maxPerDay 个；2 小时段不足时用其余日间段时段（任意时长，最晚优先）
+//      补足到上限；
+//   3) 兜底：当天最晚的日间段时段（避免空手）。
+// 2) / 3) 只取开始时间落在日间段内的时段（中午段不在 TIME_FILTER 内，不抢）。
+// 连续段可能由一段合并时段直接构成（如上午 8–12），也可能由同场地
+// 相邻的两段拼成（如 17–19 + 19–21，黄金时段 19–21 会把合并链断开）。
 // autoBookedDayKeys 仍按天跳过（当天已自动预约过则整天跳过），与今天一致。
 // 连续 3–4 小时档的日间段（默认与 edogawa TIME_FILTER 的早/晚段一致：
 // 上午 6:00–12:00，下午/晚上 17:00–22:00）。连续档必须完整落在其内
@@ -376,16 +382,7 @@ function diffSlots(currentData, lastSet) {
 const DEFAULT_RANGE_WINDOWS = [[360, 720], [1020, 1320]]
 const EVENING_START_MIN = 19 * 60 // 19:00（黄金档锚点）
 
-// 目标选择：每天一个（一次申请只约一个时段；二合一申请全有全无，
-// 一个被抢整单作废，所以不再把两个时段拼进一次申请）。
-// 每日优先级（确定性，无随机）：
-//   1) 连续 3–4 小时空闲段（一次申请，例：17–21、8–12），晚段优先、
-//      其次时长更长、其次开始更早；
-//   2) 否则 2 小时段：19:00 开始优先，其次最早的上午段，其次最晚的段；
-//   3) 否则当天最晚的时段（兜底，避免空手）。
-// 2) / 3) 只取开始时间落在日间段内的时段（中午段不在 TIME_FILTER 内，不抢）。
-// 连续段可能由一段合并时段直接构成（如上午 8–12），也可能由同场地
-// 相邻的两段拼成（如 17–19 + 19–21，黄金时段 19–21 会把合并链断开）。
+// 目标选择：每天最多 maxPerDay 个（默认 1；放号路径传 2）。
 // opts.windows：日间段 [[开始分钟, 结束分钟], ...]，默认上午/晚上两段。
 function autoPickTargets(candidates, autoBookedUIDs, autoBookedDayKeys, opts = {}) {
   const now = Date.now()
@@ -417,10 +414,13 @@ function autoPickTargets(candidates, autoBookedUIDs, autoBookedDayKeys, opts = {
     grouped.get(dayKey).push(d)
   }
 
+  // 每天最多 maxPerDay 个（默认 1；放号路径传 2，上限 2）
+  const maxPerDay = Math.max(1, Math.min(2, Number(opts.maxPerDay) || 1))
   const targets = []
   for (const [dayKey, list] of grouped.entries()) {
     const range = pickBestRange(list, windows)
     if (range) {
+      // 连续 3–4 小时档（一次申请）优先于两个 2 小时段：只取这一个。
       targets.push(range)
       continue
     }
@@ -443,16 +443,20 @@ function autoPickTargets(candidates, autoBookedUIDs, autoBookedDayKeys, opts = {
       if (sb !== sa) return sb - sa // 都不是上午：最晚优先
       return slotTiebreak(a, b)
     })
-    if (sorted2h.length > 0) {
-      targets.push(sorted2h[0])
-      continue
+    const picked = sorted2h.slice(0, maxPerDay)
+    if (picked.length < maxPerDay) {
+      // 2 小时段不够时，用其余日间段时段（任意时长，最晚优先）补足到上限
+      const pickedUids = new Set(picked.map(d => d.uid))
+      const rest = list.filter(d => inWindow(d) && !pickedUids.has(d.uid)).sort((a, b) => {
+        const diff = slotStartMin(b) - slotStartMin(a)
+        return diff !== 0 ? diff : slotTiebreak(a, b)
+      })
+      for (const d of rest) {
+        if (picked.length >= maxPerDay) break
+        picked.push(d)
+      }
     }
-    // 兜底：当天最晚的日间段时段（任意时长）；中午段不取
-    const latest = list.filter(inWindow).sort((a, b) => {
-      const diff = slotStartMin(b) - slotStartMin(a)
-      return diff !== 0 ? diff : slotTiebreak(a, b)
-    })[0]
-    if (latest) targets.push(latest)
+    targets.push(...picked)
   }
 
   return targets
