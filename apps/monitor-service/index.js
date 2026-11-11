@@ -404,6 +404,23 @@ function isPersistentPushEligible(d) {
   return getSlotStartHour(d) === 19
 }
 
+// 放号月 slot 在放号时刻前不可预约：只推一次（首推），不参与持续重推；
+// 放号时刻一到自动恢复重推（登记保留，nextPushAt 已过期故下一轮即推）。
+// 放号时刻 = 当月 RELEASE_REMINDER.DAY 日 OPEN_AT（江户川默认 12 日 12:00）。
+function isPreReleaseSlot(slot, platformConfig, now = Date.now()) {
+  const rr = normalizeReleaseReminder(platformConfig?.RELEASE_REMINDER)
+  if (!rr) return false
+  const open = parseHHMM(rr.openAt)
+  if (!open) return false
+  const p = jstParts(now)
+  const releaseMs = Date.UTC(p.y, p.mo - 1, rr.day, open[0] - 9, open[1])
+  if (now >= releaseMs) return false
+  const m = String(slot?.date || '').match(/^(\d{4})-(\d{2})-/)
+  if (!m) return false
+  const slotYM = Number(m[1]) * 12 + Number(m[2])
+  return slotYM > p.y * 12 + p.mo
+}
+
 function armPersistentPush(slot, platform) {
   if (!slot?.ucode || persistentPush.has(slot.ucode)) return false
   persistentPush.set(slot.ucode, {
@@ -476,6 +493,8 @@ async function checkPersistentPush() {
     if (start && start.getTime() < now) { persistentPush.delete(ucode); continue }
     if (now < entry.nextPushAt) continue
     entry.slot = current
+    // 放号前只推一次：放号月 slot 在放号时刻前不重推（登记保留，放号后自动恢复）
+    if (isPreReleaseSlot(current, config.getPlatform(entry.platform))) continue
     if (!dueByPlatform.has(entry.platform)) dueByPlatform.set(entry.platform, [])
     dueByPlatform.get(entry.platform).push(current)
   }
