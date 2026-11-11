@@ -13,6 +13,8 @@ const {
   navigateToMonth,
   queryMonth,
   buildNextPayload,
+  extractToken,
+  extractInputs,
   isTennisCourt,
   normalizeName,
   todayJst,
@@ -99,6 +101,47 @@ function createReq(context, baseUrl) {
     }
     return context.request.get(url, { headers })
   }
+}
+
+// 单日查询的 DisplayTerm：页面表示期間四档 1日/1週間/2週間/1ヶ月 对应
+// 值 1/2/3/4（buildPeriodPlan 里 2=1週間、3=2週間、4=1ヶ月，与此一致）。
+// 单日查询只返回当天的数据（响应和 Next 模型都比整月小得多，抢场更快）。
+// 该值是按四档顺序推断的、未经站点实测确认：若站点不接受，
+// queryMonth 会返回空模型，调用方会回退到整期查询（见 getBatchTimePageUrl）。
+const SINGLE_DAY_TERM = '1'
+
+// 单日查询：SearchCondition 只查 dateKey 当天（DisplayTerm=1日）。
+// 返回 AvailabilitySelectDays 数组（只有当天）；查询失败/为空返回 []。
+async function querySingleDay(req, formFields, token3, dateKey) {
+  return queryMonth(req, formFields, token3, dateKey, SINGLE_DAY_TERM)
+}
+
+// 判断一段 HTML 是否日期选择页（AvailabilityCheckApplySelectDays）。
+// 预约完成后直接访问该页会被站点挡回（正文含“Homeに戻り”），此时须
+// 回 Home 重走完整导航链；Home 页本身不含 SearchCondition 表单。
+function isSelectDaysPage(html) {
+  const t = String(html || '')
+  if (t.includes('Homeに戻り')) return false
+  return t.includes('SearchCondition')
+}
+
+// 用已查到的月/日视图模型 + some cells 走 Next，返回时间页完整地址。
+// Next 的模型必须匹配当前 session 的 SearchCondition（startDate/displayTerm
+// 与刚查过的 queryMonth 一致），所以每次 queryMonth 后紧跟本次 Next。
+async function nextToTimePage(req, month, someCells, formFields, token3, startDate, displayTerm) {
+  const fd4 = buildNextPayload(month, someCells, formFields, token3, startDate, displayTerm)
+  const res = await req('/user/AvailabilityCheckApplySelectDays/Next', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: fd4.toString()
+  })
+  const nextBody = await res.text()
+  if (!nextBody.includes('Result')) throw new Error(`Next 异常响应: ${nextBody.slice(0, 120)}`)
+  const nextInfo = JSON.parse(JSON.parse(nextBody))
+  if (nextInfo.Result !== 'Ok') throw new Error(`Next 失败: ${JSON.stringify(nextInfo.Information)}`)
+  const timePath = nextInfo.Information?.MessageId || ''
+  if (!timePath) throw new Error('未获得时间页地址')
+  return timePath
 }
 
 // 在月视图中定位 (facility, court, date) 的 some cell；面名不匹配时退而求其次取同设施同日期的其它面
@@ -660,23 +703,29 @@ async function bookSlot(adapter, slotData, platformConfig) {
 // ============================================================================
 // 放号窗口预热（ADDITIVE：常规路径 bookSlot 一行不动）
 // 仅在放号日 11:45 由 booking-service /api/book/prepare 触发：单会话先登录，
-// 常驻 Home；12:00 开抢时在该唯一会话内按优先级逐批抢（每批同设施同日最多
-// 2 个时段，一次申请）。日常扫描仍走 bookSlot 的游客流程，不带 token。
-// 单点登录限制：同一账号只能有一个会话，多浏览器会互相顶掉，所以只常驻一个。
+// 常驻首个目标的时间选择页（AvailabilityCheckApplySelectTime）；无目标或
+// 时间页不可达时退回常驻 Home。12:00 开抢时在该唯一会话内按优先级逐个抢
+// （每批一个时段，一次申请只约一个）。日常扫描仍走 bookSlot 的游客流程，
+// 不带 token。单点登录限制：同一账号只能有一个会话，多浏览器会互相顶掉，
+// 所以只常驻一个。会话在整轮抢场期间一直保留（约完一个不销毁，有未约
+// 目标就继续约），整轮结束或约 12:15 后才销毁。
 // ============================================================================
 
 // 一个申请里最多同时约的时段数（同设施同日）。一次申请只约一个时段：
 // 站点申请是全有全无——两个时段拼进一次申请，一个被抢整单作废，
 // 等回头补约另一个也可能没了；一个一个约，失败只损失当前这一个。
-// 目标规则（autoPickTargets）每天也只选一个，与这里一致；改这个常量即可调整。
+// 目标规则（autoPickTargets）每天最多两个（一个 3–4 小时档，或两个 2 小时段），
+// 各自单独一次申请；改这个常量即可调整。
 const BATCH_SLOTS_PER_APPLICATION = 1
 
 /**
  * 预热准备：登录-first，返回常驻的唯一登录会话（不关闭浏览器）。
- * 只登录并停在 Home，不针对任何具体时段——目标横跨多天，时间页在开抢时
- * 按批次现取。失败时关闭浏览器并返回原因。
+ * 有首个目标时：登录后现取该目标的时间页地址，停在时间选择页上
+ * （12:00 第一批直接在该页选时段，不用再跑导航链）；无目标或时间页
+ * 不可达时退回常驻 Home（预热仍算成功，抢场时按批次现取时间页）。
+ * 失败时关闭浏览器并返回原因。
  */
-async function prepareSession(adapter, platformConfig) {
+async function prepareSession(adapter, platformConfig, firstSlot) {
   const baseUrl = adapter._baseUrl
   if (!baseUrl) return { success: false, message: 'EDOGAWA_BASE_URL 未配置' }
   if (!process.env.EDOGAWA_USER_ID || !process.env.EDOGAWA_PASSWORD) {
@@ -693,8 +742,27 @@ async function prepareSession(adapter, platformConfig) {
     const loginVerified = await loginFirst(page, baseUrl)
     const homeUrl = `${baseUrl}/user/Home`
     const deadlineMs = getGrabDeadlineMs(platformConfig)
-    console.log(`[edogawa] 预热完成：单会话已登录并常驻 Home（登录${loginVerified ? '已确认' : '未确认'}，循环截止 ${new Date(deadlineMs).toLocaleTimeString('ja-JP', { timeZone: 'Asia/Tokyo', hour12: false })} JST）`)
-    return { success: true, browser, context, page, homeUrl, deadlineMs, loginVerified, preparedAt: Date.now(), pauseRange }
+    // 停在首个目标的时间选择页上（12:00 第一批直接开抢）；失败则退回 Home
+    let timeUrl = null
+    let parkedTarget = null
+    if (firstSlot && firstSlot.place && firstSlot.date) {
+      try {
+        const req = createReq(context, baseUrl)
+        timeUrl = await getBatchTimePageUrl(req, adapter, [firstSlot], platformConfig)
+        await page.goto(timeUrl, { waitUntil: 'domcontentloaded' })
+        await page.waitForSelector('.fixed-bottom ul.buttons button[class*="btn-primary"]', { state: 'attached', timeout: 20000 })
+        parkedTarget = { place: firstSlot.place, date: String(firstSlot.date).slice(0, 10) }
+        console.log(`[edogawa] 预热完成：单会话已登录并常驻时间选择页（${parkedTarget.place} ${parkedTarget.date}，登录${loginVerified ? '已确认' : '未确认'}，循环截止 ${new Date(deadlineMs).toLocaleTimeString('ja-JP', { timeZone: 'Asia/Tokyo', hour12: false })} JST）`)
+      } catch (e) {
+        console.log(`[edogawa] 预热：时间选择页停放失败（${e.message}），退回常驻 Home`)
+        timeUrl = null
+        parkedTarget = null
+        await page.goto(homeUrl, { waitUntil: 'domcontentloaded' }).catch(() => {})
+      }
+    } else {
+      console.log(`[edogawa] 预热完成：单会话已登录并常驻 Home（无首个目标，登录${loginVerified ? '已确认' : '未确认'}，循环截止 ${new Date(deadlineMs).toLocaleTimeString('ja-JP', { timeZone: 'Asia/Tokyo', hour12: false })} JST）`)
+    }
+    return { success: true, browser, context, page, homeUrl, timeUrl, parkedTarget, deadlineMs, loginVerified, preparedAt: Date.now(), pauseRange }
   } catch (e) {
     await browser.close().catch(() => {})
     console.log(`[edogawa] 预热失败:`, e.message)
@@ -734,52 +802,81 @@ function groupSlotsIntoBatches(slots, batchSize = BATCH_SLOTS_PER_APPLICATION) {
 }
 
 // 为一个批次（一个时段，一次申请）取时间页地址。
-// 链路与 bookSlot 的 1–3 步相同：每次现跑完整导航（Home → 设施选择 →
-// 日期选择 → Next），不复用上一次的导航状态；Next 勾选该时段对应的 some cell
-// （同一对象去重）。失败时抛错（由调用方按“尚未开放/已约满”分类处理）。
+// 查询只查当天（单日查询 DisplayTerm=1日），不查整月：响应和 Next 模型
+// 都小得多，抢场更快。路径分两档：
+//   1) 直接进日期选择页：GET /user/AvailabilityCheckApplySelectDays →
+//      单日查询 → Next。预约完成后站点可能挡回该页（“Homeに戻り”），此时走 2)；
+//   2) 完整导航链：navigateToMonth（Home → 设施选择 → 日期选择）→
+//      单日查询 → Next；单日查询无结果时再回退到整期查询（防 DisplayTerm=1
+//      不被站点接受）。
+// 失败时抛错（由调用方按“尚未开放/已约满”分类处理）。
 async function getBatchTimePageUrl(req, adapter, batch, platformConfig) {
   const baseUrl = adapter._baseUrl
+  const place = batch[0].place
+  const dateKey = String(batch[0].date || '').slice(0, 10)
+  const toUrl = timePath => baseUrl + (timePath.startsWith('.') ? '/user/' + timePath.slice(2) : timePath)
+
+  // 从一批次的 some cells 里找目标时段对应的 cell（同一对象去重）
+  const collectCells = month => {
+    const seen = new Set()
+    const out = []
+    for (const slot of batch) {
+      let cells = findSomeCells(month, slot)
+      if (cells.length === 0) {
+        const legacy = findSomeCell(month, slot)
+        if (legacy) cells = [legacy]
+      }
+      for (const c of cells) {
+        if (!seen.has(c.cell)) { seen.add(c.cell); out.push(c) }
+      }
+    }
+    return out.slice(0, 10)
+  }
+
+  // 1) 直接进日期选择页（跳过设施选择；预约完成后可能被挡回）
+  try {
+    const res = await req('/user/AvailabilityCheckApplySelectDays')
+    const html = await res.text()
+    if (!isSelectDaysPage(html)) throw new Error('直接进日期选择页被拒（Homeに戻り），走完整导航')
+    const token3 = extractToken(html)
+    const formFields = extractInputs(html)
+    const month = await querySingleDay(req, formFields, token3, dateKey)
+    const someCells = collectCells(month)
+    if (someCells.length === 0) throw new Error('单日查询无结果，走完整导航确认')
+    const timePath = await nextToTimePage(req, month, someCells, formFields, token3, dateKey, SINGLE_DAY_TERM)
+    console.log(`[edogawa] 时间页（直接单日查询）: ${place} ${dateKey}`)
+    return toUrl(timePath)
+  } catch (e) {
+    console.log(`[edogawa] 直接单日查询失败（${e.message}），走完整导航链`)
+  }
+
+  // 2) 完整导航链：Home → 设施选择 → 日期选择，再单日查询
   const startOffset = Number(platformConfig.SCAN_START_OFFSET) > 0 ? Number(platformConfig.SCAN_START_OFFSET) : 2
   let scanDays = Number(platformConfig.SCAN_DAYS) > 0 ? Number(platformConfig.SCAN_DAYS) : 14
   if (platformConfig.SCAN_UNTIL_NEXT_MONTH_END) {
     scanDays = daysToEndOfNextMonth(addDaysJst(todayJst(), startOffset))
   }
-  const place = batch[0].place
-  const dateKey = String(batch[0].date || '').slice(0, 10)
   const nav = await navigateToMonth(req, [place], scanDays, startOffset)
   if (!nav) throw new Error(`导航失败，设施 ${place} 不可用或站点变动`)
   const { formFields, token3, periods } = nav
   const period = periods.find(p => p.startDate <= dateKey && dateKey <= p.endDate)
   if (!period) throw new Error(`未找到 ${place} ${dateKey} 的空位（目标日期在扫描窗口外）`)
-  const { startDate, displayTerm } = period
-  const month = await queryMonth(req, formFields, token3, startDate, displayTerm)
-  const seen = new Set()
-  let someCells = []
-  for (const slot of batch) {
-    let cells = findSomeCells(month, slot)
-    if (cells.length === 0) {
-      const legacy = findSomeCell(month, slot)
-      if (legacy) cells = [legacy]
-    }
-    for (const c of cells) {
-      if (!seen.has(c.cell)) { seen.add(c.cell); someCells.push(c) }
-    }
+  // 先单日查询；无结果时回退到整期查询（防 DisplayTerm=1 不被站点接受）
+  let month = await querySingleDay(req, formFields, token3, dateKey)
+  let startDate = dateKey
+  let displayTerm = SINGLE_DAY_TERM
+  let someCells = collectCells(month)
+  if (someCells.length === 0) {
+    console.log(`[edogawa] 单日查询无结果，回退到整期查询（${period.startDate}，DisplayTerm=${period.displayTerm}）`)
+    month = await queryMonth(req, formFields, token3, period.startDate, period.displayTerm)
+    startDate = period.startDate
+    displayTerm = period.displayTerm
+    someCells = collectCells(month)
   }
   if (someCells.length === 0) throw new Error(`未找到 ${place} ${dateKey} 的空位（可能已被预约）`)
-  if (someCells.length > 10) someCells = someCells.slice(0, 10)
-  const fd4 = buildNextPayload(month, someCells, formFields, token3, startDate, displayTerm)
-  const res = await req('/user/AvailabilityCheckApplySelectDays/Next', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: fd4.toString()
-  })
-  const nextBody = await res.text()
-  if (!nextBody.includes('Result')) throw new Error(`Next 异常响应: ${nextBody.slice(0, 120)}`)
-  const nextInfo = JSON.parse(JSON.parse(nextBody))
-  if (nextInfo.Result !== 'Ok') throw new Error(`Next 失败: ${JSON.stringify(nextInfo.Information)}`)
-  const timePath = nextInfo.Information?.MessageId || ''
-  if (!timePath) throw new Error('未获得时间页地址')
-  return baseUrl + (timePath.startsWith('.') ? '/user/' + timePath.slice(2) : timePath)
+  const timePath = await nextToTimePage(req, month, someCells, formFields, token3, startDate, displayTerm)
+  console.log(`[edogawa] 时间页（完整导航链，${displayTerm === SINGLE_DAY_TERM ? '单日查询' : '整期查询'}）: ${place} ${dateKey}`)
+  return toUrl(timePath)
 }
 
 // 预热专属：关闭站点弹出的错误弹窗（放号窗口专用）。
@@ -837,7 +934,7 @@ async function dismissErrorModal(page, attempt) {
  * 注意：同一申请的费用合计只记在该批第一个约到的时段上，避免汇总时重复计算。
  */
 async function bookBatchesWithPreparedSession(adapter, prepared, slots, platformConfig) {
-  const { browser, context, page, homeUrl, deadlineMs } = prepared
+  const { browser, context, page, homeUrl, deadlineMs, timeUrl: preparedTimeUrl, parkedTarget } = prepared
   const deadline = deadlineMs || (Date.now() + 10 * 60 * 1000)
   const openMs = getReleaseOpenMs(platformConfig)
   const batches = groupSlotsIntoBatches(slots)
@@ -859,7 +956,14 @@ async function bookBatchesWithPreparedSession(adapter, prepared, slots, platform
       }
       const batchLabel = batch.map(s => `${s.place} ${s.date} ${s.time}`).join(' + ')
       console.log(`[edogawa] 预热批次 ${bi + 1}/${batches.length}：${batchLabel}`)
-      const r = await bookOneBatch(page, req, adapter, batch, platformConfig, deadline, openMs)
+      // 第一批：若预热时已常驻在该批的时间选择页上，直接用该页（不重新导航）
+      let batchOpts = undefined
+      if (bi === 0 && preparedTimeUrl && parkedTarget
+        && batch[0].place === parkedTarget.place
+        && String(batch[0].date).slice(0, 10) === parkedTarget.date) {
+        batchOpts = { presetTimeUrl: preparedTimeUrl }
+      }
+      const r = await bookOneBatch(page, req, adapter, batch, platformConfig, deadline, openMs, batchOpts)
       const bookedUids = new Set((r.booked || []).map(s => s.uid))
       const droppedMap = new Map((r.dropped || []).map(d => [d.slot.uid, d.reason]))
       let feeGiven = false
@@ -874,8 +978,8 @@ async function bookBatchesWithPreparedSession(adapter, prepared, slots, platform
       }
       // 回到 Home 再抢下一批：预约完成后站点不接受直接进设施选择页
       // （会报“Homeに戻り、登録した区分の対象施設を選択してください”），
-      // 所以每批结束后都回 Home，下一批重新跑完整导航链
-      // （navigateToMonth → queryMonth → Next，现取时间页）。
+      // 所以每批结束后都回 Home；下一批先试直接进日期选择页做单日查询，
+      // 被拒时再从 Home 重走完整导航链（见 getBatchTimePageUrl）。
       await page.goto(homeUrl, { waitUntil: 'domcontentloaded' }).catch(() => {})
     }
   } catch (e) {
@@ -886,6 +990,7 @@ async function bookBatchesWithPreparedSession(adapter, prepared, slots, platform
       if (!doneUids.has(s.uid)) results.push({ slot: s, success: false, message: `顺序抢异常：${e.message}` })
     }
   } finally {
+    // 会话只在整轮抢完（或异常/截止）后销毁：约完一个不销毁，有未约目标就继续约
     await browser.close().catch(() => {})
     // 恢复预热时设定的停顿区间，避免影响之后的常规预约
     if (prepared.pauseRange) {
@@ -908,12 +1013,13 @@ async function bookBatchesWithPreparedSession(adapter, prepared, slots, platform
 // 时间页地址一批只取一次并复用（放号时刻前重取无意义，站点 gate 在时间页的 Next）。
 // 快路径（本函数只走预热抢场）：步骤间不等固定时长，见 clickNext/submitApply 的 fast 选项。
 // 返回 { success（至少约到一个）, message, fee, booked: [slot], dropped: [{ slot, reason }] }。
-async function bookOneBatch(page, req, adapter, batch, platformConfig, deadline, openMs) {
+async function bookOneBatch(page, req, adapter, batch, platformConfig, deadline, openMs, opts = {}) {
   const batchLabel = batch.map(s => `${s.place} ${s.date} ${s.time}`).join(' + ')
   const label = `edogawa-prepared-batch-${batch[0].place}-${batch[0].date}`
   let attempt = 0
   let lastError = ''
-  let timeUrl = null
+  // opts.presetTimeUrl：预热时已常驻在该批的时间选择页上（第一批），直接用它
+  let timeUrl = opts.presetTimeUrl || null
   while (true) {
     attempt++
     if (Date.now() >= deadline) {
@@ -931,6 +1037,8 @@ async function bookOneBatch(page, req, adapter, batch, platformConfig, deadline,
       await dismissErrorModal(page, attempt)
       if (!timeUrl) {
         timeUrl = await getBatchTimePageUrl(req, adapter, batch, platformConfig)
+      } else if (attempt === 1) {
+        console.log(`[edogawa] 预热批次 #${attempt}（${batchLabel}）：使用预热常驻的时间选择页`)
       }
       if (!page.url().includes('AvailabilityCheckApplySelectTime')) {
         await page.goto(timeUrl, { waitUntil: 'domcontentloaded' })
@@ -1040,6 +1148,10 @@ module.exports = {
   bookBatchesWithPreparedSession,
   groupSlotsIntoBatches,
   BATCH_SLOTS_PER_APPLICATION,
+  SINGLE_DAY_TERM,
+  querySingleDay,
+  isSelectDaysPage,
+  nextToTimePage,
   getGrabDeadlineMs,
   getReleaseOpenMs,
   createReq,
