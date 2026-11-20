@@ -312,6 +312,51 @@ async function captureFailureEvidence(page, label = 'booking', dir = LOGS_DIR) {
   return out
 }
 
+// 延迟自动抢的观望期（毫秒）：在 [minMinutes, maxMinutes] 内随机（含两端附近），
+// 每个空位各取一个等待时长，避免所有空位同一分钟齐抢、也更像真人观望后再下手。
+function delayedGrabWaitMs(minMinutes, maxMinutes, random = Math.random) {
+  const lo = Number(minMinutes)
+  const hi = Number(maxMinutes)
+  const a = Number.isFinite(lo) && lo > 0 ? lo : 10
+  const b = Number.isFinite(hi) && hi >= a ? hi : a
+  return Math.round((a + random() * (b - a)) * 60 * 1000)
+}
+
+// Open-Meteo hourly 预报 → 指定日期 [startHour, endHour) 时段的下雨判定（纯函数）。
+// 判定：时段内任一小时降水概率 >= probMax（%），或降水量 > 0mm，即为下雨。
+// 预报未覆盖该日期/时段（Open-Meteo 只给 16 天）时 known=false，调用方按「无雨信号」处理。
+// 返回 { known, rain, maxProb, maxPrecip }，maxProb/maxPrecip 为时段内最大值（无数据为 null）。
+function rainVerdictForWindow(hourly, dateStr, startHour, endHour, probMax) {
+  const unknown = { known: false, rain: false, maxProb: null, maxPrecip: null }
+  const times = hourly?.time
+  if (!Array.isArray(times) || !dateStr) return unknown
+  const probs = hourly.precipitation_probability
+  const precips = hourly.precipitation
+  let seen = false
+  let rain = false
+  let maxProb = null
+  let maxPrecip = null
+  for (let i = 0; i < times.length; i++) {
+    const t = String(times[i])
+    if (!t.startsWith(dateStr)) continue
+    const hour = Number(t.slice(11, 13))
+    if (Number.isNaN(hour) || hour < startHour || hour >= endHour) continue
+    seen = true
+    const p = Array.isArray(probs) ? probs[i] : null
+    const mm = Array.isArray(precips) ? precips[i] : null
+    if (typeof p === 'number') {
+      maxProb = maxProb === null ? p : Math.max(maxProb, p)
+      if (p >= probMax) rain = true
+    }
+    if (typeof mm === 'number') {
+      maxPrecip = maxPrecip === null ? mm : Math.max(maxPrecip, mm)
+      if (mm > 0) rain = true
+    }
+  }
+  if (!seen) return unknown
+  return { known: true, rain, maxProb, maxPrecip }
+}
+
 module.exports = {
   slotToken,
   sleep,
@@ -342,5 +387,7 @@ module.exports = {
   createTrace,
   clickByText,
   captureFailureEvidence,
+  delayedGrabWaitMs,
+  rainVerdictForWindow,
   WEEKDAY_JP
 }
