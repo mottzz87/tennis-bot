@@ -20,6 +20,7 @@
  *   GET  /api/schedule-status
  *   POST /api/persistent/toggle  { id }（id 为完整 ucode 或 slotToken，开关持续推送：周末/祝日 + 平日 19 点）
  *   GET  /api/persistent         当前持续推送登记
+ *   GET  /api/delayed-auto-book  当前延迟自动预约观望登记（发现空位先观望，还在才抢）
  *
  * 自身不执行任何 Playwright 预约操作
  * 不处理 Telegram 用户交互（由 telegram-bot 处理）
@@ -28,6 +29,7 @@ require('@tennis-bot/config/loadEnv')()
 const fs = require('fs')
 const path = require('path')
 const http = require('http')
+const https = require('https')
 const TelegramBot = require('node-telegram-bot-api')
 const { loadPlatform } = require('@tennis-bot/platform')
 const FileStorage = require('@tennis-bot/storage/file/FileStorage')
@@ -38,7 +40,8 @@ const {
   createTrace, parseSlotStartDateTimeSafe, parseSlotDayKey, formatDateDisplayFromIso,
   isWeekendOrHoliday, slotToken,
   jstDateKey, jstParts, parseHHMM, normalizeReleaseReminder,
-  isReleaseWindow, matchReleaseReminderMoment
+  isReleaseWindow, matchReleaseReminderMoment,
+  parseTimeSafe, normalizeTimeRange, delayedGrabWaitMs, rainVerdictForWindow
 } = require('@tennis-bot/utils')
 
 const DATA_DIR = process.env.MONITOR_DATA_DIR || path.resolve(__dirname, '../../data')
@@ -524,6 +527,205 @@ async function checkPersistentPush() {
         const entry = persistentPush.get(d.ucode)
         if (entry) entry.nextPushAt = Date.now() + getPersistentIntervalMs(platform)
       }
+    }
+  }
+}
+
+// ========================
+// 延迟自动预约（发现空位先观望，还在才抢）
+// 场景（用户需求 2026-11-20）：周末/祝日空位刚出现时不立刻抢——先等一段观望期
+// （默认 10–15 分钟，每个空位随机），观望结束时空位还在、且该时段不下雨，才自动预约。
+// 给用户留出自己点预约的窗口，也滤掉刚放出又被秒收的抖动。
+// 生效范围：平台配置 DELAYED_AUTO_BOOK=true 的平台（当前只有市川在配置里开启，
+// /set ichikawa:DELAYED_AUTO_BOOK false 可关）；空位须为周末/祝日且通过该平台 AUTO_* 过滤。
+// 下雨判定：Open-Meteo 小时预报（免 key），时段内任一小时降水概率 ≥ 阈值（默认 50%）
+// 或降水量 > 0 即跳过并通知；预报未覆盖的远期日期（>16 天）按无雨信号处理、照常抢。
+// 每天最多成功 1 个：与 AUTO_BOOK 共用 autoBookedDayKeys / autoBookedUIDs 去重。
+// 状态只存内存：monitor 重启后登记会丢，但 tick 每分钟从 currentSlotMap 重新登记
+// 符合条件的空位（重新等一轮观望期），不会永久失效。
+// ========================
+const delayedAutoBook = new Map() // ucode -> { slot, platform, firstSeenAt, grabAt }
+let delayedGrabRunning = false
+let weatherCache = { at: 0, key: '', hourly: null }
+
+function getDelayedAutoBookSettings(platform) {
+  const num = (key, dflt) => {
+    const v = Number(config.getEffective(key, platform))
+    return Number.isFinite(v) && v > 0 ? v : dflt
+  }
+  return {
+    waitMinMinutes: num('DELAYED_AUTO_BOOK_WAIT_MIN_MINUTES', 10),
+    waitMaxMinutes: num('DELAYED_AUTO_BOOK_WAIT_MAX_MINUTES', 15),
+    rainProbMax: num('DELAYED_AUTO_BOOK_RAIN_PROB_MAX', 50),
+    lat: num('DELAYED_AUTO_BOOK_LAT', 35.72),
+    lon: num('DELAYED_AUTO_BOOK_LON', 140.11)
+  }
+}
+
+function isDelayedAutoBookEligible(slot, platformConfig) {
+  if (!slot || platformConfig?.DELAYED_AUTO_BOOK !== true) return false
+  if (!isWeekendOrHoliday(slot)) return false
+  if (core.filterSlotsAuto([slot], platformConfig).length === 0) return false
+  const start = parseSlotStartDateTimeSafe(slot)
+  if (!start || start.getTime() <= Date.now()) return false
+  if (autoBookedUIDs.has(slot.uid)) return false
+  const dayKey = parseSlotDayKey(slot)
+  if (dayKey && autoBookedDayKeys.has(dayKey)) return false
+  return true
+}
+
+function armDelayedAutoBook(slot, platform) {
+  if (!slot?.ucode || delayedAutoBook.has(slot.ucode)) return false
+  const s = getDelayedAutoBookSettings(platform)
+  const waitMs = delayedGrabWaitMs(s.waitMinMinutes, s.waitMaxMinutes)
+  delayedAutoBook.set(slot.ucode, { slot, platform, firstSeenAt: Date.now(), grabAt: Date.now() + waitMs })
+  console.log(`[延迟自动抢] 登记 ${slot.place} ${slot.dateDisplay || slot.date} ${slot.time}，观望 ${(waitMs / 60000).toFixed(1)} 分钟`)
+  return true
+}
+
+// Open-Meteo 小时预报（免 key），10 分钟缓存；失败抛错（调用方本轮跳过、不抢）
+async function fetchWeatherHourly(lat, lon) {
+  const key = `${lat},${lon}`
+  if (weatherCache.hourly && weatherCache.key === key && Date.now() - weatherCache.at < 10 * 60 * 1000) {
+    return weatherCache.hourly
+  }
+  const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&hourly=precipitation,precipitation_probability&forecast_days=16&timezone=Asia%2FTokyo`
+  const hourly = await new Promise((resolve, reject) => {
+    const req = https.get(url, { timeout: 10000 }, res => {
+      let data = ''
+      res.on('data', c => { data += c })
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(data)
+          if (res.statusCode !== 200 || !Array.isArray(parsed?.hourly?.time)) {
+            return reject(new Error(`天气接口异常 ${res.statusCode}`))
+          }
+          resolve(parsed.hourly)
+        } catch (e) { reject(e) }
+      })
+    })
+    req.on('timeout', () => req.destroy(new Error('天气接口超时（10s）')))
+    req.on('error', reject)
+  })
+  weatherCache = { at: Date.now(), key, hourly }
+  return hourly
+}
+
+async function checkDelayedAutoBook() {
+  if (delayedGrabRunning) return
+  const now = Date.now()
+  // 1) 观望登记：从当前空位里登记符合条件的（monitor 重启后也能自动恢复登记）
+  for (const slot of currentSlotMap.values()) {
+    if (isDelayedAutoBookEligible(slot, config.getPlatform(slot.platform))) {
+      armDelayedAutoBook(slot, slot.platform)
+    }
+  }
+  // 2) 清理：功能已关 / 空位消失 / 时段已开始 / 当天已自动约过 → 注销
+  for (const [ucode, entry] of delayedAutoBook) {
+    if (config.getPlatform(entry.platform)?.DELAYED_AUTO_BOOK !== true) { delayedAutoBook.delete(ucode); continue }
+    const current = currentSlotMap.get(ucode)
+    if (!current) { delayedAutoBook.delete(ucode); continue }
+    entry.slot = current
+    const start = parseSlotStartDateTimeSafe(current)
+    if (!start || start.getTime() <= now) { delayedAutoBook.delete(ucode); continue }
+    const dayKey = parseSlotDayKey(current)
+    if ((dayKey && autoBookedDayKeys.has(dayKey)) || autoBookedUIDs.has(current.uid)) {
+      delayedAutoBook.delete(ucode)
+    }
+  }
+  // 3) 观望到期：按平台分组处理
+  const dueByPlatform = new Map()
+  for (const entry of delayedAutoBook.values()) {
+    if (now < entry.grabAt) continue
+    if (!dueByPlatform.has(entry.platform)) dueByPlatform.set(entry.platform, [])
+    dueByPlatform.get(entry.platform).push(entry)
+  }
+  for (const [platform, entries] of dueByPlatform) {
+    const st = runtime[platform]
+    const platformConfig = config.getPlatform(platform)
+    if (!st || st.paused || platformConfig?.enabled === false || platformConfig?.DELAYED_AUTO_BOOK !== true) continue
+    if (st.scanning || st.autoBooking) continue // 本轮跳过，登记保留，下一分钟再试
+    entries.sort((a, b) => (parseSlotStartDateTimeSafe(a.slot)?.getTime() || 0) - (parseSlotStartDateTimeSafe(b.slot)?.getTime() || 0))
+    delayedGrabRunning = true
+    st.autoBooking = true
+    try {
+      const settings = getDelayedAutoBookSettings(platform)
+      const bot = getBotForPlatform(platform)
+      const chat = getPlatformChatId(platform)
+      let hourly = null
+      let weatherState = 'pending' // pending | ok | failed
+      const failures = []
+      for (const entry of entries) {
+        const slot = entry.slot
+        const start = parseSlotStartDateTimeSafe(slot)
+        if (!start) { delayedAutoBook.delete(slot.ucode); continue }
+        // 开场不足 10 分钟：赶路来不及，放弃（只记日志，不通知）
+        if (start.getTime() - Date.now() < 10 * 60 * 1000) {
+          console.log(`[延迟自动抢] ${slot.place} ${slot.dateDisplay || slot.date} ${slot.time} 开场不足 10 分钟，放弃`)
+          delayedAutoBook.delete(slot.ucode)
+          continue
+        }
+        // 天气：本轮只取一次；取不到 → 本轮剩余全部跳过（登记保留，下一分钟重试）
+        if (weatherState === 'pending') {
+          try {
+            hourly = await fetchWeatherHourly(settings.lat, settings.lon)
+            weatherState = 'ok'
+          } catch (e) {
+            weatherState = 'failed'
+            console.log(`[延迟自动抢] 天气获取失败，本轮跳过: ${e.message}`)
+          }
+        }
+        if (weatherState === 'failed') break
+        const [startHour] = parseTimeSafe(String(slot.time))
+        const endHourRaw = Number(normalizeTimeRange(slot.time).split('-')[1])
+        const endHour = Number.isFinite(endHourRaw) && endHourRaw > startHour ? endHourRaw : startHour + 2
+        const verdict = rainVerdictForWindow(hourly, parseSlotDayKey(slot), startHour, endHour, settings.rainProbMax)
+        if (verdict.known && verdict.rain) {
+          console.log(`[延迟自动抢] ${slot.place} ${slot.dateDisplay || slot.date} ${slot.time} 判为下雨（最高降水概率 ${verdict.maxProb}%），跳过`)
+          delayedAutoBook.delete(slot.ucode)
+          if (bot && chat) {
+            await bot.sendMessage(chat,
+              `🌧 *延迟自动抢跳过（可能下雨）*\n━━━━━━━━━━━━━━\n` +
+              formatSlotText(slot, getPlatformConfig(slot.place), { showBike: true, style: 'detail' }) +
+              (verdict.maxProb != null ? `\n\n该时段最高降水概率 ${verdict.maxProb}%` : ''),
+              { parse_mode: 'Markdown' }).catch(() => {})
+          }
+          continue
+        }
+        let result
+        try {
+          result = await callBookingService(slot, platform)
+        } catch (e) {
+          result = { success: false, message: e.message }
+        }
+        delayedAutoBook.delete(slot.ucode)
+        if (result.success) {
+          autoBookedUIDs.add(slot.uid)
+          const dayKey = parseSlotDayKey(slot)
+          if (dayKey) autoBookedDayKeys.add(dayKey)
+          saveAutoBooked()
+          console.log(`[延迟自动抢] 成功 ${slot.place} ${slot.dateDisplay || slot.date} ${slot.time}`)
+          if (bot && chat) {
+            const booked = result.fee?.total != null ? { ...slot, totalFee: result.fee.total } : slot
+            await bot.sendMessage(chat,
+              `🎉 *延迟自动预约成功！*\n━━━━━━━━━━━━━━\n` +
+              formatSlotText(booked, getPlatformConfig(slot.place), { showBike: true, showFee: true, style: 'detail' }),
+              { parse_mode: 'Markdown' }).catch(() => {})
+          }
+          setTimeout(() => scanPlatform(platform, { forcePush: true }), 1000)
+          break // 当天已成功 1 个；同日其余登记下一轮会被 dayKey 清理
+        }
+        failures.push({ slot, message: result.message || '未知错误' })
+      }
+      if (failures.length > 0 && bot && chat) {
+        await bot.sendMessage(chat,
+          `❌ *延迟自动预约失败*\n━━━━━━━━━━━━━━\n` +
+          failures.map(f => formatSlotText(f.slot, getPlatformConfig(f.slot.place), { style: 'detail' }) + `\n🧨 ${escapeMarkdown(f.message)}`).join('\n\n'),
+          { parse_mode: 'Markdown' }).catch(() => {})
+      }
+    } finally {
+      st.autoBooking = false
+      delayedGrabRunning = false
     }
   }
 }
@@ -1660,6 +1862,17 @@ const server = http.createServer(async (req, res) => {
       })
     }
 
+    // GET /api/delayed-auto-book — 当前延迟自动预约观望登记（排查用）
+    if (req.method === 'GET' && pathname === '/api/delayed-auto-book') {
+      return json(res, {
+        success: true,
+        items: [...delayedAutoBook.values()].map(e => ({
+          uid: e.slot.uid, platform: e.platform,
+          firstSeenAt: e.firstSeenAt, grabAt: e.grabAt
+        }))
+      })
+    }
+
     // GET /api/stats
     if (req.method === 'GET' && pathname === '/api/stats') {
       const allPlaceMaps = {}
@@ -1804,6 +2017,9 @@ async function start() {
 
   // 周末/祝日持续推送：每 60s 检查一次到期的登记并重推
   setInterval(() => { checkPersistentPush().catch(e => console.error('[持续推送] 检查失败:', e.message)) }, 60 * 1000)
+
+  // 延迟自动预约（发现空位先观望，还在才抢）：每 60s 检查一次观望到期的登记
+  setInterval(() => { checkDelayedAutoBook().catch(e => console.error('[延迟自动抢] 检查失败:', e.message)) }, 60 * 1000)
 
   // 清理旧日志
   setInterval(() => cleanOldLogs(30), 24 * 60 * 60 * 1000)

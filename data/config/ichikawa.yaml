@@ -21,6 +21,14 @@ AUTO_PLACE_FILTER:        # 自动预约只约这些场地
   - 菅野終末処理場テニスコート
 AUTO_COURT_NUM_FILTER: [] # 自动预约只约指定场地编号的球场
 
+# ===== 延迟自动预约（发现空位先观望，还在才抢；与上面的即时 AUTO_BOOK 相互独立）=====
+DELAYED_AUTO_BOOK: true              # 开关：发现周末/祝日空位后，先等一段观望期，空位还在且不下雨才自动预约（/set ichikawa:DELAYED_AUTO_BOOK false 可关）
+DELAYED_AUTO_BOOK_WAIT_MIN_MINUTES: 10  # 观望期下限（分钟；每个空位在区间内随机取一个等待时长）
+DELAYED_AUTO_BOOK_WAIT_MAX_MINUTES: 15  # 观望期上限（分钟）
+DELAYED_AUTO_BOOK_RAIN_PROB_MAX: 50     # 下雨判定：该时段任一小时降水概率 ≥ 此值（%）则不抢；降水量 > 0 同样不抢（Open-Meteo 预报，覆盖 16 天内）
+DELAYED_AUTO_BOOK_LAT: 35.72            # 天气判定坐标（市川市）
+DELAYED_AUTO_BOOK_LON: 140.11
+
 # ===== 场地展示与代码别名（short=推送里显示的短名，emoji=图标，courtCode=代码别名，bike=移动方式）=====
 PLACE_MAP:
   国府台テニスコート:
