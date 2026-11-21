@@ -41,8 +41,10 @@ const {
   isWeekendOrHoliday, slotToken,
   jstDateKey, jstParts, parseHHMM, normalizeReleaseReminder,
   isReleaseWindow, matchReleaseReminderMoment,
-  parseTimeSafe, normalizeTimeRange, delayedGrabWaitMs, rainVerdictForWindow
+  parseTimeSafe, normalizeTimeRange, delayedGrabWaitMs, rainVerdictForWindow,
+  parseTimeRangeMinutes, evaluateGrabGuard
 } = require('@tennis-bot/utils')
+const { fetchBearDayBlocks } = require('./tennisbear')
 
 const DATA_DIR = process.env.MONITOR_DATA_DIR || path.resolve(__dirname, '../../data')
 const PORT = process.env.MONITOR_PORT || 3000
@@ -569,8 +571,8 @@ function isDelayedAutoBookEligible(slot, platformConfig) {
   const start = parseSlotStartDateTimeSafe(slot)
   if (!start || start.getTime() <= Date.now()) return false
   if (autoBookedUIDs.has(slot.uid)) return false
-  const dayKey = parseSlotDayKey(slot)
-  if (dayKey && autoBookedDayKeys.has(dayKey)) return false
+  // 不再按「当天已自动约过」一刀切排除：是否可抢由到期时的行程守卫判定
+  // （当天的预约记录会作为时间块进入守卫，续场可放行、不相连的第二场拦截）
   return true
 }
 
@@ -611,6 +613,41 @@ async function fetchWeatherHourly(lat, lon) {
   return hourly
 }
 
+function httpGetJson(url, timeoutMs = 15000) {
+  return new Promise((resolve, reject) => {
+    const mod = url.startsWith('https:') ? https : http
+    const req = mod.get(url, { timeout: timeoutMs }, res => {
+      let data = ''
+      res.on('data', c => { data += c })
+      res.on('end', () => {
+        try { resolve(JSON.parse(data)) } catch { reject(new Error(`JSON 解析失败: ${url}`)) }
+      })
+    })
+    req.on('timeout', () => req.destroy(new Error(`请求超时: ${url}`)))
+    req.on('error', reject)
+  })
+}
+
+// 行程守卫的「bot 预约」时间块：经 booking-service 的 GET /api/booked 取全部预约记录
+// （含已结束的当天早场次——/api/booked/schedule 只给未来场次，会漏掉早场次），
+// 按天过滤后转成时间块。任何失败都抛错，调用方按「查不到就不抢」处理。
+async function fetchBookedDayBlocks(dayKey) {
+  const json = await httpGetJson(`${BOOKING_HOST}/api/booked`)
+  if (!json || !Array.isArray(json.slots)) throw new Error('预订记录接口返回异常')
+  const blocks = []
+  for (const rec of json.slots) {
+    if (parseSlotDayKey(rec) !== dayKey) continue
+    const range = parseTimeRangeMinutes(rec.time)
+    if (!range) continue
+    blocks.push({ start: range.start, end: range.end, venue: rec.place || '', source: 'booked' })
+  }
+  return blocks.sort((a, b) => a.start - b.start)
+}
+
+function fmtMinutes(min) {
+  return `${Math.floor(min / 60)}:${String(min % 60).padStart(2, '0')}`
+}
+
 async function checkDelayedAutoBook() {
   if (delayedGrabRunning) return
   const now = Date.now()
@@ -620,7 +657,7 @@ async function checkDelayedAutoBook() {
       armDelayedAutoBook(slot, slot.platform)
     }
   }
-  // 2) 清理：功能已关 / 空位消失 / 时段已开始 / 当天已自动约过 → 注销
+  // 2) 清理：功能已关 / 空位消失 / 时段已开始 / 该时段已自动约过 → 注销
   for (const [ucode, entry] of delayedAutoBook) {
     if (config.getPlatform(entry.platform)?.DELAYED_AUTO_BOOK !== true) { delayedAutoBook.delete(ucode); continue }
     const current = currentSlotMap.get(ucode)
@@ -628,8 +665,7 @@ async function checkDelayedAutoBook() {
     entry.slot = current
     const start = parseSlotStartDateTimeSafe(current)
     if (!start || start.getTime() <= now) { delayedAutoBook.delete(ucode); continue }
-    const dayKey = parseSlotDayKey(current)
-    if ((dayKey && autoBookedDayKeys.has(dayKey)) || autoBookedUIDs.has(current.uid)) {
+    if (autoBookedUIDs.has(current.uid)) {
       delayedAutoBook.delete(ucode)
     }
   }
@@ -655,6 +691,21 @@ async function checkDelayedAutoBook() {
       let hourly = null
       let weatherState = 'pending' // pending | ok | failed
       const failures = []
+      const guardSkips = []
+      const guardByDay = new Map() // dayKey -> { blocks } | { error }
+      const guardFetchDay = async (dayKey) => {
+        if (!dayKey) return { error: new Error('时段日期解析失败') }
+        if (guardByDay.has(dayKey)) return guardByDay.get(dayKey)
+        let g
+        try {
+          const [booked, bear] = await Promise.all([fetchBookedDayBlocks(dayKey), fetchBearDayBlocks(dayKey)])
+          g = { blocks: [...booked, ...bear].sort((a, b) => a.start - b.start) }
+        } catch (e) {
+          g = { error: e }
+        }
+        guardByDay.set(dayKey, g)
+        return g
+      }
       for (const entry of entries) {
         const slot = entry.slot
         const start = parseSlotStartDateTimeSafe(slot)
@@ -664,6 +715,35 @@ async function checkDelayedAutoBook() {
           console.log(`[延迟自动抢] ${slot.place} ${slot.dateDisplay || slot.date} ${slot.time} 开场不足 10 分钟，放弃`)
           delayedAutoBook.delete(slot.ucode)
           continue
+        }
+        // 行程守卫：当天已有不相连的网球安排 → 跳过并通知；行程查不到 → 本轮跳过（登记保留，下一分钟重试）
+        const guard = await guardFetchDay(parseSlotDayKey(slot))
+        if (guard.error) {
+          console.log(`[延迟自动抢] 行程检查失败，本轮跳过: ${guard.error.message}`)
+          break
+        }
+        const slotRange = parseTimeRangeMinutes(slot.time)
+        const slotDayKey = parseSlotDayKey(slot)
+        const nowParts = jstParts()
+        const nowMin = slotDayKey === jstDateKey() ? nowParts.h * 60 + nowParts.mi : null
+        const guardVerdict = evaluateGrabGuard(
+          { start: slotRange?.start, end: slotRange?.end, venue: slot.place },
+          guard.blocks,
+          { nowMin }
+        )
+        if (!guardVerdict.allow) {
+          const why = guardVerdict.reason === 'extension-too-late'
+            ? '续场已过决定时限（须在行程开始前且距续场开场 2 小时以上）'
+            : guardVerdict.reason === 'too-late'
+              ? '发现太晚（距开场不足 1 小时）'
+              : '当天已有不相连安排'
+          console.log(`[延迟自动抢] 跳过（${why}）${slot.place} ${slot.dateDisplay || slot.date} ${slot.time}`)
+          delayedAutoBook.delete(slot.ucode)
+          guardSkips.push({ slot, blocks: guard.blocks, reason: guardVerdict.reason })
+          continue
+        }
+        if (guardVerdict.reason === 'extension') {
+          console.log(`[延迟自动抢] ${slot.place} ${slot.dateDisplay || slot.date} ${slot.time} 与已有安排相接（续场），放行`)
         }
         // 天气：本轮只取一次；取不到 → 本轮剩余全部跳过（登记保留，下一分钟重试）
         if (weatherState === 'pending') {
@@ -713,7 +793,7 @@ async function checkDelayedAutoBook() {
               { parse_mode: 'Markdown' }).catch(() => {})
           }
           setTimeout(() => scanPlatform(platform, { forcePush: true }), 1000)
-          break // 当天已成功 1 个；同日其余登记下一轮会被 dayKey 清理
+          break // 本轮先停；同日其余登记下一轮由行程守卫判定（续场放行、不相连拦截）
         }
         failures.push({ slot, message: result.message || '未知错误' })
       }
@@ -721,6 +801,22 @@ async function checkDelayedAutoBook() {
         await bot.sendMessage(chat,
           `❌ *延迟自动预约失败*\n━━━━━━━━━━━━━━\n` +
           failures.map(f => formatSlotText(f.slot, getPlatformConfig(f.slot.place), { style: 'detail' }) + `\n🧨 ${escapeMarkdown(f.message)}`).join('\n\n'),
+          { parse_mode: 'Markdown' }).catch(() => {})
+      }
+      if (guardSkips.length > 0 && bot && chat) {
+        const lines = guardSkips.map(({ slot, blocks, reason }) => {
+          const dayBlocks = blocks
+            .map(b => `${fmtMinutes(b.start)}-${fmtMinutes(b.end)}${b.source === 'bear' ? '（Tennis Bear）' : `（${b.venue}）`}`)
+            .join('、')
+          const why = reason === 'extension-too-late'
+            ? '原因：续场须在当天行程开始前、且距续场开场 2 小时以上决定，已过时限'
+            : reason === 'too-late'
+              ? '原因：距开场不足 1 小时，不再自动抢'
+              : '原因：与当天已有安排不相连'
+          return formatSlotText(slot, getPlatformConfig(slot.place), { style: 'detail' }) + `\n${why}` + (blocks.length > 0 ? `\n当天已有：${dayBlocks}` : '')
+        })
+        await bot.sendMessage(chat,
+          `🚫 *延迟自动抢跳过（行程守卫）*\n━━━━━━━━━━━━━━\n` + lines.join('\n\n'),
           { parse_mode: 'Markdown' }).catch(() => {})
       }
     } finally {
