@@ -357,6 +357,58 @@ function rainVerdictForWindow(hourly, dateStr, startHour, endHour, probMax) {
   return { known: true, rain, maxProb, maxPrecip }
 }
 
+// "9:00-11:00" / "9-11" / "9:30～12:00" → { start, end }（当日分钟数，end 为整点时取该整点）
+// 解析失败返回 null。与 normalizeTimeRange 不同，这里保留分钟（Tennis Bear 行程可能有 :30）。
+function parseTimeRangeMinutes(timeStr) {
+  const raw = String(timeStr || '')
+    .replace(/[０-９]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0))
+    .replace(/：/g, ':')
+    .replace(/～/g, '~')
+    .trim()
+  const parts = raw.split(/[~-]/)
+  if (parts.length !== 2) return null
+  const toMin = (s) => {
+    const v = String(s || '').trim()
+    if (!v) return null
+    const [hStr, mStr = '0'] = v.includes(':') ? v.split(':') : [v, '0']
+    const h = Number(hStr), m = Number(mStr)
+    if (!Number.isInteger(h) || !Number.isInteger(m) || h < 0 || h > 24 || m < 0 || m > 59) return null
+    return h * 60 + m
+  }
+  const start = toMin(parts[0])
+  const end = toMin(parts[1])
+  if (start === null || end === null || end <= start) return null
+  return { start, end }
+}
+
+// 延迟自动抢的行程守卫（用户规则，2026-11-21）：
+//   candidate: { start, end, venue }（当日分钟数 + 场地全名）
+//   blocks: 当天已有的网球时间块 [{ start, end, venue, source }]，source: 'booked' | 'bear'
+// 判定：
+//   - 当天没有任何时间块 → { allow: true, reason: 'day-free' }
+//   - 候选与某个时间块首尾相接（续场）→ { allow: true, reason: 'extension', block }
+//     其中 booked 块要求同场地（异场地首尾相接赶不过去，不算续场）；bear 块只看时间
+//     （Tennis Bear 行程的场地是自由文本，与设施名对不齐）
+//   - 其余（已有不相连的安排 / 与安排重叠）→ { allow: false, reason: 'separate', block: 首个冲突块 }
+//   - 候选时间非法 → { allow: false, reason: 'invalid' }（失败安全，不抢）
+function evaluateGrabGuard(candidate, blocks) {
+  const c = candidate || {}
+  if (!Number.isFinite(c.start) || !Number.isFinite(c.end) || c.end <= c.start) {
+    return { allow: false, reason: 'invalid' }
+  }
+  const list = (Array.isArray(blocks) ? blocks : [])
+    .filter(b => b && Number.isFinite(b.start) && Number.isFinite(b.end) && b.end > b.start)
+  if (list.length === 0) return { allow: true, reason: 'day-free' }
+  const sameVenue = (a, b) => String(a || '').trim() !== '' && String(a || '').trim() === String(b || '').trim()
+  for (const b of list) {
+    const adjacent = c.start === b.end || c.end === b.start
+    if (!adjacent) continue
+    if (b.source === 'booked' && !sameVenue(c.venue, b.venue)) continue
+    return { allow: true, reason: 'extension', block: b }
+  }
+  return { allow: false, reason: 'separate', block: list[0] }
+}
+
 module.exports = {
   slotToken,
   sleep,
@@ -389,5 +441,7 @@ module.exports = {
   captureFailureEvidence,
   delayedGrabWaitMs,
   rainVerdictForWindow,
+  parseTimeRangeMinutes,
+  evaluateGrabGuard,
   WEEKDAY_JP
 }
