@@ -732,7 +732,11 @@ async function checkDelayedAutoBook() {
           { nowMin }
         )
         if (!guardVerdict.allow) {
-          const why = guardVerdict.reason === 'extension-too-late' ? '续场已过决定时限（当天行程已开始）' : '当天已有不相连安排'
+          const why = guardVerdict.reason === 'extension-too-late'
+            ? '续场已过决定时限（须在行程开始前且距续场开场 2 小时以上）'
+            : guardVerdict.reason === 'too-late'
+              ? '发现太晚（距开场不足 1 小时）'
+              : '当天已有不相连安排'
           console.log(`[延迟自动抢] 跳过（${why}）${slot.place} ${slot.dateDisplay || slot.date} ${slot.time}`)
           delayedAutoBook.delete(slot.ucode)
           guardSkips.push({ slot, blocks: guard.blocks, reason: guardVerdict.reason })
@@ -805,9 +809,11 @@ async function checkDelayedAutoBook() {
             .map(b => `${fmtMinutes(b.start)}-${fmtMinutes(b.end)}${b.source === 'bear' ? '（Tennis Bear）' : `（${b.venue}）`}`)
             .join('、')
           const why = reason === 'extension-too-late'
-            ? '原因：续场须在当天行程开始前决定，已过时限'
-            : '原因：与当天已有安排不相连'
-          return formatSlotText(slot, getPlatformConfig(slot.place), { style: 'detail' }) + `\n${why}\n当天已有：${dayBlocks}`
+            ? '原因：续场须在当天行程开始前、且距续场开场 2 小时以上决定，已过时限'
+            : reason === 'too-late'
+              ? '原因：距开场不足 1 小时，不再自动抢'
+              : '原因：与当天已有安排不相连'
+          return formatSlotText(slot, getPlatformConfig(slot.place), { style: 'detail' }) + `\n${why}` + (blocks.length > 0 ? `\n当天已有：${dayBlocks}` : '')
         })
         await bot.sendMessage(chat,
           `🚫 *延迟自动抢跳过（行程守卫）*\n━━━━━━━━━━━━━━\n` + lines.join('\n\n'),
