@@ -723,14 +723,19 @@ async function checkDelayedAutoBook() {
           break
         }
         const slotRange = parseTimeRangeMinutes(slot.time)
+        const slotDayKey = parseSlotDayKey(slot)
+        const nowParts = jstParts()
+        const nowMin = slotDayKey === jstDateKey() ? nowParts.h * 60 + nowParts.mi : null
         const guardVerdict = evaluateGrabGuard(
           { start: slotRange?.start, end: slotRange?.end, venue: slot.place },
-          guard.blocks
+          guard.blocks,
+          { nowMin }
         )
         if (!guardVerdict.allow) {
-          console.log(`[延迟自动抢] 跳过（当天已有不相连安排）${slot.place} ${slot.dateDisplay || slot.date} ${slot.time}`)
+          const why = guardVerdict.reason === 'extension-too-late' ? '续场已过决定时限（当天行程已开始）' : '当天已有不相连安排'
+          console.log(`[延迟自动抢] 跳过（${why}）${slot.place} ${slot.dateDisplay || slot.date} ${slot.time}`)
           delayedAutoBook.delete(slot.ucode)
-          guardSkips.push({ slot, blocks: guard.blocks })
+          guardSkips.push({ slot, blocks: guard.blocks, reason: guardVerdict.reason })
           continue
         }
         if (guardVerdict.reason === 'extension') {
@@ -795,14 +800,17 @@ async function checkDelayedAutoBook() {
           { parse_mode: 'Markdown' }).catch(() => {})
       }
       if (guardSkips.length > 0 && bot && chat) {
-        const lines = guardSkips.map(({ slot, blocks }) => {
+        const lines = guardSkips.map(({ slot, blocks, reason }) => {
           const dayBlocks = blocks
             .map(b => `${fmtMinutes(b.start)}-${fmtMinutes(b.end)}${b.source === 'bear' ? '（Tennis Bear）' : `（${b.venue}）`}`)
             .join('、')
-          return formatSlotText(slot, getPlatformConfig(slot.place), { style: 'detail' }) + `\n当天已有：${dayBlocks}`
+          const why = reason === 'extension-too-late'
+            ? '原因：续场须在当天行程开始前决定，已过时限'
+            : '原因：与当天已有安排不相连'
+          return formatSlotText(slot, getPlatformConfig(slot.place), { style: 'detail' }) + `\n${why}\n当天已有：${dayBlocks}`
         })
         await bot.sendMessage(chat,
-          `🚫 *延迟自动抢跳过（当天已有不相连的网球安排）*\n━━━━━━━━━━━━━━\n` + lines.join('\n\n'),
+          `🚫 *延迟自动抢跳过（行程守卫）*\n━━━━━━━━━━━━━━\n` + lines.join('\n\n'),
           { parse_mode: 'Markdown' }).catch(() => {})
       }
     } finally {

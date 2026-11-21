@@ -384,14 +384,18 @@ function parseTimeRangeMinutes(timeStr) {
 // 延迟自动抢的行程守卫（用户规则，2026-11-21）：
 //   candidate: { start, end, venue }（当日分钟数 + 场地全名）
 //   blocks: 当天已有的网球时间块 [{ start, end, venue, source }]，source: 'booked' | 'bear'
+//   opts.nowMin: 当前时间（当日分钟数，JST）；候选不是当天时传 null（不设时限）
 // 判定：
 //   - 当天没有任何时间块 → { allow: true, reason: 'day-free' }
 //   - 候选与某个时间块首尾相接（续场）→ { allow: true, reason: 'extension', block }
 //     其中 booked 块要求同场地（异场地首尾相接赶不过去，不算续场）；bear 块只看时间
 //     （Tennis Bear 行程的场地是自由文本，与设施名对不齐）
+//   - 续场时限：续场必须在所接「连续链」的开始之前决定（如已约 9-11，11-13 的续场
+//     只能在 9:00 前自动抢；9-11 与 11-13 已连成链时，13-15 的续场同样以 9:00 为限）。
+//     已过时限 → { allow: false, reason: 'extension-too-late', block }
 //   - 其余（已有不相连的安排 / 与安排重叠）→ { allow: false, reason: 'separate', block: 首个冲突块 }
 //   - 候选时间非法 → { allow: false, reason: 'invalid' }（失败安全，不抢）
-function evaluateGrabGuard(candidate, blocks) {
+function evaluateGrabGuard(candidate, blocks, opts = {}) {
   const c = candidate || {}
   if (!Number.isFinite(c.start) || !Number.isFinite(c.end) || c.end <= c.start) {
     return { allow: false, reason: 'invalid' }
@@ -400,13 +404,36 @@ function evaluateGrabGuard(candidate, blocks) {
     .filter(b => b && Number.isFinite(b.start) && Number.isFinite(b.end) && b.end > b.start)
   if (list.length === 0) return { allow: true, reason: 'day-free' }
   const sameVenue = (a, b) => String(a || '').trim() !== '' && String(a || '').trim() === String(b || '').trim()
-  for (const b of list) {
-    const adjacent = c.start === b.end || c.end === b.start
-    if (!adjacent) continue
-    if (b.source === 'booked' && !sameVenue(c.venue, b.venue)) continue
-    return { allow: true, reason: 'extension', block: b }
+  const adjacent = list.filter(b => {
+    if (!(c.start === b.end || c.end === b.start)) return false
+    if (b.source === 'booked' && !sameVenue(c.venue, b.venue)) return false
+    return true
+  })
+  if (adjacent.length === 0) return { allow: false, reason: 'separate', block: list[0] }
+  const nowMin = opts ? opts.nowMin : null
+  if (Number.isFinite(nowMin)) {
+    // 把时间块按重叠/相接合并成连续链，取候选所接链的最早开始作为决定截止点
+    const sorted = [...list].sort((a, b) => a.start - b.start)
+    const chains = []
+    for (const b of sorted) {
+      const last = chains[chains.length - 1]
+      if (last && b.start <= last.end) {
+        last.end = Math.max(last.end, b.end)
+        last.members.push(b)
+      } else {
+        chains.push({ start: b.start, end: b.end, members: [b] })
+      }
+    }
+    let chainStart = Infinity
+    for (const b of adjacent) {
+      const chain = chains.find(ch => ch.members.includes(b))
+      if (chain) chainStart = Math.min(chainStart, chain.start)
+    }
+    if (Number.isFinite(chainStart) && nowMin >= chainStart) {
+      return { allow: false, reason: 'extension-too-late', block: adjacent[0] }
+    }
   }
-  return { allow: false, reason: 'separate', block: list[0] }
+  return { allow: true, reason: 'extension', block: adjacent[0] }
 }
 
 module.exports = {
