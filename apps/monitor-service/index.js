@@ -304,6 +304,12 @@ function schedulePlatform(name) {
       if (!st.paused && !st.timer) schedulePlatform(name)
       return
     }
+    // 定向扫描优先窗口（放号日扫描时刻–开放时刻、定向扫描未完成）：同样不启动
+    // 新的常规扫描，给定向扫描让出扫描器；定向扫描完成后自动恢复
+    if (isReleaseScanPriorityWindow(name)) {
+      if (!st.paused && !st.timer) schedulePlatform(name)
+      return
+    }
     scanPlatform(name).finally(() => {
       // paused 防 /pause 之后又武装；!st.timer 防重复 timer
       if (!st.paused && !st.timer) schedulePlatform(name)
@@ -929,7 +935,10 @@ async function triggerReleaseReminder(name, rr) {
       console.log(`[放号提醒] ${name} 提醒发送失败:`, e.message)
     }
   }
-  await requestManualScan(name, { releaseReminder: true })
+  // 不再顺带触发全量扫描：2026-11-12 的 11:40 提醒排队了一次 8 分钟的全量
+  // 扫描，正好把定向扫描堵到 12:07。提醒的目的（推周末/祝日空位）已由定向
+  // 扫描的 🎯 锁定消息覆盖；且定向扫描未成功时全量扫描同样要等扫描器空闲，
+  // 帮不上忙。提醒文本本身不变。
 }
 
 // 每 30s 轮询一次：到 REMIND_AT 那一分钟触发（每天最多一次）
@@ -1011,6 +1020,23 @@ function isReleaseQuietWindow(now = Date.now()) {
   return curMin >= 11 * 60 + 45 && curMin < 12 * 60 + 10
 }
 
+// 放号日定向扫描优先窗口：从定向扫描时刻（RELEASE_SCAN_AT，缺省 11:00）到开放
+// 时刻之间、且当日定向扫描尚未成功时为真——期间不启动新的常规扫描。
+// 2026-11-12 的教训：Edogawa 全量扫描一轮约 8 分钟且跑完立即重启，定向扫描
+// 每次 30s 轮询都撞上 busy 被静默跳过，直到 12:07 才锁定（开抢之后）。
+// 定向扫描一成功（releaseScannedDay 记上当日）本窗口立即失效，常规扫描恢复。
+function isReleaseScanPriorityWindow(name, now = Date.now()) {
+  const rr = getReleaseReminderConfig(name)
+  const norm = normalizeReleaseReminder(rr)
+  if (!norm) return false
+  const p = jstParts(now)
+  if (p.d !== norm.day) return false
+  if (releaseScannedDay.get(name) === jstDateKey(now)) return false
+  const curMin = p.h * 60 + p.mi
+  const openMin = getReleaseOpenAtMin(rr)
+  return curMin >= getReleaseScanAtMin(rr) && (openMin == null || curMin < openMin)
+}
+
 // 放号目标排序：周末/祝日优先、其次平日 19 点；同档按日期+时间先后
 function sortReleaseTargets(list) {
   const tier = d => (isWeekendOrHoliday(d) ? 0 : (getSlotStartHour(d) === 19 ? 1 : 2))
@@ -1048,7 +1074,12 @@ async function runReleaseTargetScan(name) {
   const st = runtime[name]
   const platformConfig = config.getPlatform(name)
   if (!st || platformConfig.enabled === false || st.paused) return false
-  if (st.scanning || st.releaseScanning) return false
+  if (st.scanning || st.releaseScanning) {
+    // 不再静默返回：2026-11-12 定向扫描被常规扫描堵了近一小时无人知晓，
+    // 每次跳过都记一笔，30s 轮询会再来（checkReleaseFlow）
+    console.log(`[放号抢] ${name} 定向扫描跳过：扫描进行中（scanning=${!!st.scanning} releaseScanning=${!!st.releaseScanning}），等待下轮重试`)
+    return false
+  }
   const adapter = loadPlatform(name)
   if (!adapter) return false
   const releaseMonth = getReleaseMonthPrefix()

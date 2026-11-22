@@ -326,17 +326,57 @@ async function handleLogin(page) {
 async function loginFirst(page, baseUrl) {
   console.log('[edogawa] 预热：先登录（放号窗口专用）')
   await page.goto(`${baseUrl}/user/Home`, { waitUntil: 'domcontentloaded' })
-  await page.waitForTimeout(1500)
+  // 等入口文本出现而不是固定等 1500ms：2026-11-12 预热就栽在这里——放号日
+  // 页面慢/异常时 1.5 秒根本不够，旧代码没等到就直接判失败且不留任何诊断。
+  // 等待条件同时认 ログイン（未登录）和 ログアウト（已登录）两种状态。
+  const waitEntry = async (timeoutMs) => page.waitForFunction(() => {
+    const t = document.body ? document.body.innerText : ''
+    return t.includes('ログイン') || t.includes('ログアウト') ||
+      !!document.querySelector('a[href*="Login" i]')
+  }, { timeout: timeoutMs }).then(() => true).catch(() => false)
+  if (!await waitEntry(15000)) {
+    console.log('[edogawa] 预热：等待 ログイン/ログアウト 文本超时，重载 Home 重试一次')
+    await page.goto(`${baseUrl}/user/Home`, { waitUntil: 'domcontentloaded' }).catch(() => {})
+    await waitEntry(10000)
+  }
   const clicked = await page.evaluate(() => {
-    const nodes = [...document.querySelectorAll('header a, header button, .header a, .header button, a, button')]
-    const el = nodes.find(n => (n.textContent || '').trim().includes('ログイン') && !n.closest('form'))
+    const norm = s => (s || '').replace(/\s+/g, ' ').trim()
+    const cands = [...document.querySelectorAll('a, button, input, [role="button"], [onclick]')]
+    const textOf = n => norm(n.textContent) || norm(n.value) ||
+      norm(n.getAttribute('aria-label')) || norm(n.getAttribute('title')) ||
+      norm(n.querySelector('img')?.getAttribute('alt'))
+    // 已登录的会话 Home 上是 ログアウト：这不是失败，直接算登录完成
+    if (cands.some(n => textOf(n).includes('ログアウト'))) return { already: true }
+    // 多策略兜底找 ログイン：文本/value/aria-label/title/子图 alt 任一命中即可；
+    // 不再排除 form 内的元素（未确证入口不在 form 内，排除只会漏）
+    const el = cands.find(n => {
+      if (!textOf(n).includes('ログイン')) return false
+      if (n.tagName === 'INPUT' && !/^(submit|button)$/i.test(n.type || '')) return false
+      return true
+    })
     if (!el) return null
     const tag = el.tagName.toLowerCase()
     const cls = (el.className && el.className.baseVal !== undefined ? el.className.baseVal : el.className) || ''
     el.click()
-    return { tag, cls: String(cls), text: (el.textContent || '').trim().slice(0, 30) }
+    return { tag, cls: String(cls), text: norm(el.textContent || el.value || '').slice(0, 30) }
   })
-  if (!clicked) throw new Error('预热登录失败：Home 页未找到 ログイン 入口')
+  if (clicked && clicked.already) {
+    console.log('[edogawa] 预热：Home 已是登录状态（出现 ログアウト），跳过登录步骤')
+    return true
+  }
+  if (!clicked) {
+    // 失败自证：把当时页面状态记进日志，下次不用再向用户要截图
+    const diag = await page.evaluate(() => ({
+      url: location.href,
+      title: document.title,
+      clickables: [...document.querySelectorAll('a, button, input[type=submit], input[type=button]')]
+        .slice(0, 40).map(n => `${n.tagName}:${((n.textContent || n.value || n.getAttribute('aria-label') || '') + '').trim().slice(0, 20)}`),
+      bodyHead: (document.body ? document.body.innerText : '').slice(0, 300)
+    })).catch(() => null)
+    console.log('[edogawa] 预热登录失败诊断:', JSON.stringify(diag))
+    await page.screenshot({ path: `logs/prewarm-login-fail-${Date.now()}.png` }).catch(() => {})
+    throw new Error('预热登录失败：Home 页未找到 ログイン 入口（诊断已记日志）')
+  }
   console.log('[edogawa] 预热：点击 ログイン 入口:', JSON.stringify(clicked))
   await page.waitForURL(/Login/i, { timeout: 15000 })
   await page.waitForTimeout(1000)
