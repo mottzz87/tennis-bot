@@ -127,7 +127,13 @@ async function navigateToMonth(req, targets, scanDays, startOffset = 2) {
  * @param {string} displayTerm - SearchCondition.DisplayTerm
  * @returns {Promise<Array>} AvailabilitySelectDays 数组；查询失败/为空返回 []
  */
-async function queryMonth(req, formFields, token3, startDate, displayTerm) {
+// options.throwOnError（扫描专用）：请求失败/返回非 JSON（如站点 504 的 HTML 错误页）时
+// 抛错，让整轮扫描作废，而不是返回空模型——空模型会被上层当成「本期无空位」，
+// 一轮残缺扫描就能把 diff 基线清空，下一轮恢复时全部空位被当成新增全量推送
+// （2026-11-25 实测：单期 504 → -228 → 下一轮 +228 全量推送）。
+// 预订路径默认不传此选项：单日查询（DisplayTerm=1，未经实测）失败时要靠空模型
+// 回退整期查询，行为保持不变。
+async function queryMonth(req, formFields, token3, startDate, displayTerm, options = {}) {
   const fd3 = new URLSearchParams()
   for (const [k, v] of formFields) fd3.set(k, v)
   fd3.set('SearchCondition.StartDate', startDate)
@@ -145,6 +151,7 @@ async function queryMonth(req, formFields, token3, startDate, displayTerm) {
     })
   } catch (e) {
     console.log(`[edogawa] SearchCondition 请求失败 (${startDate}): ${e.message}`)
+    if (options.throwOnError) throw new Error(`SearchCondition 请求失败 (${startDate}): ${e.message}`)
     return []
   }
   const body = await res.text()
@@ -153,6 +160,10 @@ async function queryMonth(req, formFields, token3, startDate, displayTerm) {
     return Array.isArray(month) ? month : []
   } catch {
     console.log(`[edogawa] SearchCondition 返回异常 (${startDate}): ${body.slice(0, 120)}`)
+    if (options.throwOnError) {
+      const status = res && res.status ? ` HTTP ${res.status}` : ''
+      throw new Error(`SearchCondition 返回异常 (${startDate})${status}: ${body.slice(0, 120)}`)
+    }
     return []
   }
 }
