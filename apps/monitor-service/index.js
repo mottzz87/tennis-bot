@@ -42,7 +42,7 @@ const {
   jstDateKey, jstParts, parseHHMM, normalizeReleaseReminder,
   isReleaseWindow, matchReleaseReminderMoment,
   parseTimeSafe, normalizeTimeRange, delayedGrabWaitMs, rainVerdictForWindow,
-  parseTimeRangeMinutes, evaluateGrabGuard, isSuspiciousScanDrop
+  parseTimeRangeMinutes, evaluateGrabGuard, isSuspiciousScanDrop, isPersistentPushEnabled
 } = require('@tennis-bot/utils')
 const { fetchBearDayBlocks } = require('./tennisbear')
 
@@ -402,6 +402,10 @@ function registerEphemeralSlots(slots) {
 // （默认 10 分钟，可 /set 修改）重推一次，直到空位消失、被约走、日期已过，或用户点铃铛关闭。
 // 状态只存在内存里：monitor 重启后登记会丢，但旧消息上的铃铛仍可重新登记（toggle 未登记时
 // 会从当前空位反查并新建），不会因此永久丢掉开关。
+// 全局开关：PERSISTENT_PUSH_ENABLED（global 配置，/set global:PERSISTENT_PUSH_ENABLED false
+// 关闭，平台配置同名 key 可单独覆盖）。单空位的铃铛关闭只是内存状态，空位在扫描里
+// 闪退/重现（或重启后点旧铃铛）都会被重新登记为开启；全局开关写盘持久化，
+// 重启/重新部署后依然生效。关闭时：不再新登记、已登记的不重推（登记保留，重新开启后恢复）。
 // ========================
 const persistentPush = new Map() // ucode -> { slot, platform, nextPushAt, pushCount, enabled }
 
@@ -440,6 +444,7 @@ function isPreReleaseSlot(slot, platformConfig, now = Date.now()) {
 
 function armPersistentPush(slot, platform) {
   if (!slot?.ucode || persistentPush.has(slot.ucode)) return false
+  if (!isPersistentPushEnabled(config.getEffective('PERSISTENT_PUSH_ENABLED', platform))) return false
   persistentPush.set(slot.ucode, {
     slot, platform,
     nextPushAt: Date.now() + getPersistentIntervalMs(platform),
@@ -503,6 +508,8 @@ async function checkPersistentPush() {
   const dueByPlatform = new Map()
   for (const [ucode, entry] of persistentPush) {
     if (!entry.enabled) continue
+    // 全局开关关闭的平台不重推（登记保留，重新开启后恢复，语义同暂停）
+    if (!isPersistentPushEnabled(config.getEffective('PERSISTENT_PUSH_ENABLED', entry.platform))) continue
     // 暂停或停用的平台不重推（登记保留，恢复后下一轮再推，不会攒一堆补发）
     if (runtime[entry.platform]?.paused) continue
     if (config.getPlatform(entry.platform)?.enabled === false) continue
@@ -865,7 +872,8 @@ async function sendBookButtons(bot, chatId, slots, header) {
       }
       rows.push([bookBtn])
       if (!isPersistentPushEligible(d)) continue
-      const enabled = persistentPush.get(d.ucode)?.enabled
+      const enabled = persistentPush.get(d.ucode)?.enabled &&
+        isPersistentPushEnabled(config.getEffective('PERSISTENT_PUSH_ENABLED', d.platform))
       rows.push([{ text: enabled ? '🔔' : '🔕', callback_data: `bell_${slotToken(d.ucode)}` }])
     }
     const h = i === 0 ? header : `${header}\n（第 ${i / MAX_INLINE_BUTTONS + 1} 页）`
