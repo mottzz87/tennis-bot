@@ -458,6 +458,13 @@ function isSuspiciousScanDrop(prevCount, newCount, minBaseline = 20) {
   return next < prev / 2
 }
 
+// 持续推送全局开关判定：只有显式 false 才关闭；未配置（undefined）/true/其它值都视为开启。
+// 开关存放在配置里（global.yaml 的 PERSISTENT_PUSH_ENABLED，可 /set global: 修改），
+// 写盘持久化，重启/重新部署后依然生效——与只存内存的单空位铃铛状态不同。
+function isPersistentPushEnabled(effectiveValue) {
+  return effectiveValue !== false
+}
+
 module.exports = {
   slotToken,
   sleep,
@@ -493,5 +500,6 @@ module.exports = {
   parseTimeRangeMinutes,
   evaluateGrabGuard,
   isSuspiciousScanDrop,
+  isPersistentPushEnabled,
   WEEKDAY_JP
 }
