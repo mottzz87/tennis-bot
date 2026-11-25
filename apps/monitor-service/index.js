@@ -42,7 +42,7 @@ const {
   jstDateKey, jstParts, parseHHMM, normalizeReleaseReminder,
   isReleaseWindow, matchReleaseReminderMoment,
   parseTimeSafe, normalizeTimeRange, delayedGrabWaitMs, rainVerdictForWindow,
-  parseTimeRangeMinutes, evaluateGrabGuard
+  parseTimeRangeMinutes, evaluateGrabGuard, isSuspiciousScanDrop
 } = require('@tennis-bot/utils')
 const { fetchBearDayBlocks } = require('./tennisbear')
 
@@ -93,7 +93,8 @@ for (const name of config.getPlatformNames()) {
     pendingManualOptions: null, // 排队中的手动扫描参数（如 { releaseReminder: true }）
     lastCycleStartAt: null, // 上一轮扫描周期的启动时间（周期起点调度用）
     rawCells: [],         // 本平台最近一次扫描合并前的原始小时格（按需重合并用）
-    lastSet: new Set()    // 只含本平台的 uid（diff 基线）
+    lastSet: new Set(),   // 只含本平台的 uid（diff 基线）
+    suspectDropStreak: 0  // 连续「结果暴跌」轮数：第 1 轮跳过不更新基线，第 2 轮起接受为真实变化
   }
 }
 
@@ -1695,6 +1696,20 @@ async function scanPlatform(name, options = {}) {
 
     const enriched = enrichSlots(slots, name, platformConfig)
     const filtered = core.filterSlotsByConfig(enriched, platformConfig)
+
+    // 残缺扫描防护：结果比基线暴跌过半（基线 ≥20）时多半是站点故障/残缺结果
+    // （2026-11-25 江户川 504 一轮打成 0 个，基线被清空后下一轮 +228 全量误推）。
+    // 第 1 轮可疑 → 跳过本轮：不更新 lastSet/currentSlotMap、不推送，下一轮恢复后自然无变化；
+    // 连续第 2 轮仍暴跌 → 接受为真实变化（如大批空位真的同时消失），避免永久卡住基线。
+    if (!st.firstRun && isSuspiciousScanDrop(st.lastSet.size, filtered.length)) {
+      st.suspectDropStreak = (st.suspectDropStreak || 0) + 1
+      if (st.suspectDropStreak < 2) {
+        console.log(`[MONITOR][${name.toUpperCase()}][${trace}] 可疑扫描：空位 ${st.lastSet.size} → ${filtered.length}（暴跌过半），跳过本轮不更新基线 · ${formatDuration(Date.now() - scanStart)}`)
+        return
+      }
+      console.log(`[MONITOR][${name.toUpperCase()}][${trace}] 连续 ${st.suspectDropStreak} 轮空位暴跌（基线 ${st.lastSet.size} → ${filtered.length}），接受为真实变化`)
+    }
+    st.suspectDropStreak = 0
 
     // 放号窗口内推送只保留周末/祝日（diff 仍用全量 filtered，避免窗口前后重复推/误报减少）
     const weekendOnly = inReleaseWindow(name)
