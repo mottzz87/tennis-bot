@@ -83,9 +83,12 @@ class EdogawaAdapter {
     try {
       return await this._scan(http, targets, platformConfig, options)
     } catch (e) {
+      // 不再吞错返回 []：空数组会被 monitor 当成「扫描成功但无空位」，清空 diff 基线，
+      // 下一轮恢复时全量误推。抛给调用方（scanPlatform / 定向扫描 / 手动扫描都有
+      // catch 并保留原状态），本轮作废即可。
       console.log(`[edogawa] 扫描失败: ${e.message}`)
       this.rawCells = []
-      return []
+      throw e
     }
   }
 
@@ -112,7 +115,7 @@ class EdogawaAdapter {
   async _scan(req, targets, platformConfig, options = {}) {
     // 1-5. 导航到 SelectDays 页（窗口超 1ヶ月 自动拆多期，但不在导航阶段提前查询）
     const nav = await navigateToMonth(req, targets, this._scanDays, this._startOffset)
-    if (!nav) return []
+    if (!nav) throw new Error('导航失败（navigateToMonth 返回空），本轮扫描作废')
     const { selected, formFields, token3, periods } = nav
 
     // 定向扫描（放号日）：只查放号月那一期，跳过其它期，省掉当月期的 Next+时间页请求。
@@ -133,7 +136,7 @@ class EdogawaAdapter {
     const BATCH = 10
     let someTotal = 0
     for (const p of periodsToScan) {
-      const month = await queryMonth(req, formFields, token3, p.startDate, p.displayTerm)
+      const month = await queryMonth(req, formFields, token3, p.startDate, p.displayTerm, { throwOnError: true })
       const cells = collectSomeCells(month, p.startDate, p.endDate)
       someTotal += cells.length
       for (let i = 0; i < cells.length; i += BATCH) {

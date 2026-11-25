@@ -445,6 +445,19 @@ function evaluateGrabGuard(candidate, blocks, opts = {}) {
   return { allow: true, reason: 'extension', block: adjacent[0] }
 }
 
+// 扫描结果「暴跌」判定（monitor 防残缺扫描误推用）：
+// 基线（上一轮空位数）达到 minBaseline 后，本轮结果不足基线一半 → 可疑。
+// 站点 504/超时等会让一轮扫描只拿到残缺结果（极端时 0 个），若照常更新 diff 基线，
+// 下一轮恢复时全部空位会被当成新增全量推送（2026-11-25 江户川实测 228 个）。
+// 小基线时波动正常（如市川日常 0-3 个），不触发；阈值可由调用方覆盖。
+function isSuspiciousScanDrop(prevCount, newCount, minBaseline = 20) {
+  const prev = Number(prevCount)
+  const next = Number(newCount)
+  if (!Number.isFinite(prev) || !Number.isFinite(next)) return false
+  if (prev < minBaseline) return false
+  return next < prev / 2
+}
+
 module.exports = {
   slotToken,
   sleep,
@@ -479,5 +492,6 @@ module.exports = {
   rainVerdictForWindow,
   parseTimeRangeMinutes,
   evaluateGrabGuard,
+  isSuspiciousScanDrop,
   WEEKDAY_JP
 }
