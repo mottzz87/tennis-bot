@@ -42,7 +42,8 @@ const {
   jstDateKey, jstParts, parseHHMM, normalizeReleaseReminder,
   isReleaseWindow, matchReleaseReminderMoment,
   parseTimeSafe, normalizeTimeRange, delayedGrabWaitMs, rainVerdictForWindow,
-  parseTimeRangeMinutes, evaluateGrabGuard, isSuspiciousScanDrop, isPersistentPushEnabled
+  parseTimeRangeMinutes, evaluateGrabGuard, isSuspiciousScanDrop, isPersistentPushEnabled,
+  isSlotBooked
 } = require('@tennis-bot/utils')
 const { fetchBearDayBlocks } = require('./tennisbear')
 
@@ -406,6 +407,9 @@ function registerEphemeralSlots(slots) {
 // 关闭，平台配置同名 key 可单独覆盖）。单空位的铃铛关闭只是内存状态，空位在扫描里
 // 闪退/重现（或重启后点旧铃铛）都会被重新登记为开启；全局开关写盘持久化，
 // 重启/重新部署后依然生效。关闭时：不再新登记、已登记的不重推（登记保留，重新开启后恢复）。
+// 已预订防重推：发送前查预订记录（fetchBookedSlotKeys），已订掉的注销不推；monitor 自身
+// 预订成功时另走 cleanupAfterBooked 即时清理。手动按钮预订（telegram-bot 直连预订机）
+// 靠发送前校验覆盖——预订记录在下单成功时即已落盘，下一 tick 必然先查后推。
 // ========================
 const persistentPush = new Map() // ucode -> { slot, platform, nextPushAt, pushCount, enabled }
 
@@ -460,6 +464,20 @@ function removePersistentPushByUid(uid) {
   }
 }
 
+// 预订成功后的即时清理：注销该空位的持续推送/延迟抢登记，并把它摘出当前空位列表，
+// 不等下一轮扫描刷新（江户川一轮扫描约 6 分钟，窗口内持续推送 tick 会以为它还在）。
+// lastSet 不动：diff 语义保持原样，下一轮扫描自然以 removed 收尾。
+function cleanupAfterBooked(slot) {
+  if (!slot) return
+  removePersistentPushByUid(slot.uid)
+  if (slot.ucode) {
+    persistentPush.delete(slot.ucode)
+    delayedAutoBook.delete(slot.ucode)
+    currentSlotMap.delete(slot.ucode)
+  }
+  currentData = currentData.filter(s => s.uid !== slot.uid)
+}
+
 function resolvePersistentSlot(id) {
   let slot = currentSlotMap.get(id) || ephemeralSlots.get(id)?.slot
   if (slot) return slot
@@ -505,7 +523,7 @@ async function checkPersistentPush() {
   // 放号日静默窗口（11:45–12:10）：暂停持续推送（登记保留，窗口后下一轮继续）
   if (isReleaseQuietWindow()) return
   const now = Date.now()
-  const dueByPlatform = new Map()
+  const dueEntries = []
   for (const [ucode, entry] of persistentPush) {
     if (!entry.enabled) continue
     // 全局开关关闭的平台不重推（登记保留，重新开启后恢复，语义同暂停）
@@ -521,6 +539,31 @@ async function checkPersistentPush() {
     entry.slot = current
     // 放号前只推一次：放号月 slot 在放号时刻前不重推（登记保留，放号后自动恢复）
     if (isPreReleaseSlot(current, config.getPlatform(entry.platform))) continue
+    dueEntries.push({ ucode, entry, current })
+  }
+  // 已预订校验：到期要推的空位先查预订记录（bot 预订 + 手动同步的记录都在里面），
+  // 已订掉的直接注销不推——旧逻辑只看扫描列表，预订成功到下一轮扫描刷新之间
+  // （江户川约 6 分钟）会把自己刚订的空位又推回来（2026-11-26 谷河内 B面实测）。
+  // 查询失败按失败安全处理：本轮不推，下一轮 tick 重试（登记与到期时间都保留）。
+  if (dueEntries.length > 0) {
+    let bookedKeys
+    try {
+      bookedKeys = await fetchBookedSlotKeys()
+    } catch (e) {
+      console.log(`[持续推送] 预订记录查询失败，本轮不推: ${e.message}`)
+      return
+    }
+    for (let i = dueEntries.length - 1; i >= 0; i--) {
+      const { ucode, current } = dueEntries[i]
+      if (isSlotBooked(current, bookedKeys)) {
+        persistentPush.delete(ucode)
+        console.log(`[持续推送] 已预订，注销 ${current.platform} ${current.place} ${current.dateDisplay || current.date} ${current.time}`)
+        dueEntries.splice(i, 1)
+      }
+    }
+  }
+  const dueByPlatform = new Map()
+  for (const { entry, current } of dueEntries) {
     if (!dueByPlatform.has(entry.platform)) dueByPlatform.set(entry.platform, [])
     dueByPlatform.get(entry.platform).push(current)
   }
@@ -656,6 +699,19 @@ async function fetchBookedDayBlocks(dayKey) {
     blocks.push({ start: range.start, end: range.end, venue: rec.place || '', source: 'booked' })
   }
   return blocks.sort((a, b) => a.start - b.start)
+}
+
+// 全部预订记录的 uid+ucode 集合（持续推送的已预订校验用）。任何失败都抛错，
+// 调用方按「查不到就不推」处理（见 checkPersistentPush）。
+async function fetchBookedSlotKeys() {
+  const json = await httpGetJson(`${BOOKING_HOST}/api/booked`)
+  if (!json || !Array.isArray(json.slots)) throw new Error('预订记录接口返回异常')
+  const keys = new Set()
+  for (const rec of json.slots) {
+    if (rec.uid) keys.add(rec.uid)
+    if (rec.ucode) keys.add(rec.ucode)
+  }
+  return keys
 }
 
 function fmtMinutes(min) {
@@ -798,6 +854,7 @@ async function checkDelayedAutoBook() {
           const dayKey = parseSlotDayKey(slot)
           if (dayKey) autoBookedDayKeys.add(dayKey)
           saveAutoBooked()
+          cleanupAfterBooked(slot)
           console.log(`[延迟自动抢] 成功 ${slot.place} ${slot.dateDisplay || slot.date} ${slot.time}`)
           if (bot && chat) {
             const booked = result.fee?.total != null ? { ...slot, totalFee: result.fee.total } : slot
@@ -1147,6 +1204,7 @@ async function runParallelReleaseGrab(targets, name) {
       const dk = parseSlotDayKey(t)
       if (dk) autoBookedDayKeys.add(dk)
       saveAutoBooked()
+      cleanupAfterBooked(t)
     }
     return r
   }
@@ -1215,6 +1273,7 @@ async function runReleaseGrab(name) {
             autoBookedUIDs.add(targets[i].uid)
             const dk = parseSlotDayKey(targets[i])
             if (dk) autoBookedDayKeys.add(dk)
+            cleanupAfterBooked(targets[i])
           }
         }
         saveAutoBooked()
@@ -1631,6 +1690,7 @@ async function autoBookPlatform(name, added, platformConfig, trace) {
         if (dayKey) autoBookedDayKeys.add(dayKey)
         autoBookedUIDs.add(target.uid)
         saveAutoBooked()
+        cleanupAfterBooked(target)
       }
     }
 
