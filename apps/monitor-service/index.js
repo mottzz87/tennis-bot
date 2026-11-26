@@ -19,6 +19,7 @@
  *   GET  /api/slot/:ucode
  *   GET  /api/schedule-status
  *   POST /api/persistent/toggle  { id }（id 为完整 ucode 或 slotToken，开关持续推送：周末/祝日 + 平日 19 点）
+ *   POST /api/push/toggle        翻转自动推送总开关 SLOT_PUSH_ENABLED（推送消息上一键按钮用）
  *   GET  /api/persistent         当前持续推送登记
  *   GET  /api/delayed-auto-book  当前延迟自动预约观望登记（发现空位先观望，还在才抢）
  *
@@ -43,7 +44,7 @@ const {
   isReleaseWindow, matchReleaseReminderMoment,
   parseTimeSafe, normalizeTimeRange, delayedGrabWaitMs, rainVerdictForWindow,
   parseTimeRangeMinutes, evaluateGrabGuard, isSuspiciousScanDrop, isPersistentPushEnabled,
-  isSlotBooked
+  isSlotPushEnabled, isSlotBooked
 } = require('@tennis-bot/utils')
 const { fetchBearDayBlocks } = require('./tennisbear')
 
@@ -522,6 +523,8 @@ function togglePersistentPush(id) {
 async function checkPersistentPush() {
   // 放号日静默窗口（11:45–12:10）：暂停持续推送（登记保留，窗口后下一轮继续）
   if (isReleaseQuietWindow()) return
+  // 自动推送总开关关闭：整轮不推（登记与到期时间保留，重新开启后下一轮继续，语义同平台暂停）
+  if (!isSlotPushEnabled(config.getEffective('SLOT_PUSH_ENABLED'))) return
   const now = Date.now()
   const dueEntries = []
   for (const [ucode, entry] of persistentPush) {
@@ -576,6 +579,7 @@ async function checkPersistentPush() {
         botInstance, chatId, sortWeekendOrHolidayFirst(slots),
         '🔔 空位还在 · 点击直接预约（持续推送中，点 🔔 可取消）'
       )
+      await maybeSendPushToggle(botInstance, chatId, slots.length)
       for (const d of slots) {
         const entry = persistentPush.get(d.ucode)
         if (entry) { entry.pushCount += 1; entry.nextPushAt = Date.now() + getPersistentIntervalMs(platform) }
@@ -909,6 +913,24 @@ function rematchPlaceSlots(platform, place, hours, rawCells) {
   const filtered = core.filterSlotsByConfig(enrichSlots(merged, platform, platformConfig), platformConfig)
   registerEphemeralSlots(filtered)
   return sortWeekendOrHolidayFirst(filtered)
+}
+
+// 一键开关推送按钮：单轮自动推送的空位多于 PUSH_TOGGLE_THRESHOLD 个时，
+// 在本轮消息之后补发一条带「一键关闭推送」按钮的消息（用户 2026-11-26 要求）。
+// 点按钮 → telegram-bot 回调 push_toggle → POST /api/push/toggle 翻转全局
+// SLOT_PUSH_ENABLED 并把按钮文字翻成「一键开启推送」；关闭期间不再发新空位
+// 通知与持续推送重推（扫描与状态照常推进，恢复后不会把积压当新空位补发）。
+const PUSH_TOGGLE_THRESHOLD = 5
+async function maybeSendPushToggle(bot, chatId, pushedCount) {
+  if (!(pushedCount > PUSH_TOGGLE_THRESHOLD)) return
+  if (!isSlotPushEnabled(config.getEffective('SLOT_PUSH_ENABLED'))) return
+  try {
+    await bot.sendMessage(chatId, `📣 本轮推送了 ${pushedCount} 个空位。嫌多可以先关掉自动推送（预约和自动抢场不受影响）。`, {
+      reply_markup: { inline_keyboard: [[{ text: '🔕 一键关闭推送', callback_data: 'push_toggle' }]] }
+    })
+  } catch (e) {
+    console.log('[推送总开关] 一键按钮消息发送失败:', e.message)
+  }
 }
 
 // 分批发送 book 按钮（每批 MAX_INLINE_BUTTONS 个）。
@@ -1461,6 +1483,9 @@ async function sendTelegram(data, version, title = '🆕 可预约（点击直�
         { reply_markup: { inline_keyboard: restButtons } }
       )
     }
+
+    // 本轮推送空位多于阈值 → 附一键关闭推送按钮
+    await maybeSendPushToggle(botInstance, chatId, list.length)
   }
 }
 
@@ -1845,8 +1870,12 @@ async function scanPlatform(name, options = {}) {
         if (isPersistentPushEligible(d)) armPersistentPush(d, name)
       }
       if (config.getEffective('NOTIFY_ADDED', name) !== false) {
-        console.log(`[MONITOR][${name.toUpperCase()}][${trace}] PUSH 发送新增通知 ${added.length}`)
-        await sendTelegram(added, currentVersion, '✨ 有新场地！点击直接预约', { weekendOnly })
+        if (isSlotPushEnabled(config.getEffective('SLOT_PUSH_ENABLED'))) {
+          console.log(`[MONITOR][${name.toUpperCase()}][${trace}] PUSH 发送新增通知 ${added.length}`)
+          await sendTelegram(added, currentVersion, '✨ 有新场地！点击直接预约', { weekendOnly })
+        } else {
+          console.log(`[MONITOR][${name.toUpperCase()}][${trace}] 自动推送总开关关闭，跳过新增通知 ${added.length} 个`)
+        }
       }
       await autoBookPlatform(name, added, platformConfig, trace)
     }
@@ -1994,6 +2023,15 @@ const server = http.createServer(async (req, res) => {
       }
       config.setPlatform(platform, 'TARGET_PLACE', pc.TARGET_PLACE)
       config.save()
+      return json(res, { success: true, enabled: !enabled })
+    }
+
+    // POST /api/push/toggle 翻转自动推送总开关（SLOT_PUSH_ENABLED，全局键，写盘持久化）
+    if (req.method === 'POST' && pathname === '/api/push/toggle') {
+      const enabled = isSlotPushEnabled(config.getEffective('SLOT_PUSH_ENABLED'))
+      config.set('SLOT_PUSH_ENABLED', !enabled)
+      config.save()
+      console.log(`[推送总开关] 已${!enabled ? '开启' : '关闭'}（一键按钮）`)
       return json(res, { success: true, enabled: !enabled })
     }
 
