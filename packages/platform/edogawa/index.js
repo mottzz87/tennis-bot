@@ -22,6 +22,7 @@ const {
   daysToEndOfNextMonth
 } = require('./flow')
 const { bookSlot, prepareSession, bookBatchesWithPreparedSession } = require('./booking')
+const { fetchReservationEntries, siteEntryToRecord } = require('./reservations')
 
 const PLATFORM_NAME = 'edogawa'
 
@@ -211,6 +212,14 @@ class EdogawaAdapter {
   // 放号窗口批量抢场（ADDITIVE）：单会话内按优先级逐批抢（每批 1 个时段，一次申请）。
   async bookPrepared(prepared, slots, platformConfig) {
     return bookBatchesWithPreparedSession(this, prepared, slots, platformConfig)
+  }
+
+  // 官网预约同步（只读）：登录官网读预约列表，映射成 bot 预约记录形状返回。
+  // 给 booking-service 的定时同步对账用（用户直接在官网订的场次补进服务器）。
+  async fetchReservationRecords(platformConfig) {
+    const placeNames = Object.keys(platformConfig?.PLACE_MAP || {}).sort((a, b) => b.length - a.length)
+    const entries = await fetchReservationEntries(placeNames)
+    return entries.map(e => siteEntryToRecord(e, platformConfig))
   }
 }
 

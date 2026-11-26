@@ -1202,6 +1202,7 @@ module.exports = {
   selectTimeCells,
   clickNext,
   handleLogin,
+  loginFirst,
   fillApplyDetail,
   submitApply,
   extractFee,
