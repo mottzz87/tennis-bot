@@ -1330,19 +1330,20 @@ function registerHandlers(bot) {
       return
     }
 
-    // --- 一键开关自动推送（单轮推送 >5 个空位时由 monitor 附带） ---
-    if (data === 'push_toggle') {
+    // --- 一键开关「这一批」推送（单轮推送 >5 个空位时由 monitor 附带；只影响这批空位） ---
+    if (data.startsWith('push_toggle_')) {
+      const batchId = data.replace('push_toggle_', '')
       try {
-        const res = await monitorApi('POST', '/api/push/toggle', {})
+        const res = await monitorApi('POST', '/api/push/toggle-batch', { id: batchId })
         if (!res.data?.success) {
-          await bot.answerCallbackQuery(query.id, { text: '❌ 操作失败' })
+          await bot.answerCallbackQuery(query.id, { text: '⚠️ 这批空位已过期' })
           return
         }
         const enabled = res.data.enabled
-        const newText = enabled ? '🔕 一键关闭推送' : '🔔 一键开启推送'
+        const newText = enabled ? '🔕 关闭这批推送' : '🔔 开启这批推送'
         const rows = query.message.reply_markup?.inline_keyboard || []
         const newRows = rows.map(row => row.map(btn =>
-          btn.callback_data === 'push_toggle' ? { ...btn, text: newText } : btn
+          btn.callback_data === data ? { ...btn, text: newText } : btn
         ))
         try {
           await bot.editMessageReplyMarkup({ inline_keyboard: newRows }, {
@@ -1352,7 +1353,7 @@ function registerHandlers(bot) {
         } catch (e) {
           console.warn('[push_toggle] 更新按钮失败:', e.message)
         }
-        await bot.answerCallbackQuery(query.id, { text: enabled ? '🔔 自动推送已开启' : '🔕 自动推送已关闭，安静了' })
+        await bot.answerCallbackQuery(query.id, { text: enabled ? `🔔 这批推送已开启（${res.data.count} 个空位）` : `🔕 这批推送已关闭（${res.data.count} 个空位）` })
       } catch (e) {
         await bot.answerCallbackQuery(query.id, { text: '❌ 操作失败' })
       }
