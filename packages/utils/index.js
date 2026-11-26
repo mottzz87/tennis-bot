@@ -465,6 +465,17 @@ function isPersistentPushEnabled(effectiveValue) {
   return effectiveValue !== false
 }
 
+// 空位是否已在预订记录里（uid / ucode 任一命中即算已预订）。
+// bookedKeys 是预订记录的 uid+ucode 集合（来自 booking-service GET /api/booked）。
+// 持续推送发送前用它拦下「已经订掉还在推」的空位（2026-11-26 谷河内 B面实测：
+// 09:55 预订成功，10:00 仍收到持续推送——旧逻辑只看扫描列表，扫描未刷新前不注销）。
+function isSlotBooked(slot, bookedKeys) {
+  if (!slot || !bookedKeys || typeof bookedKeys.has !== 'function') return false
+  if (slot.uid && bookedKeys.has(slot.uid)) return true
+  if (slot.ucode && bookedKeys.has(slot.ucode)) return true
+  return false
+}
+
 module.exports = {
   slotToken,
   sleep,
@@ -501,5 +512,6 @@ module.exports = {
   evaluateGrabGuard,
   isSuspiciousScanDrop,
   isPersistentPushEnabled,
+  isSlotBooked,
   WEEKDAY_JP
 }
