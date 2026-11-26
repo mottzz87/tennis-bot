@@ -465,6 +465,14 @@ function isPersistentPushEnabled(effectiveValue) {
   return effectiveValue !== false
 }
 
+// 自动推送总开关判定：语义同 isPersistentPushEnabled — 只有显式 false 才关闭。
+// 开关存放在 global.yaml 的 SLOT_PUSH_ENABLED（全局键，不分平台），写盘持久化。
+// 关闭时 monitor 不再发「新空位通知」与「持续推送重推」（手动扫描、预约、
+// 自动抢场不受影响）；开启/关闭由推送消息上的一键按钮（push_toggle）翻转。
+function isSlotPushEnabled(effectiveValue) {
+  return effectiveValue !== false
+}
+
 // 空位是否已在预订记录里（uid / ucode 任一命中即算已预订）。
 // bookedKeys 是预订记录的 uid+ucode 集合（来自 booking-service GET /api/booked）。
 // 持续推送发送前用它拦下「已经订掉还在推」的空位（2026-11-26 谷河内 B面实测：
@@ -512,6 +520,7 @@ module.exports = {
   evaluateGrabGuard,
   isSuspiciousScanDrop,
   isPersistentPushEnabled,
+  isSlotPushEnabled,
   isSlotBooked,
   WEEKDAY_JP
 }

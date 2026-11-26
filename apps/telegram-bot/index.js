@@ -1330,6 +1330,35 @@ function registerHandlers(bot) {
       return
     }
 
+    // --- 一键开关自动推送（单轮推送 >5 个空位时由 monitor 附带） ---
+    if (data === 'push_toggle') {
+      try {
+        const res = await monitorApi('POST', '/api/push/toggle', {})
+        if (!res.data?.success) {
+          await bot.answerCallbackQuery(query.id, { text: '❌ 操作失败' })
+          return
+        }
+        const enabled = res.data.enabled
+        const newText = enabled ? '🔕 一键关闭推送' : '🔔 一键开启推送'
+        const rows = query.message.reply_markup?.inline_keyboard || []
+        const newRows = rows.map(row => row.map(btn =>
+          btn.callback_data === 'push_toggle' ? { ...btn, text: newText } : btn
+        ))
+        try {
+          await bot.editMessageReplyMarkup({ inline_keyboard: newRows }, {
+            chat_id: query.message.chat.id,
+            message_id: query.message.message_id
+          })
+        } catch (e) {
+          console.warn('[push_toggle] 更新按钮失败:', e.message)
+        }
+        await bot.answerCallbackQuery(query.id, { text: enabled ? '🔔 自动推送已开启' : '🔕 自动推送已关闭，安静了' })
+      } catch (e) {
+        await bot.answerCallbackQuery(query.id, { text: '❌ 操作失败' })
+      }
+      return
+    }
+
     // --- Book slot ---
     if (data.startsWith('book_')) {
       const ucode = data.replace('book_', '')
