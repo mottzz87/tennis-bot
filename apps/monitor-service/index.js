@@ -913,24 +913,28 @@ function rematchPlaceSlots(platform, place, hours, rawCells) {
   return sortWeekendOrHolidayFirst(filtered)
 }
 
-// 一键开关「这一批」推送的按钮（用户 2026-11-26 要求，并明确只开关这一批、
-// 不做全局开关）：单轮自动推送的空位多于 PUSH_TOGGLE_THRESHOLD 个时，在本轮
-// 消息之后补发一条带「关闭这批推送」按钮的消息。批次只记本轮 slot 的 ucode
-// （内存，最近 50 批）；点按钮 → telegram-bot 回调 push_toggle_<批次id> →
-// POST /api/push/toggle-batch → toggleBatchPush 翻转这批空位在持续推送登记
-// 里的 enabled（任一开着 → 全部关；全关着 → 全部开，开时顺延一个间隔再推），
-// 按钮文字随之翻成「开启这批推送」。新空位通知本身是一次性的，能开关的只有
-// 这批空位后续的持续推送重推；其它批次、全局设置都不受影响。
+// 一键开关「这一批」推送的按钮（用户 2026-11-26 要求，并明确：只开关这一批、
+// 不做全局开关；且只针对周末/祝日的自动推送，平日空位一律不处理——平日 19 点
+// 空位虽然也参与持续推送，但不进批次、不带这个按钮）：单轮推送里周末/祝日
+// 空位多于 PUSH_TOGGLE_THRESHOLD 个时，在本轮消息之后补发一条带「关闭这批
+// 推送」按钮的消息。批次只记这批周末/祝日 slot 的 ucode（内存，最近 50 批）；
+// 点按钮 → telegram-bot 回调 push_toggle_<批次id> → POST /api/push/toggle-batch
+// → toggleBatchPush 翻转这批空位在持续推送登记里的 enabled（任一开着 → 全部
+// 关；全关着 → 全部开，开时顺延一个间隔再推），按钮文字随之翻成「开启这批
+// 推送」。新空位通知本身是一次性的，能开关的只有这批空位后续的持续推送
+// 重推；其它批次、全局设置都不受影响。
 const PUSH_TOGGLE_THRESHOLD = 5
 const pushBatches = new Map()
 let pushBatchSeq = 0
 async function maybeSendPushToggle(bot, chatId, slots) {
-  if (!Array.isArray(slots) || slots.length <= PUSH_TOGGLE_THRESHOLD) return
+  if (!Array.isArray(slots)) return
+  const batchSlots = slots.filter(d => isWeekendOrHoliday(d))
+  if (batchSlots.length <= PUSH_TOGGLE_THRESHOLD) return
   const batchId = `b${Date.now().toString(36)}${(pushBatchSeq += 1).toString(36)}`
-  pushBatches.set(batchId, { ucodes: slots.map(d => d.ucode), createdAt: Date.now() })
+  pushBatches.set(batchId, { ucodes: batchSlots.map(d => d.ucode), createdAt: Date.now() })
   while (pushBatches.size > 50) pushBatches.delete(pushBatches.keys().next().value)
   try {
-    await bot.sendMessage(chatId, `📣 本轮推送了 ${slots.length} 个空位。嫌这一批太吵，可以关掉这批空位的持续推送（不影响其它空位）。`, {
+    await bot.sendMessage(chatId, `📣 本轮周末/祝日空位推送了 ${batchSlots.length} 个。嫌这一批太吵，可以关掉这批空位的持续推送（不影响其它空位）。`, {
       reply_markup: { inline_keyboard: [[{ text: '🔕 关闭这批推送', callback_data: `push_toggle_${batchId}` }]] }
     })
   } catch (e) {
