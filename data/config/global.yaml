@@ -18,7 +18,6 @@ PUSH_ON_INIT: true     # 启动时是否先推送一次当前全部空位
 BOOKED_REMINDER_INTERVAL_HOURS: 5  # 已预约临近的定时提醒间隔（小时）
 PERSISTENT_PUSH_INTERVAL_MINUTES: 10  # 周末/祝日空位持续推送间隔（分钟）；持续推送开启的空位每隔该时长重推一次，可 /set 修改
 PERSISTENT_PUSH_ENABLED: true  # 持续推送全局开关；/set global:PERSISTENT_PUSH_ENABLED false 全局关闭（写盘持久化，重启/部署后仍生效；平台 yaml 同名 key 可单独覆盖）
-SLOT_PUSH_ENABLED: true  # 自动推送总开关（全局）：false 时不发新空位通知与持续推送重推（手动扫描/预约/自动抢不受影响）；单轮推送超过 5 个空位时消息后附一键开关按钮，点按翻转本开关（写盘持久化）
 
 # ===== 预约 =====
 DOUBLE_CONFIRM_DAYS: 7 # 距开始 N 天内的时段，点预约会先二次确认（默认 7；设 0 关闭；可按平台覆盖）

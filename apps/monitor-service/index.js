@@ -19,7 +19,7 @@
  *   GET  /api/slot/:ucode
  *   GET  /api/schedule-status
  *   POST /api/persistent/toggle  { id }（id 为完整 ucode 或 slotToken，开关持续推送：周末/祝日 + 平日 19 点）
- *   POST /api/push/toggle        翻转自动推送总开关 SLOT_PUSH_ENABLED（推送消息上一键按钮用）
+ *   POST /api/push/toggle-batch  { id }（翻转一批空位的持续推送开关，推送消息上一键按钮用）
  *   GET  /api/persistent         当前持续推送登记
  *   GET  /api/delayed-auto-book  当前延迟自动预约观望登记（发现空位先观望，还在才抢）
  *
@@ -44,7 +44,7 @@ const {
   isReleaseWindow, matchReleaseReminderMoment,
   parseTimeSafe, normalizeTimeRange, delayedGrabWaitMs, rainVerdictForWindow,
   parseTimeRangeMinutes, evaluateGrabGuard, isSuspiciousScanDrop, isPersistentPushEnabled,
-  isSlotPushEnabled, isSlotBooked
+  isSlotBooked
 } = require('@tennis-bot/utils')
 const { fetchBearDayBlocks } = require('./tennisbear')
 
@@ -523,8 +523,6 @@ function togglePersistentPush(id) {
 async function checkPersistentPush() {
   // 放号日静默窗口（11:45–12:10）：暂停持续推送（登记保留，窗口后下一轮继续）
   if (isReleaseQuietWindow()) return
-  // 自动推送总开关关闭：整轮不推（登记与到期时间保留，重新开启后下一轮继续，语义同平台暂停）
-  if (!isSlotPushEnabled(config.getEffective('SLOT_PUSH_ENABLED'))) return
   const now = Date.now()
   const dueEntries = []
   for (const [ucode, entry] of persistentPush) {
@@ -579,7 +577,7 @@ async function checkPersistentPush() {
         botInstance, chatId, sortWeekendOrHolidayFirst(slots),
         '🔔 空位还在 · 点击直接预约（持续推送中，点 🔔 可取消）'
       )
-      await maybeSendPushToggle(botInstance, chatId, slots.length)
+      await maybeSendPushToggle(botInstance, chatId, slots)
       for (const d of slots) {
         const entry = persistentPush.get(d.ucode)
         if (entry) { entry.pushCount += 1; entry.nextPushAt = Date.now() + getPersistentIntervalMs(platform) }
@@ -915,22 +913,48 @@ function rematchPlaceSlots(platform, place, hours, rawCells) {
   return sortWeekendOrHolidayFirst(filtered)
 }
 
-// 一键开关推送按钮：单轮自动推送的空位多于 PUSH_TOGGLE_THRESHOLD 个时，
-// 在本轮消息之后补发一条带「一键关闭推送」按钮的消息（用户 2026-11-26 要求）。
-// 点按钮 → telegram-bot 回调 push_toggle → POST /api/push/toggle 翻转全局
-// SLOT_PUSH_ENABLED 并把按钮文字翻成「一键开启推送」；关闭期间不再发新空位
-// 通知与持续推送重推（扫描与状态照常推进，恢复后不会把积压当新空位补发）。
+// 一键开关「这一批」推送的按钮（用户 2026-11-26 要求，并明确只开关这一批、
+// 不做全局开关）：单轮自动推送的空位多于 PUSH_TOGGLE_THRESHOLD 个时，在本轮
+// 消息之后补发一条带「关闭这批推送」按钮的消息。批次只记本轮 slot 的 ucode
+// （内存，最近 50 批）；点按钮 → telegram-bot 回调 push_toggle_<批次id> →
+// POST /api/push/toggle-batch → toggleBatchPush 翻转这批空位在持续推送登记
+// 里的 enabled（任一开着 → 全部关；全关着 → 全部开，开时顺延一个间隔再推），
+// 按钮文字随之翻成「开启这批推送」。新空位通知本身是一次性的，能开关的只有
+// 这批空位后续的持续推送重推；其它批次、全局设置都不受影响。
 const PUSH_TOGGLE_THRESHOLD = 5
-async function maybeSendPushToggle(bot, chatId, pushedCount) {
-  if (!(pushedCount > PUSH_TOGGLE_THRESHOLD)) return
-  if (!isSlotPushEnabled(config.getEffective('SLOT_PUSH_ENABLED'))) return
+const pushBatches = new Map()
+let pushBatchSeq = 0
+async function maybeSendPushToggle(bot, chatId, slots) {
+  if (!Array.isArray(slots) || slots.length <= PUSH_TOGGLE_THRESHOLD) return
+  const batchId = `b${Date.now().toString(36)}${(pushBatchSeq += 1).toString(36)}`
+  pushBatches.set(batchId, { ucodes: slots.map(d => d.ucode), createdAt: Date.now() })
+  while (pushBatches.size > 50) pushBatches.delete(pushBatches.keys().next().value)
   try {
-    await bot.sendMessage(chatId, `📣 本轮推送了 ${pushedCount} 个空位。嫌多可以先关掉自动推送（预约和自动抢场不受影响）。`, {
-      reply_markup: { inline_keyboard: [[{ text: '🔕 一键关闭推送', callback_data: 'push_toggle' }]] }
+    await bot.sendMessage(chatId, `📣 本轮推送了 ${slots.length} 个空位。嫌这一批太吵，可以关掉这批空位的持续推送（不影响其它空位）。`, {
+      reply_markup: { inline_keyboard: [[{ text: '🔕 关闭这批推送', callback_data: `push_toggle_${batchId}` }]] }
     })
   } catch (e) {
-    console.log('[推送总开关] 一键按钮消息发送失败:', e.message)
+    console.log('[批次推送] 一键按钮消息发送失败:', e.message)
   }
+}
+
+// 翻转一批空位的持续推送开关。批次不存在 → null；批次空位都已注销 → success:false。
+function toggleBatchPush(batchId) {
+  const batch = pushBatches.get(batchId)
+  if (!batch) return null
+  const entries = []
+  for (const ucode of batch.ucodes) {
+    const entry = persistentPush.get(ucode)
+    if (entry) entries.push(entry)
+  }
+  if (entries.length === 0) return { success: false, message: '这批空位已过期' }
+  const target = !entries.some(e => e.enabled)
+  for (const entry of entries) {
+    entry.enabled = target
+    if (target) entry.nextPushAt = Date.now() + getPersistentIntervalMs(entry.platform)
+  }
+  console.log(`[批次推送] 已${target ? '开启' : '关闭'} ${entries.length} 个空位的持续推送（批次 ${batchId}）`)
+  return { success: true, enabled: target, count: entries.length }
 }
 
 // 分批发送 book 按钮（每批 MAX_INLINE_BUTTONS 个）。
@@ -1484,8 +1508,8 @@ async function sendTelegram(data, version, title = '🆕 可预约（点击直�
       )
     }
 
-    // 本轮推送空位多于阈值 → 附一键关闭推送按钮
-    await maybeSendPushToggle(botInstance, chatId, list.length)
+    // 本轮推送空位多于阈值 → 附一键开关「这批推送」按钮
+    await maybeSendPushToggle(botInstance, chatId, list)
   }
 }
 
@@ -1870,12 +1894,8 @@ async function scanPlatform(name, options = {}) {
         if (isPersistentPushEligible(d)) armPersistentPush(d, name)
       }
       if (config.getEffective('NOTIFY_ADDED', name) !== false) {
-        if (isSlotPushEnabled(config.getEffective('SLOT_PUSH_ENABLED'))) {
-          console.log(`[MONITOR][${name.toUpperCase()}][${trace}] PUSH 发送新增通知 ${added.length}`)
-          await sendTelegram(added, currentVersion, '✨ 有新场地！点击直接预约', { weekendOnly })
-        } else {
-          console.log(`[MONITOR][${name.toUpperCase()}][${trace}] 自动推送总开关关闭，跳过新增通知 ${added.length} 个`)
-        }
+        console.log(`[MONITOR][${name.toUpperCase()}][${trace}] PUSH 发送新增通知 ${added.length}`)
+        await sendTelegram(added, currentVersion, '✨ 有新场地！点击直接预约', { weekendOnly })
       }
       await autoBookPlatform(name, added, platformConfig, trace)
     }
@@ -2026,13 +2046,13 @@ const server = http.createServer(async (req, res) => {
       return json(res, { success: true, enabled: !enabled })
     }
 
-    // POST /api/push/toggle 翻转自动推送总开关（SLOT_PUSH_ENABLED，全局键，写盘持久化）
-    if (req.method === 'POST' && pathname === '/api/push/toggle') {
-      const enabled = isSlotPushEnabled(config.getEffective('SLOT_PUSH_ENABLED'))
-      config.set('SLOT_PUSH_ENABLED', !enabled)
-      config.save()
-      console.log(`[推送总开关] 已${!enabled ? '开启' : '关闭'}（一键按钮）`)
-      return json(res, { success: true, enabled: !enabled })
+    // POST /api/push/toggle-batch body: { id }（翻转一批空位的持续推送开关，一键按钮用；只影响这一批）
+    if (req.method === 'POST' && pathname === '/api/push/toggle-batch') {
+      const body = await parseBody(req).catch(() => null)
+      if (!body?.id) return json(res, { success: false, message: '缺少 id' }, 400)
+      const result = toggleBatchPush(body.id)
+      if (!result) return json(res, { success: false, message: '这批推送已过期' }, 404)
+      return json(res, result)
     }
 
     // POST /api/config/set
