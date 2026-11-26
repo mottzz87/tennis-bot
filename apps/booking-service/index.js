@@ -14,6 +14,7 @@
  *   GET  /api/booked           -> 全部预约记录
  *   GET  /api/booked/schedule  -> 未开始预约（按时间排序）
  *   POST /api/booked/disable-reminder  { uid }
+ *   POST /api/booked/sync     -> 手动触发官网预约同步对账（江户川，只读）
  *   DELETE /api/booked/:uid
  *   GET  /status               -> { busy, activeCount, currentTasks, parkedCount, parkedSession, batchRunning }
  */
@@ -21,8 +22,10 @@ require('@tennis-bot/config/loadEnv')()
 const http = require('http')
 const { loadPlatform } = require('@tennis-bot/platform')
 const FileStorage = require('@tennis-bot/storage/file/FileStorage')
-const { parseSlotDayKey, parseSlotStartDateTimeSafe, slotToken, isReleaseWindow } = require('@tennis-bot/utils')
+const { parseSlotDayKey, parseSlotStartDateTimeSafe, slotToken, isReleaseWindow, jstParts, jstDateKey, normalizeReleaseReminder } = require('@tennis-bot/utils')
 const ConfigManager = require('@tennis-bot/config')
+const { reconcileBookedSlots } = require('./sync')
+const fs = require('fs')
 const path = require('path')
 
 const DATA_DIR = process.env.BOOKING_DATA_DIR || path.resolve(__dirname, '../../data')
@@ -85,6 +88,70 @@ let preparing = false // 正在 prepare（防重复并发）
 const PREPARED_TTL_MS = 30 * 60 * 1000 // 11:45 创建 → 约 12:15 过期
 const PREPARED_KEEPALIVE_MS = 3 * 60 * 1000 // 每 3 分钟刷新一次 Home，保持会话新鲜
 let batchRunning = false // 批量顺序抢进行中（防重复调用）
+
+// ===== 官网预约同步（江户川，只读）=====
+// 用户直接在官网订的场次不经过 bot，服务器没有记录（守卫看不到、提醒不发）。
+// 每 SYNC_INTERVAL 登录官网读预约列表对账：补新增、删官网已取消的未来记录。
+// 跳过条件：预约执行中 / 批量抢 / 预热会话占用（官网单会话，互踢）、
+// 放号日 11:00–12:20（保护预热单会话）。抓取失败整轮跳过，不动本地数据。
+const SYNC_INTERVAL_MS = (Number(process.env.BOOKING_SYNC_INTERVAL_MINUTES) > 0 ? Number(process.env.BOOKING_SYNC_INTERVAL_MINUTES) : 30) * 60 * 1000
+let syncRunning = false
+let lastSync = null // { at, trigger, ok, added, removed, message }
+
+function inSyncReleaseBlock(platformConfig) {
+  const r = normalizeReleaseReminder(platformConfig?.RELEASE_REMINDER)
+  if (!r) return false
+  const p = jstParts()
+  if (p.d !== r.day) return false
+  const cur = p.h * 60 + p.mi
+  return cur >= 11 * 60 && cur < 12 * 60 + 20
+}
+
+async function runBookingSync(trigger) {
+  if (syncRunning) return { success: false, message: '同步进行中' }
+  if (activeCount > 0 || batchRunning || parkedSession || preparing) {
+    const message = '预约/预热占用中，本轮跳过'
+    console.log(`[booking-sync] ${message}（trigger=${trigger}）`)
+    return { success: false, message }
+  }
+  const adapter = loadPlatform('edogawa')
+  if (!adapter || typeof adapter.fetchReservationRecords !== 'function') {
+    return { success: false, message: 'edogawa 适配器不可用' }
+  }
+  const platformConfig = config.getPlatform('edogawa')
+  if (inSyncReleaseBlock(platformConfig)) {
+    const message = '放号窗口保护期，本轮跳过'
+    console.log(`[booking-sync] ${message}（trigger=${trigger}）`)
+    return { success: false, message }
+  }
+  syncRunning = true
+  try {
+    const siteRecords = await adapter.fetchReservationRecords(platformConfig)
+    const locals = await storage.getBookedSlots()
+    const { added, removed, next, suspectEmpty } = reconcileBookedSlots(locals, siteRecords, jstDateKey())
+    if (suspectEmpty) {
+      console.log('[booking-sync] 警告：官网列表为空但本地有未来记录，拒绝删除（疑似页面异常）')
+    }
+    if (added.length || removed.length) {
+      const livePath = path.join(DATA_DIR, 'bookedSlots.json')
+      if (fs.existsSync(livePath)) {
+        fs.copyFileSync(livePath, path.join(DATA_DIR, `bookedSlots.json.bak-sync-${Date.now()}`))
+      }
+      await storage.saveBookedSlots(next)
+    }
+    for (const r of added) console.log(`[booking-sync] 新增 ${r.place} ${r.court} ${r.date} ${r.time}（官网同步）`)
+    for (const r of removed) console.log(`[booking-sync] 删除 ${r.place} ${r.court} ${r.date} ${r.time}（官网已无此预约）`)
+    lastSync = { at: Date.now(), trigger, ok: true, added: added.length, removed: removed.length }
+    console.log(`[booking-sync] 完成（trigger=${trigger}）：官网 ${siteRecords.length} 条，新增 ${added.length}，删除 ${removed.length}`)
+    return { success: true, siteCount: siteRecords.length, added: added.map(r => r.uid), removed: removed.map(r => r.uid), suspectEmpty }
+  } catch (e) {
+    lastSync = { at: Date.now(), trigger, ok: false, message: e.message }
+    console.log(`[booking-sync] 失败（trigger=${trigger}），本地数据未动：`, e.message)
+    return { success: false, message: e.message }
+  } finally {
+    syncRunning = false
+  }
+}
 
 function parkSession(session) {
   const entry = { ...session }
@@ -363,7 +430,8 @@ const server = http.createServer(async (req, res) => {
         currentTasks: [...activeTasks.values()].map(t => ({ platform: t.platform, place: t.slot?.place, date: t.slot?.date, time: t.slot?.time })),
         parkedCount: parkedSession ? 1 : 0,
         parkedSession: parkedSession ? { loginVerified: parkedSession.loginVerified ?? null, preparedAt: parkedSession.preparedAt, timeUrl: parkedSession.timeUrl || null, parkedTarget: parkedSession.parkedTarget || null } : null,
-        batchRunning
+        batchRunning,
+        lastSync
       })
     }
 
@@ -446,6 +514,12 @@ const server = http.createServer(async (req, res) => {
       return json(res, { success: true, reminderEnabled: newState })
     }
 
+    // POST /api/booked/sync（手动触发官网预约同步对账）
+    if (req.method === 'POST' && pathname === '/api/booked/sync') {
+      const result = await runBookingSync('manual')
+      return json(res, result, result.success ? 200 : 500)
+    }
+
     // DELETE /api/booked/:uid
     if (req.method === 'DELETE' && pathname.startsWith('/api/booked/')) {
       const uid = decodeURIComponent(pathname.replace('/api/booked/', ''))
@@ -482,6 +556,9 @@ async function start() {
   server.listen(PORT, () => {
     console.log(`[booking-service] 启动于 http://localhost:${PORT}`)
   })
+  // 官网预约同步：启动 1 分钟后先跑一轮，之后每 SYNC_INTERVAL 一轮
+  setTimeout(() => { runBookingSync('startup').catch(() => {}) }, 60 * 1000)
+  setInterval(() => { runBookingSync('interval').catch(() => {}) }, SYNC_INTERVAL_MS)
 }
 
 start().catch(e => {
